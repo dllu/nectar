@@ -31,4 +31,3 @@ add_executable(capture
     src/capture.cpp
 )
 target_link_libraries(capture ${NECTA_LIBRARIES})
-
