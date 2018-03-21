@@ -7,6 +7,7 @@ find_package(PNG REQUIRED)
 set(NECTAR_INCLUDE_DIRS
     ${PROJECT_SOURCE_DIR}/src
     ${PROJECT_SOURCE_DIR}/third-party/tinypng
+    ${PROJECT_SOURCE_DIR}/third-party
     ${EIGEN3_INCLUDE_DIR}
     ${PNG_INCLUDE_DIRS}
     /usr/local/include/libalkusb3-1.0
