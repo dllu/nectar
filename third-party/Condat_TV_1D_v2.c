@@ -42,7 +42,7 @@ licence (compatible with the GNU GPL), which can be
 found at the URL "http://www.cecill.info".
 */
 
-#define datatype float
+#define datatype double
 /* double is recommended; in that case the precision is of order 1e-11. With float, the precision for a typical signal with values in [0,255] is of order 5e-3 only. */
 
 

@@ -16,42 +16,22 @@ constexpr size_t start_cols = 100;
 constexpr size_t match_px_top = 350;
 constexpr size_t match_px_bot = 240;
 
-using ColVec = Eigen::Matrix<float, cols / 2, 1>;
+using ColVec = Eigen::Matrix<double, cols / 2, 1>;
 using vecColVec = std::vector<ColVec, Eigen::aligned_allocator<ColVec>>;
 
-constexpr size_t black_point_calib_start = 1294;
-constexpr size_t black_point_calib_end = 1314;
-constexpr size_t calib_n = black_point_calib_end - black_point_calib_start;
-constexpr float black_point_calib[] = {
-    -185.60000, -194.40000, -28.00000,  -99.20000,  -405.60000, -370.00000,
-    -353.60000, -402.40000, -182.40000, -152.80000, -427.20000, -439.20000,
-    400.40000,  430.00000,  141.60000,  181.60000,  315.20000,  279.20000,
-    354.80000,  415.20000,  -265.60000, -283.20000, -98.40000,  -166.40000,
-    -238.80000, -285.60000, -192.80000, -286.40000, 183.20000,  255.20000,
-    126.00000,  167.60000,  208.00000,  224.80000,  111.20000,  215.20000,
-    -56.80000,  -128.80000, -88.80000,  -130.40000, -67.20000,  -118.40000,
-    -69.60000,  -125.20000, 137.60000,  134.40000,  104.00000,  49.60000,
-    266.40000,  335.20000,  74.40000,   144.00000,  504.00000,  434.00000,
-    365.60000,  344.80000,  203.20000,  221.60000,  379.20000,  427.20000,
-    -284.00000, -256.00000, -70.40000,  -72.00000,  -217.60000, -137.60000,
-    -333.60000, -324.00000, 180.00000,  182.80000,  0.00000,    64.00000,
-    110.80000,  143.20000,  59.20000,   144.80000,  -21.60000,  -132.00000,
-    -21.60000,  -46.40000,
-};
+constexpr size_t calib_start = 1294;
+constexpr size_t calib_end = 1314;
+constexpr size_t calib_n = calib_end - calib_start;
 
 class PostProcessor {
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW;
 
    private:
-    Eigen::Array<float, cols / 2, -1> reds;
-    Eigen::Array<float, cols / 2, -1> greens_r;
-    Eigen::Array<float, cols / 2, -1> greens_b;
-    Eigen::Array<float, cols / 2, -1> blues;
+    Eigen::Array<double, cols / 2, -1> reds;
+    Eigen::Array<double, cols / 2, -1> greens_r;
+    Eigen::Array<double, cols / 2, -1> greens_b;
+    Eigen::Array<double, cols / 2, -1> blues;
 
-    ColVec red_corrector;
-    ColVec green_r_corrector;
-    ColVec green_b_corrector;
-    ColVec blue_corrector;
     size_t col_ind;
     size_t frame_ind;
 
@@ -64,60 +44,126 @@ class PostProcessor {
      */
     static void matchColumnExposure(Eigen::Ref<ColVec> mutable_col,
                                     const ColVec &target) {
-        constexpr size_t acols = 3;
-        Eigen::Matrix<float, cols / 2, acols> A;
+        constexpr size_t acols = 2;
+        Eigen::Matrix<double, cols / 2, acols> A;
         A.col(0) = mutable_col;
         A.col(1).setLinSpaced(0, 1);
-        A.col(2).setOnes();
+        A.col(1).array() *= mutable_col.array();
 
-        Eigen::Matrix<float, match_px_bot + match_px_top, acols> AA;
+        Eigen::Matrix<double, match_px_bot + match_px_top, acols> AA;
         AA.block<match_px_bot, acols>(0, 0) =
             A.block<match_px_bot, acols>(0, 0);
         AA.block<match_px_top, acols>(match_px_bot, 0) =
             A.block<match_px_top, acols>(cols / 2 - match_px_top - 1, 0);
 
-        Eigen::Matrix<float, match_px_bot + match_px_top, 1> b;
+        Eigen::Matrix<double, match_px_bot + match_px_top, 1> b;
         b.segment<match_px_bot>(0) = target.segment<match_px_bot>(0);
         b.segment<match_px_top>(match_px_bot) =
             target.segment<match_px_top>(cols / 2 - match_px_top - 1);
 
-        Eigen::Array<float, match_px_bot + match_px_top, 1> w =
-            1.0 / (1.0 + AA.col(0).array().sqrt());
+        Eigen::Array<double, match_px_bot + match_px_top, 1> w;
+        w.setOnes();
+        //    1.0 / (1.0 + AA.col(0).array().sqrt());
 
         AA.array().colwise() *= w;
         b.array() *= w;
 
-        Eigen::Matrix<float, acols, 1> x =
+        Eigen::Matrix<double, acols, 1> x =
             (AA.transpose() * AA).inverse() * (AA.transpose() * b);
 
         mutable_col = A * x;
     }
 
+    /**
+     */
+    static void matchGreens(Eigen::Ref<ColVec> mutable_col,
+                            Eigen::Ref<ColVec> target) {
+        // Eigen::Matrix<double, cols / 2, 3> pr;
+        // pr.col(0) = mutable_col;
+        // pr.col(1) = target;
+        // for (int k = 0; k < 3; k++) {
+        constexpr size_t acols = 7;
+        Eigen::Matrix<double, cols / 2, acols> A;
+        A.col(0) = mutable_col;
+        A.col(1).array() = mutable_col.array().square();
+        A.col(2).setLinSpaced(-1.0, 1.0);
+        A.col(3).array() = A.col(2).array().square();
+        A.col(2).array() *= mutable_col.array();
+        A.col(3).array() *= mutable_col.array();
+        A.col(4).setOnes();
+        A.col(5).setLinSpaced(-1.0, 1.0);
+        A.col(6).array() = A.col(5).array().square();
+
+        ColVec b;
+        b.head<cols / 2 - 1>().array() =
+            0.5 * (target.tail<cols / 2 - 1>() + target.head<cols / 2 - 1>());
+        b(cols / 2 - 1) = target(cols / 2 - 1);
+
+        Eigen::Array<double, cols / 2, 1> w;
+        w.setOnes();
+        for (size_t i = 0; i < cols / 2; i++) {
+            if (mutable_col(i) < 0.01 || target(i) < 0.01) {
+                w(i) = 0;
+            };
+        }
+
+        // 1.0 / (1.0 + ((A.col(0) - b).array() / 0.5).square());
+
+        Eigen::Matrix<double, cols / 2, acols> AA = A;
+        A.array().colwise() *= w;
+        b.array() *= w;
+
+        Eigen::Matrix<double, acols, 1> x =
+            (A.transpose() * A).inverse() * (A.transpose() * b);
+
+        mutable_col = AA * x;
+        for (size_t i = 0; i < cols / 2; i++) {
+            if (mutable_col(i) < 0) mutable_col(i) = 0;
+        }
+        // pr.col(2) = mutable_col;
+        // std::cout << pr << std::endl;
+        // std::exit(0);
+        //}
+    }
+
     static std::unique_ptr<std::vector<uint8_t>> rgbToByteArray(
-        Eigen::Ref<Eigen::Array<float, cols / 2, -1>> r,
-        Eigen::Ref<Eigen::Array<float, cols / 2, -1>> g,
-        Eigen::Ref<Eigen::Array<float, cols / 2, -1>> b) {
-        auto arr = std::make_unique<std::vector<uint8_t>>(rows * cols, 255);
+        Eigen::Ref<Eigen::Array<double, cols, -1>> r,
+        Eigen::Ref<Eigen::Array<double, cols, -1>> g,
+        Eigen::Ref<Eigen::Array<double, cols, -1>> b) {
+        auto arr = std::make_unique<std::vector<uint8_t>>(rows * cols * 2, 255);
         auto &ba = *arr;
-        auto clam = [](float y) {
-            if (y < 0) return (float)0;
-            if (y > 1) return (float)1;
+        auto clam = [](double y) {
+            if (y < 0) return (double)0;
+            if (y > 1) return (double)1;
             return y;
         };
-        Eigen::Array<float, cols / 2, -1> R =
-            r.unaryExpr(clam).array().pow(1 / 2.20);
-        Eigen::Array<float, cols / 2, -1> G =
-            g.unaryExpr(clam).array().pow(1 / 2.20);
-        Eigen::Array<float, cols / 2, -1> B =
-            b.unaryExpr(clam).array().pow(1 / 2.20);
+
+        Eigen::Array<double, cols, -1> R = r.unaryExpr(clam) * 255;
+        Eigen::Array<double, cols, -1> G = b.unaryExpr(clam) * 255;
+        Eigen::Array<double, cols, -1> B = b.unaryExpr(clam) * 255;
+
         for (size_t x = 0; x < rows / 2; x++) {
-            for (size_t y = 0; y < cols / 2; y++) {
-                ba[4 * (x * cols / 2 + y)] = R(y, x) * 255;
-                ba[4 * (x * cols / 2 + y) + 1] = G(y, x) * 255;
-                ba[4 * (x * cols / 2 + y) + 2] = B(y, x) * 255;
+            for (size_t y = 0; y < cols; y++) {
+                ba[4 * (x * cols + y)] = R(y, x);
+                ba[4 * (x * cols + y) + 1] = G(y, x);
+                ba[4 * (x * cols + y) + 2] = B(y, x);
             }
         }
         return arr;
+    }
+
+    static void adjustExposure(Eigen::Array<double, cols / 2, -1> &x,
+                               const double m, const double k) {
+        x -= x.minCoeff();
+        x /= x.maxCoeff();
+        // adjusts exposure with the following curve:
+        // y = 1 - m * log(exp(-k*x - log(1 / (exp(k/m) - 1))) + 1) / k;
+        // where m = percentile / x(percentile).
+        const size_t n = x.cols();
+        Eigen::Array<double, cols / 2, -1> tmp = x;
+        const double x0 = std::log(1 / (std::exp(k / m) - 1.0));
+
+        x = 1 - (m / k) * ((-k * tmp - x0).exp() + 1.0).log();
     }
 
    public:
@@ -126,29 +172,64 @@ class PostProcessor {
           greens_r(cols / 2, rows / 2 * n),
           greens_b(cols / 2, rows / 2 * n),
           blues(cols / 2, rows / 2 * n),
-          red_corrector(ColVec::Zero()),
-          green_r_corrector(ColVec::Zero()),
-          green_b_corrector(ColVec::Zero()),
-          blue_corrector(ColVec::Zero()),
           col_ind(0),
-          frame_ind(0) {
-        for (size_t i = black_point_calib_start; i < black_point_calib_end;
-             i++) {
-            size_t j = i - black_point_calib_start;
-            blue_corrector(i) = black_point_calib[j * 4];
-            green_b_corrector(i) = black_point_calib[j * 4 + 1];
-            green_r_corrector(i) = black_point_calib[j * 4 + 2];
-            red_corrector(i) = black_point_calib[j * 4 + 3];
-        }
-    }
+          frame_ind(0) {}
 
+    /**
+     * performs demosaicing and outputs byte array
+     */
     std::unique_ptr<std::vector<uint8_t>> pop() {
-        Eigen::Array<float, cols / 2, -1> greens =
-            0.5 * (greens_r.block<cols / 2, rows / 2>(0, frame_ind * rows / 2) +
-                   greens_b.block<cols / 2, rows / 2>(0, frame_ind * rows / 2));
-        auto bytes = rgbToByteArray(
-            reds.block<cols / 2, rows / 2>(0, frame_ind * rows / 2), greens,
-            blues.block<cols / 2, rows / 2>(0, frame_ind * rows / 2));
+        size_t ind = frame_ind * rows / 2;
+        Eigen::Array<double, cols, -1> greens_s(cols, rows / 2);
+        Eigen::Array<double, cols / 2, -1> green_r =
+            greens_r.block<cols / 2, rows / 2>(0, ind + 1);
+        Eigen::Array<double, cols / 2, -1> green_b =
+            greens_b.block<cols / 2, rows / 2>(0, ind + 0);
+
+        for (size_t c = 0; c < cols; c++) {
+            if (c % 2) {
+                greens_s.row(c) = green_r.row(c / 2);
+            } else {
+                greens_s.row(c) = green_b.row(c / 2);
+            }
+        }
+        Eigen::Array<double, cols, -1> tmp = greens_s;
+        TV1D_denoise_v2(tmp.data(), greens_s.data(), cols * rows / 2, 0.02);
+
+        Eigen::Array<double, cols, -1> reds_s(cols, rows / 2);
+        Eigen::Array<double, cols, -1> blues_s(cols, rows / 2);
+        for (size_t c = 0; c < cols / 2; c++) {
+            reds_s.row(c * 2) = reds.block<1, rows / 2>(c, ind + 1);
+            blues_s.row(c * 2 + 1) = blues.block<1, rows / 2>(c, ind + 0);
+        }
+        constexpr double interp_smooth = 0.1;
+        for (size_t c = 0; c < cols / 2; c++) {
+            if (c * 2 + 2 < cols) {
+                Eigen::Array<double, 1, rows> g =
+                    (greens_s.row(c * 2 + 1) + interp_smooth) /
+                    (greens_s.row(c * 2) + greens_s.row(c * 2 + 2) +
+                     2 * interp_smooth);
+                reds_s.row(c * 2 + 1) =
+                    g * (reds_s.row(c * 2) + reds_s.row(c * 2 + 2));
+            } else {
+                reds_s.row(c * 2 + 1) = reds_s.row(c * 2);
+            }
+            if (c > 0) {
+                Eigen::Array<double, 1, rows> g =
+                    (greens_s.row(c * 2) + interp_smooth) /
+                    (greens_s.row(c * 2 - 1) + greens_s.row(c * 2 + 1) +
+                     2 * interp_smooth);
+                blues_s.row(c * 2) =
+                    g * (blues_s.row(c * 2 - 1) + blues_s.row(c * 2 + 1));
+            } else {
+                blues_s.row(c * 2) = blues_s.row(c * 2 + 1);
+            }
+        }
+        // tmp = reds_s;
+        // TV1D_denoise_v2(tmp.data(), reds_s.data(), cols * rows / 2, 0.01);
+        // tmp = blues_s;
+        // TV1D_denoise_v2(tmp.data(), blues_s.data(), cols * rows / 2, 0.01);
+        auto bytes = rgbToByteArray(reds_s, greens_s, blues_s);
         frame_ind++;
         return bytes;
     }
@@ -156,91 +237,104 @@ class PostProcessor {
     void push(const std::vector<uint16_t> &raw) {
         for (size_t row = 0; row < rows / 2; row++) {
             blues.col(col_ind) =
-                ((Eigen::Map<const Eigen::Matrix<uint16_t, cols / 2, 1>,
-                             Eigen::Unaligned, Eigen::Stride<1, 2>>(
-                      raw.data() + cols * row * 2 + 1)
-                      .cast<float>() -
-                  blue_corrector) /
-                 65536);
+                Eigen::Map<const Eigen::Matrix<uint16_t, cols / 2, 1>,
+                           Eigen::Unaligned, Eigen::Stride<1, 2>>(
+                    raw.data() + cols * row * 2 + 1)
+                    .cast<double>() /
+                65536;
             greens_b.col(col_ind) =
-                ((Eigen::Map<const Eigen::Matrix<uint16_t, cols / 2, 1>,
-                             Eigen::Unaligned, Eigen::Stride<1, 2>>(
-                      raw.data() + cols * row * 2)
-                      .cast<float>() -
-                  green_b_corrector) /
-                 65536);
+                Eigen::Map<const Eigen::Matrix<uint16_t, cols / 2, 1>,
+                           Eigen::Unaligned, Eigen::Stride<1, 2>>(
+                    raw.data() + cols * row * 2)
+                    .cast<double>() /
+                65536;
             reds.col(col_ind) =
-                ((Eigen::Map<const Eigen::Matrix<uint16_t, cols / 2, 1>,
-                             Eigen::Unaligned, Eigen::Stride<1, 2>>(
-                      raw.data() + cols * (row * 2 + 1))
-                      .cast<float>() -
-                  red_corrector) /
-                 65536);
+                Eigen::Map<const Eigen::Matrix<uint16_t, cols / 2, 1>,
+                           Eigen::Unaligned, Eigen::Stride<1, 2>>(
+                    raw.data() + cols * (row * 2 + 1))
+                    .cast<double>() /
+                65536;
             greens_r.col(col_ind) =
-                ((Eigen::Map<const Eigen::Matrix<uint16_t, cols / 2, 1>,
-                             Eigen::Unaligned, Eigen::Stride<1, 2>>(
-                      raw.data() + cols * (row * 2 + 1) + 1)
-                      .cast<float>() -
-                  green_r_corrector) /
-                 65536);
+                Eigen::Map<const Eigen::Matrix<uint16_t, cols / 2, 1>,
+                           Eigen::Unaligned, Eigen::Stride<1, 2>>(
+                    raw.data() + cols * (row * 2 + 1) + 1)
+                    .cast<double>() /
+                65536;
+
+            if (col_ind > 0) {
+                matchGreens(greens_r.col(col_ind), greens_b.col(col_ind - 1));
+            }
             col_ind++;
         }
     }
     void process() {
+        reds = (reds + 0.05).pow(1 / 2.20);
+        greens_r = (greens_r + 0.05).pow(1 / 2.20);
+        greens_b = (greens_b + 0.05).pow(1 / 2.20);
+        blues = (blues + 0.05).pow(1 / 2.20);
         ColVec red_start = reds.leftCols(1000).rowwise().mean();
         ColVec green_start = (greens_r.leftCols(1000).rowwise().mean() +
                               greens_b.leftCols(1000).rowwise().mean()) *
                              0.5;
         ColVec blue_start = blues.leftCols(1000).rowwise().mean();
         const size_t n = reds.cols();
-        Eigen::ArrayXf tmp0(n);
-        Eigen::ArrayXf tmp1(n);
+        Eigen::ArrayXd tmp0(n);
+        Eigen::ArrayXd tmp1(n);
 
+        std::cerr << "Matching column exposure" << std::endl;
         for (size_t c = 0; c < n; c++) {
             matchColumnExposure(reds.col(c), red_start);
             matchColumnExposure(greens_r.col(c), green_start);
             matchColumnExposure(greens_b.col(c), green_start);
             matchColumnExposure(blues.col(c), blue_start);
 
-            TV1D_denoise_v2(
-                reds.block<calib_n + 2, 1>(black_point_calib_start, c).data(),
-                tmp0.data(), calib_n + 2, 0.02);
-            reds.block<calib_n + 2, 1>(black_point_calib_start, c) = tmp0;
+            TV1D_denoise_v2(reds.block<calib_n + 2, 1>(calib_start, c).data(),
+                            tmp0.data(), calib_n + 2, 0.02);
+            reds.block<calib_n + 2, 1>(calib_start, c) =
+                tmp0.head<calib_n + 2>();
 
             TV1D_denoise_v2(
-                greens_r.block<calib_n + 2, 1>(black_point_calib_start, c)
-                    .data(),
+                greens_r.block<calib_n + 2, 1>(calib_start, c).data(),
                 tmp0.data(), calib_n + 2, 0.02);
-            greens_r.block<calib_n + 2, 1>(black_point_calib_start, c) = tmp0;
+            greens_r.block<calib_n + 2, 1>(calib_start, c) =
+                tmp0.head<calib_n + 2>();
 
             TV1D_denoise_v2(
-                greens_b.block<calib_n + 2, 1>(black_point_calib_start, c)
-                    .data(),
+                greens_b.block<calib_n + 2, 1>(calib_start, c).data(),
                 tmp0.data(), calib_n + 2, 0.02);
-            greens_b.block<calib_n + 2, 1>(black_point_calib_start, c) = tmp0;
+            greens_b.block<calib_n + 2, 1>(calib_start, c) =
+                tmp0.head<calib_n + 2>();
 
-            TV1D_denoise_v2(
-                blues.block<calib_n + 2, 1>(black_point_calib_start, c).data(),
-                tmp0.data(), calib_n + 2, 0.02);
-            blues.block<calib_n + 2, 1>(black_point_calib_start, c) = tmp0;
+            TV1D_denoise_v2(blues.block<calib_n + 2, 1>(calib_start, c).data(),
+                            tmp0.data(), calib_n + 2, 0.02);
+            blues.block<calib_n + 2, 1>(calib_start, c) =
+                tmp0.head<calib_n + 2>();
         }
+
+        std::cerr << "Row denoise" << std::endl;
         for (size_t r = 0; r < cols / 2; r++) {
             tmp1 = reds.row(r);
-            TV1D_denoise_v2(tmp1.data(), tmp0.data(), n, 0.005);
+            TV1D_denoise_v2(tmp1.data(), tmp0.data(), n, 0.007);
             reds.row(r) = tmp0;
 
             tmp1 = greens_r.row(r);
-            TV1D_denoise_v2(tmp1.data(), tmp0.data(), n, 0.005);
+            TV1D_denoise_v2(tmp1.data(), tmp0.data(), n, 0.007);
             greens_r.row(r) = tmp0;
 
             tmp1 = greens_b.row(r);
-            TV1D_denoise_v2(tmp1.data(), tmp0.data(), n, 0.005);
+            TV1D_denoise_v2(tmp1.data(), tmp0.data(), n, 0.007);
             greens_b.row(r) = tmp0;
 
             tmp1 = blues.row(r);
             TV1D_denoise_v2(tmp1.data(), tmp0.data(), n, 0.01);
             blues.row(r) = tmp0;
         }
+
+        std::cerr << "Adjusting exposure" << std::endl;
+        adjustExposure(reds, 3.8, 12);
+        adjustExposure(greens_r, 4.1, 12);
+        adjustExposure(greens_b, 4.1, 12);
+        adjustExposure(blues, 4.5, 12);
     }
 };
 
@@ -262,14 +356,13 @@ int main(int argc, char **argv) {
         pp.push(buf);
     }
     pp.process();
-    for (int f = 0; f < n; f++) {
+    for (int f = 0; f < n - 1; f++) {
         std::string filename = argv[f + 1];
         filename[filename.size() - 1] = 'g';
         filename[filename.size() - 2] = 'n';
         filename[filename.size() - 3] = 'p';
         auto bytes = pp.pop();
-        tinypng::PNG png(cols / 2, bytes->size() / (cols / 2) / 4,
-                         bytes->data());
+        tinypng::PNG png(cols, bytes->size() / cols / 4, bytes->data());
         png.writeToFile(filename);
         std::cerr << filename << std::endl;
     }

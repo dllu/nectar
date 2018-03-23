@@ -2,7 +2,7 @@ s = '/mnt/data8/pictures/linescan/17-12-03-23-11-30-utc/im%04d';
 close all;
 a = [];
 png = [];
-for ind=[34,40,135,235,30,100,110,212,51,1,2,3]
+for ind=[29]
     f = fopen(sprintf([s, '.bin'], ind));
     %ff = imread(sprintf([s, '.png'], ind));
     %png = cat(1, png, ff);
@@ -15,6 +15,7 @@ gb = aa(2:2:end,2:2:end);
 gr = aa(1:2:end,1:2:end);
 g = (gb + gr) / 2;
 r = aa(1:2:end,2:2:end);
+%{
 %imshow(aa' / max(aa(:)));
 rgb = cat(3, r', g', b');
 
