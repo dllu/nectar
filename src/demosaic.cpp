@@ -120,6 +120,19 @@ class PostProcessor {
         for (size_t i = 0; i < cols / 2; i++) {
             if (mutable_col(i) < 0) mutable_col(i) = 0;
         }
+        for (size_t i = 0; i < cols / 2; i++) {
+            if (mutable_col(i) == 0 && b(i) > 0) {
+                mutable_col(i) = b(i);
+            }
+        }
+        for (size_t i = 1; i < cols / 2; i++) {
+            // target 0 1 2 3 4
+            // mutable 0 1 2 3
+            if (target(i) == 0 && mutable_col(i - 1) > 0 &&
+                mutable_col(i) > 0) {
+                target(i) = (mutable_col(i - 1) + mutable_col(i)) * 0.5;
+            }
+        }
         // pr.col(2) = mutable_col;
         // std::cout << pr << std::endl;
         // std::exit(0);
@@ -205,7 +218,7 @@ class PostProcessor {
         constexpr double interp_smooth = 0.1;
         for (size_t c = 0; c < cols / 2; c++) {
             if (c * 2 + 2 < cols) {
-                Eigen::Array<double, 1, rows> g =
+                Eigen::Array<double, 1, rows / 2> g =
                     (greens_s.row(c * 2 + 1) + interp_smooth) /
                     (greens_s.row(c * 2) + greens_s.row(c * 2 + 2) +
                      2 * interp_smooth);
@@ -215,7 +228,7 @@ class PostProcessor {
                 reds_s.row(c * 2 + 1) = reds_s.row(c * 2);
             }
             if (c > 0) {
-                Eigen::Array<double, 1, rows> g =
+                Eigen::Array<double, 1, rows / 2> g =
                     (greens_s.row(c * 2) + interp_smooth) /
                     (greens_s.row(c * 2 - 1) + greens_s.row(c * 2 + 1) +
                      2 * interp_smooth);
@@ -225,10 +238,10 @@ class PostProcessor {
                 blues_s.row(c * 2) = blues_s.row(c * 2 + 1);
             }
         }
-        // tmp = reds_s;
-        // TV1D_denoise_v2(tmp.data(), reds_s.data(), cols * rows / 2, 0.01);
-        // tmp = blues_s;
-        // TV1D_denoise_v2(tmp.data(), blues_s.data(), cols * rows / 2, 0.01);
+        tmp = reds_s;
+        TV1D_denoise_v2(tmp.data(), reds_s.data(), cols * rows / 2, 0.008);
+        tmp = blues_s;
+        TV1D_denoise_v2(tmp.data(), blues_s.data(), cols * rows / 2, 0.008);
         auto bytes = rgbToByteArray(reds_s, greens_s, blues_s);
         frame_ind++;
         return bytes;
@@ -331,10 +344,16 @@ class PostProcessor {
         }
 
         std::cerr << "Adjusting exposure" << std::endl;
-        adjustExposure(reds, 3.8, 12);
-        adjustExposure(greens_r, 4.1, 12);
-        adjustExposure(greens_b, 4.1, 12);
-        adjustExposure(blues, 4.5, 12);
+        /*
+        adjustExposure(reds, 4.0, 10);
+        adjustExposure(greens_r, 4.1, 10);
+        adjustExposure(greens_b, 4.1, 10);
+        adjustExposure(blues, 5.0, 10);
+        */
+        adjustExposure(reds, 5.0, 10);
+        adjustExposure(greens_r, 5.1, 10);
+        adjustExposure(greens_b, 5.1, 10);
+        adjustExposure(blues, 6.25, 10);
     }
 };
 
