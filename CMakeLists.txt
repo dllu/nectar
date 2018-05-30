@@ -33,10 +33,11 @@ include_directories(${NECTAR_INCLUDE_DIRS})
 #src/main.cpp
 #)
 #target_link_libraries(necta ${NECTAR_LIBRARIES})
-#add_executable(capture
-#src/capture.cpp
-#)
-#target_link_libraries(capture ${NECTAR_LIBRARIES})
+
+add_executable(capture
+src/capture.cpp
+)
+target_link_libraries(capture ${NECTAR_LIBRARIES})
 add_executable(demosaic
     src/demosaic.cpp
     third-party/tinypng/pixel.cc

@@ -5,7 +5,6 @@ a = 0.055;
 gt_srgb = dlmread('../calib/srgb.txt') / 255;
 gt_xyz = gt_srgb / 12.92;
 gt_xyz(gt_srgb > 0.04045) = ((gt_srgb(gt_srgb > 0.04045) + a) ./ (1 + a)).^2.4;
-gt_xyyz = [gt_xyz(:,1), gt_xyz(:,2), gt_xyz(:,2), gt_xyz(:,3)];
 
 inds = 0:50;
 framesize = 16777216;
@@ -60,12 +59,12 @@ for px = 1:2048
         necta_gr = mean(gr(px, segment));
         necta_r = mean(r(px, segment));
 
-        img(1024 + 2 * px - 1, img_segment, 1) = r(px, segment);
-        img(1024 + 2 * px - 0, img_segment, 1) = r(px, segment);
-        img(1024 + 2 * px - 1, img_segment, 2) = gb(px, segment);
-        img(1024 + 2 * px - 0, img_segment, 2) = gr(px, segment);
-        img(1024 + 2 * px - 1, img_segment, 3) = b(px, segment);
-        img(1024 + 2 * px - 0, img_segment, 3) = b(px, segment);
+        img(5120 + 2 * px - 1, img_segment, 1) = r(px, segment);
+        img(5120 + 2 * px - 0, img_segment, 1) = r(px, segment);
+        img(5120 + 2 * px - 1, img_segment, 2) = gb(px, segment);
+        img(5120 + 2 * px - 0, img_segment, 2) = gr(px, segment);
+        img(5120 + 2 * px - 1, img_segment, 3) = b(px, segment);
+        img(5120 + 2 * px - 0, img_segment, 3) = b(px, segment);
 
         necta_xyyz(colour, 1) = necta_r;
         necta_xyyz(colour, 2) = necta_gr;
@@ -74,11 +73,15 @@ for px = 1:2048
     end
     valid = 1:(colour - 1);
 
-    C = necta_xyyz(valid,:) \ gt_xyyz(valid,:);
-    calibrated_necta_xyyz = necta_xyyz(valid,:) * C;
-    calibrations = [calibrations; C];
-    raw_xyz = [r(px,:)', gr(px,:)', gb(px,:)', b(px,:)'];
-    calibrated_xyz = raw_xyz * C;
+    Cr = necta_xyyz(valid,[1 2 4]) \ gt_xyz(valid,:);
+    Cb = necta_xyyz(valid,[1 3 4]) \ gt_xyz(valid,:);
+    calibrations = [calibrations; [Cr Cb]];
+    calibrated_necta_xyz_r = necta_xyyz(valid,[1 2 4]) * Cr;
+    calibrated_necta_xyz_b = necta_xyyz(valid,[1 3 4]) * Cb;
+    raw_xyz_r = [r(px,:)', gr(px,:)', b(px,:)'];
+    raw_xyz_b = [r(px,:)', gb(px,:)', b(px,:)'];
+    calibrated_xyz_r = raw_xyz_r * Cr;
+    calibrated_xyz_b = raw_xyz_b * Cb;
 
     if px == 512
         figure;
@@ -100,32 +103,42 @@ for px = 1:2048
         ylabel('Sensor green value (raw values)');
 
         figure;
-        subplot(2,2,1); plot(gt_xyz(valid,1), calibrated_necta_xyyz(valid,1), 'r+', 'MarkerSize', 3, 'LineWidth', 3)
-        title('Red channel, calibrated');
+        subplot(1,3,1); plot(gt_xyz(valid,1), calibrated_necta_xyz_r(valid,1), 'r+', 'MarkerSize', 3, 'LineWidth', 3)
+        title('Red channel, calibrated_r');
         xlabel('True red value (sRGB linear)');
         ylabel('Sensor red value (calibrated values)');
-        subplot(2,2,2); plot(gt_xyz(valid,3), calibrated_necta_xyyz(valid,4), 'b+', 'MarkerSize', 3, 'LineWidth', 3)
-        title('Blue channel, calibrated');
+        subplot(1,3,2); plot(gt_xyz(valid,2), calibrated_necta_xyz_r(valid,2), 'g+', 'MarkerSize', 3, 'LineWidth', 3)
+        title('Green channel (red line), calibrated_r');
+        xlabel('True green value (sRGB linear)');
+        ylabel('Sensor green value (calibrated values)');
+        subplot(1,3,3); plot(gt_xyz(valid,3), calibrated_necta_xyz_r(valid,3), 'b+', 'MarkerSize', 3, 'LineWidth', 3)
+        title('Blue channel, calibrated_r');
         xlabel('True blue value (sRGB linear)');
         ylabel('Sensor blue value (calibrated values)');
-        subplot(2,2,3); plot(gt_xyz(valid,2), calibrated_necta_xyyz(valid,2), 'g+', 'MarkerSize', 3, 'LineWidth', 3)
-        title('Green channel (red line), calibrated');
+
+        figure;
+        subplot(1,3,1); plot(gt_xyz(valid,1), calibrated_necta_xyz_b(valid,1), 'r+', 'MarkerSize', 3, 'LineWidth', 3)
+        title('Red channel, calibrated_b');
+        xlabel('True red value (sRGB linear)');
+        ylabel('Sensor red value (calibrated values)');
+        subplot(1,3,2); plot(gt_xyz(valid,2), calibrated_necta_xyz_b(valid,2), 'g+', 'MarkerSize', 3, 'LineWidth', 3)
+        title('Green channel (red line), calibrated_b');
         xlabel('True green value (sRGB linear)');
         ylabel('Sensor green value (calibrated values)');
-        subplot(2,2,4); plot(gt_xyz(valid,2), calibrated_necta_xyyz(valid,3), 'g+', 'MarkerSize', 3, 'LineWidth', 3)
-        title('Green channel (blue line), calibrated');
-        xlabel('True green value (sRGB linear)');
-        ylabel('Sensor green value (calibrated values)');
+        subplot(1,3,3); plot(gt_xyz(valid,3), calibrated_necta_xyz_b(valid,3), 'b+', 'MarkerSize', 3, 'LineWidth', 3)
+        title('Blue channel, calibrated_b');
+        xlabel('True blue value (sRGB linear)');
+        ylabel('Sensor blue value (calibrated values)');
     end
     for colour = 1:colours
         segment = duration * (colour - 1) + start + pad : duration * colour + start - pad;
         img_segment = (colour - 1) * segmentlength + 1 : colour * segmentlength;
-        img(5120 + 2 * px - 1, img_segment, 1) = calibrated_xyz(segment, 1);
-        img(5120 + 2 * px - 0, img_segment, 1) = calibrated_xyz(segment, 1);
-        img(5120 + 2 * px - 1, img_segment, 2) = calibrated_xyz(segment, 3);
-        img(5120 + 2 * px - 0, img_segment, 2) = calibrated_xyz(segment, 2);
-        img(5120 + 2 * px - 1, img_segment, 3) = calibrated_xyz(segment, 4);
-        img(5120 + 2 * px - 0, img_segment, 3) = calibrated_xyz(segment, 4);
+        img(1024 + 2 * px - 1, img_segment, 1) = calibrated_xyz_r(segment, 1);
+        img(1024 + 2 * px - 0, img_segment, 1) = calibrated_xyz_b(segment, 1);
+        img(1024 + 2 * px - 1, img_segment, 2) = calibrated_xyz_r(segment, 2);
+        img(1024 + 2 * px - 0, img_segment, 2) = calibrated_xyz_b(segment, 2);
+        img(1024 + 2 * px - 1, img_segment, 3) = calibrated_xyz_r(segment, 3);
+        img(1024 + 2 * px - 0, img_segment, 3) = calibrated_xyz_b(segment, 3);
     end
 end
 img(img < 0) = 0;
