@@ -191,27 +191,41 @@ class PostProcessor {
      */
     std::unique_ptr<std::vector<uint8_t>> pop() {
         size_t ind = frame_ind * rows / 2;
+        /** --> pixel id
+         *      0   0  1   1
+         * |  0 gr  b  gr  b
+         * |  0 r  gb  r  gb
+         * V  1 gr  b  gr  b
+         * t  1 r  gb  r  gb
+         *      ^   ^
+         *      Cb  Cr
+         */
         Eigen::Array<double, cols, -1> greens_s(cols, rows / 2);
         Eigen::Array<double, cols / 2, -1> green_r =
             greens_r.block<cols / 2, rows / 2>(0, ind + 1);
         Eigen::Array<double, cols / 2, -1> green_b =
-            greens_b.block<cols / 2, rows / 2>(0, ind + 0);
+            greens_b.block<cols / 2, rows / 2>(0, ind);
 
-        for (size_t c = 0; c < cols; c++) {
-            if (c % 2) {
-                greens_s.row(c) = green_r.row(c / 2);
-            } else {
-                greens_s.row(c) = green_b.row(c / 2);
-            }
+        greens_s.row(0) = greens_b.row(0);
+        greens_s.row(cols - 1) = greens_r.row(cols / 2 - 1);
+        for (size_t c = 1; c < cols - 2; c += 2) {
+            greens_s.row(c) =
+                0.5 * green_r.row(c / 2) +
+                0.25 * (green_b.row(c / 2) + green_b.row(c / 2 + 1));
+        }
+        for (size_t c = 2; c < cols; c += 2) {
+            greens_s.row(c) =
+                0.5 * green_b.row(c / 2) +
+                0.25 * (green_r.row(c / 2) + green_r.row(c / 2 - 1));
         }
         Eigen::Array<double, cols, -1> tmp = greens_s;
-        TV1D_denoise_v2(tmp.data(), greens_s.data(), cols * rows / 2, 0.008);
+        TV1D_denoise_v2(tmp.data(), greens_s.data(), cols * rows / 2, 0.005);
 
         Eigen::Array<double, cols, -1> reds_s(cols, rows / 2);
         Eigen::Array<double, cols, -1> blues_s(cols, rows / 2);
         for (size_t c = 0; c < cols / 2; c++) {
             reds_s.row(c * 2) = reds.block<1, rows / 2>(c, ind + 1);
-            blues_s.row(c * 2 + 1) = blues.block<1, rows / 2>(c, ind + 0);
+            blues_s.row(c * 2 + 1) = blues.block<1, rows / 2>(c, ind);
         }
         constexpr double interp_smooth = 0.3;
         for (size_t c = 0; c < cols / 2; c++) {
@@ -237,9 +251,9 @@ class PostProcessor {
             }
         }
         tmp = reds_s;
-        TV1D_denoise_v2(tmp.data(), reds_s.data(), cols * rows / 2, 0.008);
+        TV1D_denoise_v2(tmp.data(), reds_s.data(), cols * rows / 2, 0.005);
         tmp = blues_s;
-        TV1D_denoise_v2(tmp.data(), blues_s.data(), cols * rows / 2, 0.008);
+        TV1D_denoise_v2(tmp.data(), blues_s.data(), cols * rows / 2, 0.005);
 
         adjustExposure(reds_s, 2.9, 15);
         adjustExposure(greens_s, 3.0, 15);
@@ -300,7 +314,7 @@ class PostProcessor {
         blues /= 65536;
         std::ifstream fin(filename);
         const size_t n = blues.cols();
-        for (size_t row = 0; row < cols / 2; row++) {
+        for (size_t pixel = 0; pixel < cols / 2; pixel++) {
             Eigen::Matrix3d calibration_r;
             Eigen::Matrix3d calibration_b;
             for (size_t i = 0; i < 3; i++) {
@@ -311,32 +325,61 @@ class PostProcessor {
                     fin >> calibration_b(i, j);
                 }
             }
+            /** --> pixel id
+             *      0   0  1   1
+             * |  0 gr  b  gr  b
+             * |  0 r  gb  r  gb
+             * V  1 gr  b  gr  b
+             * t  1 r  gb  r  gb
+             *      ^   ^
+             *      Cb  Cr
+             */
             Eigen::Matrix<double, -1, 3> raw(n - 1, 3);
-            raw.col(0) = reds.block(row, 1, 1, n - 1).transpose();
-            raw.col(1) = greens_r.block(row, 1, 1, n - 1).transpose();
-            raw.col(2) = blues.block(row, 0, 1, n - 1).transpose();
+
+            // calibrate reds
+            raw.col(0) = reds.block(pixel, 0, 1, n - 1).transpose();
+            raw.col(1) = greens_r.block(pixel, 1, 1, n - 1).transpose();
+            if (pixel > 0) {
+                raw.col(2) =
+                    0.5 * (blues.block(pixel - 0, 1, 1, n - 1).transpose() +
+                           blues.block(pixel - 1, 1, 1, n - 1).transpose());
+            } else {
+                raw.col(2) = blues.block(pixel, 1, 1, n - 1).transpose();
+            }
             Eigen::Matrix<double, -1, 3> cooked_r = raw * calibration_r;
-            raw.col(1) = greens_b.block(row, 0, 1, n - 1).transpose();
+
+            // calibrate blues
+            if (pixel < n - 1) {
+                raw.col(0) =
+                    0.5 * (reds.block(pixel + 0, 0, 1, n - 1).transpose() +
+                           reds.block(pixel + 1, 0, 1, n - 1).transpose());
+            } else {
+                raw.col(0) = reds.block(pixel, 0, 1, n - 1).transpose();
+            }
+            raw.col(1) = greens_b.block(pixel, 0, 1, n - 1).transpose();
+            raw.col(2) = blues.block(pixel, 1, 1, n - 1).transpose();
             Eigen::Matrix<double, -1, 3> cooked_b = raw * calibration_b;
 
-            reds.block(row, 1, 1, n - 1) = cooked_r.col(0).transpose();
-            greens_r.block(row, 1, 1, n - 1) = cooked_r.col(1).transpose();
-            greens_b.block(row, 0, 1, n - 1) = cooked_b.col(1).transpose();
-            blues.block(row, 0, 1, n - 1) = cooked_b.col(2).transpose();
+            reds.block(pixel, 0, 1, n - 1).transpose() = cooked_r.col(0);
+            greens_r.block(pixel, 1, 1, n - 1).transpose() = cooked_r.col(1);
+            greens_b.block(pixel, 0, 1, n - 1).transpose() = cooked_b.col(1);
+            blues.block(pixel, 1, 1, n - 1).transpose() = cooked_b.col(2);
         }
-        reds.col(0) = reds.col(1);
+        reds.col(n - 1) = reds.col(n - 2);
         greens_r.col(0) = greens_r.col(1);
         greens_b.col(n - 1) = greens_b.col(n - 2);
-        blues.col(n - 1) = blues.col(n - 2);
+        blues.col(0) = blues.col(1);
     }
 
     void denoise() {
-        ColVec red_start = reds.block<cols / 2, 1000>(0, 1).rowwise().mean();
-        ColVec green_start =
-            (greens_r.block<cols / 2, 1000>(0, 1).rowwise().mean() +
-             greens_b.block<cols / 2, 1000>(0, 0).rowwise().mean()) *
-            0.5;
-        ColVec blue_start = blues.block<cols / 2, 1000>(0, 0).rowwise().mean();
+        ColVec red_start =
+            reds.block<cols / 2, start_cols>(0, 0).rowwise().mean();
+        ColVec green_start_r =
+            greens_r.block<cols / 2, start_cols>(0, 1).rowwise().mean();
+        ColVec green_start_b =
+            greens_b.block<cols / 2, start_cols>(0, 1).rowwise().mean();
+        ColVec blue_start =
+            blues.block<cols / 2, start_cols>(0, 0).rowwise().mean();
         const size_t n = reds.cols();
         Eigen::ArrayXd tmp0(n);
         Eigen::ArrayXd tmp1(n);
@@ -344,8 +387,8 @@ class PostProcessor {
         std::cerr << "Matching column exposure" << std::endl;
         for (size_t c = 0; c < n; c++) {
             matchColumnExposure(reds.col(c), red_start);
-            matchColumnExposure(greens_r.col(c), green_start);
-            matchColumnExposure(greens_b.col(c), green_start);
+            matchColumnExposure(greens_r.col(c), green_start_r);
+            matchColumnExposure(greens_b.col(c), green_start_b);
             matchColumnExposure(blues.col(c), blue_start);
 
             TV1D_denoise_v2(reds.block<calib_n + 2, 1>(calib_start, c).data(),
@@ -374,19 +417,19 @@ class PostProcessor {
         std::cerr << "Row denoise" << std::endl;
         for (size_t r = 0; r < cols / 2; r++) {
             tmp1 = reds.row(r);
-            TV1D_denoise_v2(tmp1.data(), tmp0.data(), n, 0.0075);
+            TV1D_denoise_v2(tmp1.data(), tmp0.data(), n, 0.009);
             reds.row(r) = tmp0;
 
             tmp1 = greens_r.row(r);
-            TV1D_denoise_v2(tmp1.data(), tmp0.data(), n, 0.0075);
+            TV1D_denoise_v2(tmp1.data(), tmp0.data(), n, 0.009);
             greens_r.row(r) = tmp0;
 
             tmp1 = greens_b.row(r);
-            TV1D_denoise_v2(tmp1.data(), tmp0.data(), n, 0.0075);
+            TV1D_denoise_v2(tmp1.data(), tmp0.data(), n, 0.009);
             greens_b.row(r) = tmp0;
 
             tmp1 = blues.row(r);
-            TV1D_denoise_v2(tmp1.data(), tmp0.data(), n, 0.0075);
+            TV1D_denoise_v2(tmp1.data(), tmp0.data(), n, 0.01);
             blues.row(r) = tmp0;
         }
     }
