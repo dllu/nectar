@@ -1,7 +1,7 @@
 close all;
 a = [];
-for ind=0:4
-    f = fopen(sprintf('im%04d.bin', ind));
+for ind=0:81
+    f = fopen(sprintf('../build/im%04d.bin', ind));
     a = [a; fread(f, 16777216)];
     fclose(f);
 end

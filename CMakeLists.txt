@@ -1,15 +1,15 @@
-cmake_minimum_required(VERSION 2.8)
+cmake_minimum_required(VERSION 3.1)
 project(necta)
 
 find_package(OpenCV REQUIRED)
 set(NECTA_INCLUDE_DIRS
 	${PROJECT_SOURCE_DIR}/src
     ${OpenCV_INCLUDE_DIRS}
-    /usr/local/include/libalkusb3-1.0
+    /usr/local/include/libalkusb3-1.6.1
 )
 set(NECTA_LIBRARIES
     ${OpenCV_LIBS}
-    /usr/local/lib/libalkusb3.so
+    /usr/local/lib/libalkusb3-1.6.1.so
 )
 
 ################################################################

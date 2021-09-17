@@ -1,8 +1,9 @@
+#include <INectaCamera.h>
+
+#include <iomanip>
+#include <iostream>
 #include <opencv2/core/core.hpp>
 #include <opencv2/highgui/highgui.hpp>
-#include <INectaCamera.h>
-#include <iostream>
-#include <iomanip>
 #include <sstream>
 
 using namespace CAlkUSB3;
@@ -11,6 +12,7 @@ using namespace std;
 const int rows = 192;
 const int cols = 4096;
 
+/*
 void printColorCodings(INectaCamera &cam) {
     auto acc = cam.GetAvailableColorCoding();
     for (auto cc = acc.Front(); 1; cc++) {
@@ -20,13 +22,14 @@ void printColorCodings(INectaCamera &cam) {
         }
     }
 }
+*/
 
 void printVideoModes(INectaCamera &cam) {
     auto acc = cam.GetAvailableVideoModes();
     for (auto cc = 0; cc < acc.Size(); cc++) {
         cerr << (int)(acc[cc].GetVideoMode()) << endl;
     }
-    cerr << "selected: " << (int) cam.GetVideoMode() << endl;
+    cerr << "selected: " << (int)cam.GetVideoMode() << endl;
 }
 
 void capture(INectaCamera &cam, int *gain, int *cds_gain, int *shutter) {
@@ -48,16 +51,15 @@ void capture(INectaCamera &cam, int *gain, int *cds_gain, int *shutter) {
 
     cam.SetPacketSize(min(16384U, cam.GetMaxPacketSize()));
 
-    cerr  << "Starting acquisition..." << endl;
+    cerr << "Starting acquisition..." << endl;
     // Start acquisition
-
 
     cam.SetAcquire(true);
     cv::Mat cv_image(rows, cols / 2, CV_8UC3, cv::Scalar(0, 0, 0));
 
-    std::vector<int>reds(256, 0);
-    std::vector<int>greens(256, 0);
-    std::vector<int>blues(256, 0);
+    std::vector<int> reds(256, 0);
+    std::vector<int> greens(256, 0);
+    std::vector<int> blues(256, 0);
     for (int f = 0; true; f++) {
         if (cv::getWindowProperty("necta", 0) < 0) {
             break;
@@ -71,20 +73,25 @@ void capture(INectaCamera &cam, int *gain, int *cds_gain, int *shutter) {
 
         // Get new frame
         auto raw_image = cam.GetRawData();
-        for (int i = 0; i < rows/2; i++) {
-            for (int j = 0; j < cols/2; j++) {
+        for (int i = 0; i < rows / 2; i++) {
+            for (int j = 0; j < cols / 2; j++) {
                 cv::Vec3b &intensity = cv_image.at<cv::Vec3b>(i, j);
 
-                intensity.val[0] = raw_image[2 * (2 * i * cols + (2 * j + 1)) + 1];
-                intensity.val[1] = (raw_image[2 * ((2 * i + 1) * cols + (2 * j + 1)) + 1] + raw_image[2 * (2 * i * cols + 2 * j) + 1]) / 2;
-                intensity.val[2] = raw_image[2 * ((2 * i + 1) * cols + 2 * j) + 1];
+                intensity.val[0] =
+                    raw_image[2 * (2 * i * cols + (2 * j + 1)) + 1];
+                intensity.val[1] =
+                    (raw_image[2 * ((2 * i + 1) * cols + (2 * j + 1)) + 1] +
+                     raw_image[2 * (2 * i * cols + 2 * j) + 1]) /
+                    2;
+                intensity.val[2] =
+                    raw_image[2 * ((2 * i + 1) * cols + 2 * j) + 1];
 
                 reds[intensity.val[0]]++;
                 greens[intensity.val[1]]++;
                 blues[intensity.val[2]]++;
             }
         }
-        for (int i = 0; i < rows/2; i++) {
+        for (int i = 0; i < rows / 2; i++) {
             for (int j = 0; j < 256; j++) {
                 cv::Vec3b &intensity = cv_image.at<cv::Vec3b>(rows - i - 1, j);
                 if (i * 100 < reds[j]) {
@@ -139,8 +146,8 @@ int main(int argc, char *argv[]) {
         capture(cam, &analog_gain, &cds_gain, &shutterspeed);
     } catch (const Exception &ex) {
         cerr << "Exception " << ex.Name() << " occurred" << endl
-            << ex.Message() << endl;
-    } catch(...) {
+             << ex.Message() << endl;
+    } catch (...) {
         cerr << "Unhandled excpetion" << endl;
     }
     cout << analog_gain << " " << cds_gain << " " << shutterspeed << endl;
