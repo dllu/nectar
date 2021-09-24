@@ -1,7 +1,8 @@
 close all;
 a = [];
-for ind=0:81
-    f = fopen(sprintf('../build/im%04d.bin', ind));
+for ind=10:21
+    ind
+    f = fopen(sprintf('/home/dllu/pictures/linescan/nyc4/im%04d.bin', ind));
     a = [a; fread(f, 16777216)];
     fclose(f);
 end
@@ -11,4 +12,6 @@ g = (aa(2:2:end,2:2:end) + aa(1:2:end,1:2:end)) / 2;
 r = aa(1:2:end,2:2:end);
 %imshow(aa' / max(aa(:)));
 rgb = cat(3, r, g, b);
-imshow(rgb / max(rgb(:)));
+rgb = rgb / max(rgb(:));
+%imshow(rgb / max(rgb(:)));
+imwrite(sqrt(rgb), 'nyc4.jpg');
