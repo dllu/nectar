@@ -1,0 +1,6 @@
+
+CompileFlags: # Tweak the parse settings
+  Add: 
+    - "--include-directory=/usr/local/include/libalkusb3"
+    - "--include-directory=/usr/include/opencv4"
+    - "--include-directory=/usr/include/SDL2"
