@@ -14,6 +14,7 @@ using namespace CAlkUSB3;
 
 constexpr int rows = 192;
 constexpr int cols = 4096;
+constexpr int imsize = rows * (cols / 2) * 3;
 
 /*
 void printColorCodings(INectaCamera &cam) {
@@ -36,52 +37,79 @@ void printVideoModes(INectaCamera &cam) {
 }
 
 template <class T>
-cv::Mat demosaic(const T &raw_image) {
-    cv::Mat cv_image(rows, cols / 2, CV_8UC3, cv::Scalar(0, 0, 0));
-    std::vector<int> reds(256, 0);
-    std::vector<int> greens(256, 0);
-    std::vector<int> blues(256, 0);
+std::array<uint8_t, imsize> viz(const T &raw_image) {
+    std::array<uint8_t, imsize> rgb_image;
+    std::array<int, 256> reds;
+    std::array<int, 256> greens;
+    std::array<int, 256> blues;
+    std::fill(rgb_image.begin(), rgb_image.end(), 0);
     std::fill(reds.begin(), reds.end(), 0);
     std::fill(greens.begin(), greens.end(), 0);
     std::fill(blues.begin(), blues.end(), 0);
 
+    // make image
     for (int i = 0; i < rows / 2; i++) {
         for (int j = 0; j < cols / 2; j++) {
-            cv::Vec3b &intensity = cv_image.at<cv::Vec3b>(i, j);
-
-            intensity.val[0] = raw_image[2 * (2 * i * cols + (2 * j + 1)) + 1];
-            intensity.val[1] =
+            int ind = (j + cols / 2 * i) * 3;
+            rgb_image[ind] = raw_image[2 * (2 * i * cols + (2 * j + 1)) + 1];
+            rgb_image[ind + 1] =
                 (raw_image[2 * ((2 * i + 1) * cols + (2 * j + 1)) + 1] +
                  raw_image[2 * (2 * i * cols + 2 * j) + 1]) /
                 2;
-            intensity.val[2] = raw_image[2 * ((2 * i + 1) * cols + 2 * j) + 1];
+            rgb_image[ind + 2] =
+                raw_image[2 * ((2 * i + 1) * cols + 2 * j) + 1];
 
-            reds[intensity.val[0]]++;
-            greens[intensity.val[1]]++;
-            blues[intensity.val[2]]++;
+            reds[rgb_image[ind]]++;
+            greens[rgb_image[ind + 1]]++;
+            blues[rgb_image[ind + 2]]++;
         }
     }
+    // make a histogram
     for (int i = 0; i < rows / 2; i++) {
         for (int j = 0; j < 256; j++) {
-            cv::Vec3b &intensity = cv_image.at<cv::Vec3b>(rows - i - 1, j);
+            int ind = (j + cols / 2 * (rows - i - 1)) * 3;
             if (i * 100 < reds[j]) {
-                intensity.val[0] = 255;
+                rgb_image[ind + 0] = 255;
             } else {
-                intensity.val[0] = 0;
+                rgb_image[ind + 0] = 0;
             }
             if (i * 100 < greens[j]) {
-                intensity.val[1] = 255;
+                rgb_image[ind + 1] = 255;
             } else {
-                intensity.val[1] = 0;
+                rgb_image[ind + 1] = 0;
             }
             if (i * 100 < blues[j]) {
-                intensity.val[2] = 255;
+                rgb_image[ind + 2] = 255;
             } else {
-                intensity.val[2] = 0;
+                rgb_image[ind + 2] = 0;
             }
         }
     }
-    return cv_image;
+    return rgb_image;
+}
+
+void draw_image(const uint8_t *const image_data) {
+    GLuint image_texture;
+    glGenTextures(1, &image_texture);
+    glBindTexture(GL_TEXTURE_2D, image_texture);
+
+    // Setup filtering parameters for display
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                    GL_CLAMP_TO_EDGE);  // This is required on WebGL for non
+                                        // power-of-two textures
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                    GL_CLAMP_TO_EDGE);  // Same
+
+    // Upload pixels into texture
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, cols / 2, rows, 0, GL_RGB,
+                 GL_UNSIGNED_BYTE, image_data);
+
+    ImGui::Begin("Capture preview");
+    ImGui::Text("size = %d x %d", cols / 2, rows);
+    ImGui::Image((void *)(intptr_t)image_texture, ImVec2(cols / 2, rows));
+    ImGui::End();
 }
 
 void capture(INectaCamera &cam, int *gain, int *cds_gain, int *shutter) {
@@ -89,7 +117,9 @@ void capture(INectaCamera &cam, int *gain, int *cds_gain, int *shutter) {
     cam.SetCDSGain(*cds_gain);
     cam.SetShutter(*shutter);
     // Get new frame
-    auto raw_image = cam.GetRawData();
+    const auto raw_image = cam.GetRawData();
+    const auto rgb_image = viz(raw_image);
+    draw_image(rgb_image.data());
 }
 
 INectaCamera &get_camera() {
@@ -169,9 +199,6 @@ int main(int argc, char *argv[]) {
     ImGui::CreateContext();
     ImGuiIO &io = ImGui::GetIO();
     (void)io;
-    // io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;     // Enable
-    // Keyboard Controls io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad; //
-    // Enable Gamepad Controls
 
     // Setup Dear ImGui style
     ImGui::StyleColorsDark();
@@ -181,9 +208,6 @@ int main(int argc, char *argv[]) {
     ImGui_ImplSDL2_InitForOpenGL(window, gl_context);
     ImGui_ImplOpenGL3_Init(glsl_version);
 
-    std::cerr << "Starting acquisition..." << std::endl;
-    // Start acquisition
-
     int analog_gain = 10;
     int cds_gain = 1;
     int shutterspeed = 2000;
@@ -192,13 +216,12 @@ int main(int argc, char *argv[]) {
     unsigned char *tex_pixels = NULL;
     int tex_w, tex_h;
     io.Fonts->GetTexDataAsRGBA32(&tex_pixels, &tex_w, &tex_h);
-    ImVec4 clear_color = ImVec4(0.45f, 0.55f, 0.60f, 1.00f);
-    // INectaCamera &cam = get_camera();
+    ImVec4 clear_color = ImVec4(0.00f, 0.00f, 0.00f, 1.00f);
+    INectaCamera &cam = get_camera();
     bool capturing = false;
     bool done = false;
     while (!done) {
         io.DisplaySize = ImVec2(1920, 1080);
-        io.DeltaTime = 1.0f / 60.0f;
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             ImGui_ImplSDL2_ProcessEvent(&event);
@@ -213,10 +236,9 @@ int main(int argc, char *argv[]) {
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
-        ImGui::Text("Hello, world %d", 123);
         if (ImGui::Button("Capture")) {
             capturing = !capturing;
-            // cam.SetAcquire(capturing);
+            cam.SetAcquire(capturing);
         }
         if (ImGui::Button("Save")) {
         }
@@ -228,7 +250,7 @@ int main(int argc, char *argv[]) {
         ImGui::SliderInt("shutterspeed", &shutterspeed, 0, 10000);
         if (capturing) {
             try {
-                // capture(cam, &analog_gain, &cds_gain, &shutterspeed);
+                capture(cam, &analog_gain, &cds_gain, &shutterspeed);
             } catch (const Exception &ex) {
                 std::cerr << "Exception " << ex.Name() << " occurred"
                           << std::endl
