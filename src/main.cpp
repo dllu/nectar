@@ -30,14 +30,6 @@ class NectarCapturer {
     const int hist_w = 512;
     const int histogram_size = hist_h * hist_w * 3;
 
-    void printVideoModes(INectaCamera &cam) {
-        auto acc = cam.GetAvailableVideoModes();
-        for (size_t cc = 0; cc < acc.Size(); cc++) {
-            std::cerr << (int)(acc[cc].GetVideoMode()) << std::endl;
-        }
-        std::cerr << "selected: " << (int)cam.GetVideoMode() << std::endl;
-    }
-
     template <class T>
     std::tuple<std::vector<uint8_t>, std::vector<uint8_t>, std::vector<uint8_t>>
     viz(const T &raw_image) {
@@ -55,7 +47,7 @@ class NectarCapturer {
         // make image
         for (int i = 0; i < rows / 2; i++) {
             for (int j = 0; j < cols / 2; j++) {
-                int ind = (j + cols / 2 * i) * 3;
+                const int ind = (j + cols / 2 * i) * 3;
                 rgb_image[ind] =
                     raw_image[2 * (2 * i * cols + (2 * j + 1)) + 1];
                 rgb_image[ind + 1] =
@@ -73,20 +65,18 @@ class NectarCapturer {
         // punched in
         for (int i = 0; i < rows / 2; i++) {
             for (int j = 0; j < cols / 8; j++) {
-                // 2048
-                // 512
-                // 768 + 768 + 512 = 2048
-                int ind_cropped = (j + cols / 8 * i) * 3;
-                int ind = (j + (cols / 2 - cols - 8) / 2 + cols / 2 * i) * 3;
+                const int ind_cropped = (j + cols / 8 * i) * 3;
+                const int ind =
+                    (j + (cols / 2 - cols / 8) / 2 + cols / 2 * i) * 3;
                 for (int k = 0; k < 3; k++) {
-                    rgb_image_cropped[ind_cropped + k] = rgb_image[ind + k];
+                    // rgb_image_cropped[ind_cropped + k] = rgb_image[ind + k];
                 }
             }
         }
         // make a histogram
         for (int i = 0; i < hist_h; i++) {
             for (int j = 0; j < hist_w; j++) {
-                int ind = (j + i * hist_w) * 3;
+                const int ind = (j + i * hist_w) * 3;
                 if (i * 100 < reds[j / 2]) {
                     histogram[ind + 0] = 255;
                 } else {
@@ -127,7 +117,6 @@ class NectarCapturer {
                      GL_UNSIGNED_BYTE, image_data);
 
         ImGui::Image((void *)(intptr_t)image_texture, ImVec2(w_disp, h_disp));
-        ImGui::End();
     }
 
    public:
@@ -137,15 +126,20 @@ class NectarCapturer {
         cam.SetShutter(shutterspeed);
 
         // rows * shutter = 1000000 / 30 microseconds
-        rows = std::ceil(1.0e6 / 30.0 / shutterspeed);
-        rows = (rows / 16 + 1) * 16;
-        cam.SetImageSizeX(cols);
-        cam.SetImageSizeY(rows);
+        int new_rows = std::ceil(1.0e6 / 30.0 / shutterspeed);
+        new_rows = (new_rows / 16 + 1) * 16;
+        if (new_rows != rows) {
+            cam.SetAcquire(false);
+            cam.SetImageSizeX(cols);
+            cam.SetImageSizeY(new_rows);
+            cam.SetAcquire(true);
+            rows = new_rows;
+        }
 
         // Get new frame
         const auto raw_image = cam.GetRawData();
         const auto [rgb_image, rgb_image_cropped, histogram] = viz(raw_image);
-        ImGui::Begin("Capture preview");
+        ImGui::Text("rows = %d", rows);
         draw_image(rgb_image.data(), cols / 2, rows / 2, cols / 2, rows / 2);
         draw_image(rgb_image_cropped.data(), cols / 8, rows / 2, cols / 2,
                    rows / 2);
@@ -154,7 +148,7 @@ class NectarCapturer {
             std::ofstream fout;
             std::stringstream ss;
 
-            ss << "im" << std::setfill('0') << std::setw(4) << frame_id++
+            ss << "im" << std::setfill('0') << std::setw(6) << frame_id++
                << ".bin";
             fout.open(ss.str(), std::ios::out | std::ios::binary);
             fout.write((char *)raw_image.Data(), raw_image.Size());
@@ -162,6 +156,14 @@ class NectarCapturer {
         }
     }
 };
+
+void print_video_modes(INectaCamera &cam) {
+    auto acc = cam.GetAvailableVideoModes();
+    for (size_t cc = 0; cc < acc.Size(); cc++) {
+        std::cerr << (int)(acc[cc].GetVideoMode()) << std::endl;
+    }
+    std::cerr << "selected: " << (int)cam.GetVideoMode() << std::endl;
+}
 
 INectaCamera &get_camera() {
     INectaCamera &cam = INectaCamera::Create();
@@ -232,9 +234,9 @@ struct SdlGlGui {
         SDL_WindowFlags window_flags =
             (SDL_WindowFlags)(SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE |
                               SDL_WINDOW_ALLOW_HIGHDPI);
-        window = SDL_CreateWindow(
-            "Dear ImGui SDL2+OpenGL3 example", SDL_WINDOWPOS_CENTERED,
-            SDL_WINDOWPOS_CENTERED, 1280, 720, window_flags);
+        window =
+            SDL_CreateWindow("Nectar UI", SDL_WINDOWPOS_CENTERED,
+                             SDL_WINDOWPOS_CENTERED, 1280, 720, window_flags);
         gl_context = SDL_GL_CreateContext(window);
         SDL_GL_MakeCurrent(window, gl_context);
         SDL_GL_SetSwapInterval(1);  // Enable vsync
@@ -266,7 +268,6 @@ int main(int argc, char *argv[]) {
     io.Fonts->GetTexDataAsRGBA32(&tex_pixels, &tex_w, &tex_h);
     ImVec4 clear_color = ImVec4(0.00f, 0.00f, 0.00f, 1.00f);
     INectaCamera &cam = get_camera();
-    bool capturing = false;
     bool done = false;
 
     NectarCapturer nc;
@@ -292,9 +293,11 @@ int main(int argc, char *argv[]) {
         if (ImGui::Button("Quit")) {
             done = true;
         }
-        ImGui::SliderInt("analog_gain", &nc.analog_gain, 0, 20);
-        ImGui::SliderInt("cds_gain", &nc.cds_gain, 0, 1);
-        ImGui::SliderInt("shutterspeed", &nc.shutterspeed, 0, 10000);
+        if (!nc.save) {
+            ImGui::SliderInt("analog_gain", &nc.analog_gain, 0, 20);
+            ImGui::SliderInt("cds_gain", &nc.cds_gain, 0, 1);
+            ImGui::SliderInt("shutterspeed", &nc.shutterspeed, 0, 10000);
+        }
         try {
             nc.capture(cam);
         } catch (const Exception &ex) {
