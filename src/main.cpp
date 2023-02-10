@@ -12,115 +12,119 @@
 
 using namespace CAlkUSB3;
 
-constexpr int rows = 192;
-constexpr int cols = 4096;
-constexpr int imsize = rows * (cols / 2) * 3;
+class NectarCapturer {
+    int rows = 192;
+    int cols = 4096;
 
-/*
-void printColorCodings(INectaCamera &cam) {
-    auto acc = cam.GetAvailableColorCoding();
-    for (auto cc = acc.Front(); 1; cc++) {
-        std::cerr << cc->ToString() << std::endl;
-        if (cc == acc.Back()) {
-            break;
+    const int hist_h = 256;
+    const int hist_w = 512;
+    const int histogram_size = hist_h * hist_w * 3;
+
+    void printVideoModes(INectaCamera &cam) {
+        auto acc = cam.GetAvailableVideoModes();
+        for (size_t cc = 0; cc < acc.Size(); cc++) {
+            std::cerr << (int)(acc[cc].GetVideoMode()) << std::endl;
         }
+        std::cerr << "selected: " << (int)cam.GetVideoMode() << std::endl;
     }
-}
-*/
 
-void printVideoModes(INectaCamera &cam) {
-    auto acc = cam.GetAvailableVideoModes();
-    for (size_t cc = 0; cc < acc.Size(); cc++) {
-        std::cerr << (int)(acc[cc].GetVideoMode()) << std::endl;
-    }
-    std::cerr << "selected: " << (int)cam.GetVideoMode() << std::endl;
-}
+    template <class T>
+    std::tuple<std::vector<uint8_t>, std::vector<uint8_t>> viz(
+        const T &raw_image) {
+        std::vector<uint8_t> rgb_image((rows / 2) * (cols / 2) * 3, 0);
 
-template <class T>
-std::array<uint8_t, imsize> viz(const T &raw_image) {
-    std::array<uint8_t, imsize> rgb_image;
-    std::array<int, 256> reds;
-    std::array<int, 256> greens;
-    std::array<int, 256> blues;
-    std::fill(rgb_image.begin(), rgb_image.end(), 0);
-    std::fill(reds.begin(), reds.end(), 0);
-    std::fill(greens.begin(), greens.end(), 0);
-    std::fill(blues.begin(), blues.end(), 0);
+        std::array<int, 256> reds;
+        std::array<int, 256> greens;
+        std::array<int, 256> blues;
+        std::fill(reds.begin(), reds.end(), 0);
+        std::fill(greens.begin(), greens.end(), 0);
+        std::fill(blues.begin(), blues.end(), 0);
 
-    // make image
-    for (int i = 0; i < rows / 2; i++) {
-        for (int j = 0; j < cols / 2; j++) {
-            int ind = (j + cols / 2 * i) * 3;
-            rgb_image[ind] = raw_image[2 * (2 * i * cols + (2 * j + 1)) + 1];
-            rgb_image[ind + 1] =
-                (raw_image[2 * ((2 * i + 1) * cols + (2 * j + 1)) + 1] +
-                 raw_image[2 * (2 * i * cols + 2 * j) + 1]) /
-                2;
-            rgb_image[ind + 2] =
-                raw_image[2 * ((2 * i + 1) * cols + 2 * j) + 1];
+        std::vector<uint8_t> histogram(histogram_size, 0);
+        // make image
+        for (int i = 0; i < rows / 2; i++) {
+            for (int j = 0; j < cols / 2; j++) {
+                int ind = (j + cols / 2 * i) * 3;
+                rgb_image[ind] =
+                    raw_image[2 * (2 * i * cols + (2 * j + 1)) + 1];
+                rgb_image[ind + 1] =
+                    (raw_image[2 * ((2 * i + 1) * cols + (2 * j + 1)) + 1] +
+                     raw_image[2 * (2 * i * cols + 2 * j) + 1]) /
+                    2;
+                rgb_image[ind + 2] =
+                    raw_image[2 * ((2 * i + 1) * cols + 2 * j) + 1];
 
-            reds[rgb_image[ind]]++;
-            greens[rgb_image[ind + 1]]++;
-            blues[rgb_image[ind + 2]]++;
-        }
-    }
-    // make a histogram
-    for (int i = 0; i < rows / 2; i++) {
-        for (int j = 0; j < 256; j++) {
-            int ind = (j + cols / 2 * (rows - i - 1)) * 3;
-            if (i * 100 < reds[j]) {
-                rgb_image[ind + 0] = 255;
-            } else {
-                rgb_image[ind + 0] = 0;
-            }
-            if (i * 100 < greens[j]) {
-                rgb_image[ind + 1] = 255;
-            } else {
-                rgb_image[ind + 1] = 0;
-            }
-            if (i * 100 < blues[j]) {
-                rgb_image[ind + 2] = 255;
-            } else {
-                rgb_image[ind + 2] = 0;
+                reds[rgb_image[ind]]++;
+                greens[rgb_image[ind + 1]]++;
+                blues[rgb_image[ind + 2]]++;
             }
         }
+        // make a histogram
+        for (int i = 0; i < hist_h; i++) {
+            for (int j = 0; j < hist_w; j++) {
+                int ind = (j + i * hist_w) * 3;
+                if (i * 100 < reds[j / 2]) {
+                    histogram[ind + 0] = 255;
+                } else {
+                    histogram[ind + 0] = 0;
+                }
+                if (i * 100 < greens[j / 2]) {
+                    histogram[ind + 1] = 255;
+                } else {
+                    histogram[ind + 1] = 0;
+                }
+                if (i * 100 < blues[j / 2]) {
+                    histogram[ind + 2] = 255;
+                } else {
+                    histogram[ind + 2] = 0;
+                }
+            }
+        }
+        return make_tuple(rgb_image, histogram);
     }
-    return rgb_image;
-}
 
-void draw_image(const uint8_t *const image_data) {
-    GLuint image_texture;
-    glGenTextures(1, &image_texture);
-    glBindTexture(GL_TEXTURE_2D, image_texture);
+    void draw_image(const uint8_t *const image_data, const int w, const int h) {
+        GLuint image_texture;
+        glGenTextures(1, &image_texture);
+        glBindTexture(GL_TEXTURE_2D, image_texture);
 
-    // Setup filtering parameters for display
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
-                    GL_CLAMP_TO_EDGE);  // This is required on WebGL for non
-                                        // power-of-two textures
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
-                    GL_CLAMP_TO_EDGE);  // Same
+        // Setup filtering parameters for display
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                        GL_CLAMP_TO_EDGE);  // This is required on WebGL for non
+                                            // power-of-two textures
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                        GL_CLAMP_TO_EDGE);  // Same
 
-    // Upload pixels into texture
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, cols / 2, rows, 0, GL_RGB,
-                 GL_UNSIGNED_BYTE, image_data);
+        // Upload pixels into texture
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, cols / 2, rows, 0, GL_RGB,
+                     GL_UNSIGNED_BYTE, image_data);
 
-    ImGui::Begin("Capture preview");
-    ImGui::Text("size = %d x %d", cols / 2, rows);
-    ImGui::Image((void *)(intptr_t)image_texture, ImVec2(cols / 2, rows));
-    ImGui::End();
-}
+        ImGui::Begin("Capture preview");
+        ImGui::Text("size = %d x %d", w, h);
+        ImGui::Image((void *)(intptr_t)image_texture, ImVec2(w, h));
+        ImGui::End();
+    }
 
-void capture(INectaCamera &cam, int *gain, int *cds_gain, int *shutter) {
-    cam.SetGain(*gain);
-    cam.SetCDSGain(*cds_gain);
-    cam.SetShutter(*shutter);
-    // Get new frame
-    const auto raw_image = cam.GetRawData();
-    const auto rgb_image = viz(raw_image);
-    draw_image(rgb_image.data());
-}
+   public:
+    void capture(INectaCamera &cam, int *gain, int *cds_gain, int *shutter) {
+        cam.SetGain(*gain);
+        cam.SetCDSGain(*cds_gain);
+        cam.SetShutter(*shutter);
+
+        // rows * shutter = 1000000 / 60
+        rows = 1.0e3 / 60 / *shutter;
+        cam.SetImageSizeX(cols);
+        cam.SetImageSizeY(rows);
+
+        // Get new frame
+        const auto raw_image = cam.GetRawData();
+        const auto [rgb_image, histogram] = viz(raw_image);
+        draw_image(rgb_image.data(), cols / 2, rows / 2);
+        draw_image(histogram.data(), hist_w, hist_h);
+    }
+};
 
 INectaCamera &get_camera() {
     INectaCamera &cam = INectaCamera::Create();
@@ -137,8 +141,6 @@ INectaCamera &get_camera() {
     cam.SetADCResolution(12);
     cam.SetVideoMode(1);
     cam.SetColorCoding(ColorCoding::Raw16);
-    cam.SetImageSizeX(cols);
-    cam.SetImageSizeY(rows);
 
     cam.SetPacketSize(std::min(16384U, cam.GetMaxPacketSize()));
     return cam;
@@ -220,6 +222,8 @@ int main(int argc, char *argv[]) {
     INectaCamera &cam = get_camera();
     bool capturing = false;
     bool done = false;
+
+    NectarCapturer nc;
     while (!done) {
         io.DisplaySize = ImVec2(1920, 1080);
         SDL_Event event;
@@ -250,7 +254,7 @@ int main(int argc, char *argv[]) {
         ImGui::SliderInt("shutterspeed", &shutterspeed, 0, 10000);
         if (capturing) {
             try {
-                capture(cam, &analog_gain, &cds_gain, &shutterspeed);
+                nc.capture(cam, &analog_gain, &cds_gain, &shutterspeed);
             } catch (const Exception &ex) {
                 std::cerr << "Exception " << ex.Name() << " occurred"
                           << std::endl

@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.1)
+cmake_minimum_required(VERSION 3.11)
 project(necta)
 set(OpenGL_GL_PREFERENCE GLVND)
 
@@ -22,7 +22,7 @@ set(NECTA_LIBRARIES
 
 ################################################################
 
-set(CMAKE_CXX_FLAGS         "${CMAKE_CXX_FLAGS} -std=c++11")
+set(CMAKE_CXX_FLAGS         "${CMAKE_CXX_FLAGS} -std=c++17")
 set(CMAKE_CXX_FLAGS_DEBUG   "${CMAKE_CXX_FLAGS_DEBUG} -Og -g -Wall")
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -march=native")
 
