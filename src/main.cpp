@@ -5,6 +5,8 @@
 #include <imgui_impl_opengl3.h>
 #include <imgui_impl_sdl.h>
 
+#include <cmath>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <opencv2/core/core.hpp>
@@ -13,6 +15,14 @@
 using namespace CAlkUSB3;
 
 class NectarCapturer {
+   public:
+    bool save = false;
+    int analog_gain = 10;
+    int cds_gain = 1;
+    int shutterspeed = 2000;
+
+   private:
+    int frame_id = 0;
     int rows = 192;
     int cols = 4096;
 
@@ -29,9 +39,10 @@ class NectarCapturer {
     }
 
     template <class T>
-    std::tuple<std::vector<uint8_t>, std::vector<uint8_t>> viz(
-        const T &raw_image) {
+    std::tuple<std::vector<uint8_t>, std::vector<uint8_t>, std::vector<uint8_t>>
+    viz(const T &raw_image) {
         std::vector<uint8_t> rgb_image((rows / 2) * (cols / 2) * 3, 0);
+        std::vector<uint8_t> rgb_image_cropped((rows / 2) * (cols / 8) * 3, 0);
 
         std::array<int, 256> reds;
         std::array<int, 256> greens;
@@ -59,6 +70,19 @@ class NectarCapturer {
                 blues[rgb_image[ind + 2]]++;
             }
         }
+        // punched in
+        for (int i = 0; i < rows / 2; i++) {
+            for (int j = 0; j < cols / 8; j++) {
+                // 2048
+                // 512
+                // 768 + 768 + 512 = 2048
+                int ind_cropped = (j + cols / 8 * i) * 3;
+                int ind = (j + (cols / 2 - cols - 8) / 2 + cols / 2 * i) * 3;
+                for (int k = 0; k < 3; k++) {
+                    rgb_image_cropped[ind_cropped + k] = rgb_image[ind + k];
+                }
+            }
+        }
         // make a histogram
         for (int i = 0; i < hist_h; i++) {
             for (int j = 0; j < hist_w; j++) {
@@ -80,10 +104,11 @@ class NectarCapturer {
                 }
             }
         }
-        return make_tuple(rgb_image, histogram);
+        return make_tuple(rgb_image, rgb_image_cropped, histogram);
     }
 
-    void draw_image(const uint8_t *const image_data, const int w, const int h) {
+    void draw_image(const uint8_t *const image_data, const int w, const int h,
+                    const int w_disp, const int h_disp) {
         GLuint image_texture;
         glGenTextures(1, &image_texture);
         glBindTexture(GL_TEXTURE_2D, image_texture);
@@ -98,31 +123,43 @@ class NectarCapturer {
                         GL_CLAMP_TO_EDGE);  // Same
 
         // Upload pixels into texture
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, cols / 2, rows, 0, GL_RGB,
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGB,
                      GL_UNSIGNED_BYTE, image_data);
 
-        ImGui::Begin("Capture preview");
-        ImGui::Text("size = %d x %d", w, h);
-        ImGui::Image((void *)(intptr_t)image_texture, ImVec2(w, h));
+        ImGui::Image((void *)(intptr_t)image_texture, ImVec2(w_disp, h_disp));
         ImGui::End();
     }
 
    public:
-    void capture(INectaCamera &cam, int *gain, int *cds_gain, int *shutter) {
-        cam.SetGain(*gain);
-        cam.SetCDSGain(*cds_gain);
-        cam.SetShutter(*shutter);
+    void capture(INectaCamera &cam) {
+        cam.SetGain(analog_gain);
+        cam.SetCDSGain(cds_gain);
+        cam.SetShutter(shutterspeed);
 
-        // rows * shutter = 1000000 / 60
-        rows = 1.0e3 / 60 / *shutter;
+        // rows * shutter = 1000000 / 30 microseconds
+        rows = std::ceil(1.0e6 / 30.0 / shutterspeed);
+        rows = (rows / 16 + 1) * 16;
         cam.SetImageSizeX(cols);
         cam.SetImageSizeY(rows);
 
         // Get new frame
         const auto raw_image = cam.GetRawData();
-        const auto [rgb_image, histogram] = viz(raw_image);
-        draw_image(rgb_image.data(), cols / 2, rows / 2);
-        draw_image(histogram.data(), hist_w, hist_h);
+        const auto [rgb_image, rgb_image_cropped, histogram] = viz(raw_image);
+        ImGui::Begin("Capture preview");
+        draw_image(rgb_image.data(), cols / 2, rows / 2, cols / 2, rows / 2);
+        draw_image(rgb_image_cropped.data(), cols / 8, rows / 2, cols / 2,
+                   rows / 2);
+        draw_image(histogram.data(), hist_w, hist_h, hist_w, hist_h);
+        if (save) {
+            std::ofstream fout;
+            std::stringstream ss;
+
+            ss << "im" << std::setfill('0') << std::setw(4) << frame_id++
+               << ".bin";
+            fout.open(ss.str(), std::ios::out | std::ios::binary);
+            fout.write((char *)raw_image.Data(), raw_image.Size());
+            fout.close();
+        }
     }
 };
 
@@ -132,7 +169,7 @@ INectaCamera &get_camera() {
     Array<String> camList = cam.GetCameraList();
     if (camList.Size() == 0) {
         std::cerr << "No AlkUSB3 camera found" << std::endl;
-        exit(1);
+        std::exit(1);
     }
 
     cam.SetCamera(0);
@@ -143,76 +180,85 @@ INectaCamera &get_camera() {
     cam.SetColorCoding(ColorCoding::Raw16);
 
     cam.SetPacketSize(std::min(16384U, cam.GetMaxPacketSize()));
+    cam.SetAcquire(true);
     return cam;
 }
 
-int main(int argc, char *argv[]) {
-    // Setup SDL
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_GAMECONTROLLER) !=
-        0) {
-        printf("Error: %s\n", SDL_GetError());
-        return -1;
-    }
+struct SdlGlGui {
+    std::string glsl_version;
+    SDL_GLContext gl_context;
+    SDL_Window *window;
+    SdlGlGui() {
+        // Setup SDL
+        if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER |
+                     SDL_INIT_GAMECONTROLLER) != 0) {
+            printf("Error: %s\n", SDL_GetError());
+            std::exit(1);
+        }
 
-    // Decide GL+GLSL versions
+        // Decide GL+GLSL versions
 #if defined(IMGUI_IMPL_OPENGL_ES2)
-    // GL ES 2.0 + GLSL 100
-    const char *glsl_version = "#version 100";
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, 0);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+        // GL ES 2.0 + GLSL 100
+        glsl_version = "#version 100";
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, 0);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
+                            SDL_GL_CONTEXT_PROFILE_ES);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
 #elif defined(__APPLE__)
-    // GL 3.2 Core + GLSL 150
-    const char *glsl_version = "#version 150";
-    SDL_GL_SetAttribute(
-        SDL_GL_CONTEXT_FLAGS,
-        SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);  // Always required on Mac
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
-                        SDL_GL_CONTEXT_PROFILE_CORE);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
+        // GL 3.2 Core + GLSL 150
+        glsl_version = "#version 150";
+        SDL_GL_SetAttribute(
+            SDL_GL_CONTEXT_FLAGS,
+            SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);  // Always required on Mac
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
+                            SDL_GL_CONTEXT_PROFILE_CORE);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
 #else
-    // GL 3.0 + GLSL 130
-    const char *glsl_version = "#version 130";
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, 0);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
-                        SDL_GL_CONTEXT_PROFILE_CORE);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+        // GL 3.0 + GLSL 130
+        glsl_version = "#version 130";
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, 0);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
+                            SDL_GL_CONTEXT_PROFILE_CORE);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
 #endif
 
-    // Create window with graphics context
-    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
-    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
-    SDL_WindowFlags window_flags =
-        (SDL_WindowFlags)(SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE |
-                          SDL_WINDOW_ALLOW_HIGHDPI);
-    SDL_Window *window = SDL_CreateWindow(
-        "Dear ImGui SDL2+OpenGL3 example", SDL_WINDOWPOS_CENTERED,
-        SDL_WINDOWPOS_CENTERED, 1280, 720, window_flags);
-    SDL_GLContext gl_context = SDL_GL_CreateContext(window);
-    SDL_GL_MakeCurrent(window, gl_context);
-    SDL_GL_SetSwapInterval(1);  // Enable vsync
-                                //
+        // Create window with graphics context
+        SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+        SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
+        SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
+        SDL_WindowFlags window_flags =
+            (SDL_WindowFlags)(SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE |
+                              SDL_WINDOW_ALLOW_HIGHDPI);
+        window = SDL_CreateWindow(
+            "Dear ImGui SDL2+OpenGL3 example", SDL_WINDOWPOS_CENTERED,
+            SDL_WINDOWPOS_CENTERED, 1280, 720, window_flags);
+        gl_context = SDL_GL_CreateContext(window);
+        SDL_GL_MakeCurrent(window, gl_context);
+        SDL_GL_SetSwapInterval(1);  // Enable vsync
+    }
+
+    ~SdlGlGui() {
+        SDL_GL_DeleteContext(gl_context);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+    }
+};
+
+int main(int argc, char *argv[]) {
+    SdlGlGui sdl_gl_gui;
     // Setup Dear ImGui context
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO &io = ImGui::GetIO();
-    (void)io;
 
-    // Setup Dear ImGui style
     ImGui::StyleColorsDark();
-    // ImGui::StyleColorsLight();
 
     // Setup Platform/Renderer backends
-    ImGui_ImplSDL2_InitForOpenGL(window, gl_context);
-    ImGui_ImplOpenGL3_Init(glsl_version);
-
-    int analog_gain = 10;
-    int cds_gain = 1;
-    int shutterspeed = 2000;
+    ImGui_ImplSDL2_InitForOpenGL(sdl_gl_gui.window, sdl_gl_gui.gl_context);
+    ImGui_ImplOpenGL3_Init(sdl_gl_gui.glsl_version.c_str());
 
     // Build atlas
     unsigned char *tex_pixels = NULL;
@@ -232,7 +278,7 @@ int main(int argc, char *argv[]) {
             if (event.type == SDL_QUIT) done = true;
             if (event.type == SDL_WINDOWEVENT &&
                 event.window.event == SDL_WINDOWEVENT_CLOSE &&
-                event.window.windowID == SDL_GetWindowID(window))
+                event.window.windowID == SDL_GetWindowID(sdl_gl_gui.window))
                 done = true;
         }
 
@@ -240,29 +286,23 @@ int main(int argc, char *argv[]) {
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
-        if (ImGui::Button("Capture")) {
-            capturing = !capturing;
-            cam.SetAcquire(capturing);
-        }
         if (ImGui::Button("Save")) {
+            nc.save = !nc.save;
         }
         if (ImGui::Button("Quit")) {
             done = true;
         }
-        ImGui::SliderInt("analog_gain", &analog_gain, 0, 20);
-        ImGui::SliderInt("cds_gain", &cds_gain, 0, 1);
-        ImGui::SliderInt("shutterspeed", &shutterspeed, 0, 10000);
-        if (capturing) {
-            try {
-                nc.capture(cam, &analog_gain, &cds_gain, &shutterspeed);
-            } catch (const Exception &ex) {
-                std::cerr << "Exception " << ex.Name() << " occurred"
-                          << std::endl
-                          << ex.Message() << std::endl;
-                ImGui::Text("Exception %s %s", ex.Name(), ex.Message());
-            } catch (...) {
-                std::cerr << "Unhandled exception" << std::endl;
-            }
+        ImGui::SliderInt("analog_gain", &nc.analog_gain, 0, 20);
+        ImGui::SliderInt("cds_gain", &nc.cds_gain, 0, 1);
+        ImGui::SliderInt("shutterspeed", &nc.shutterspeed, 0, 10000);
+        try {
+            nc.capture(cam);
+        } catch (const Exception &ex) {
+            std::cerr << "Exception " << ex.Name() << " occurred" << std::endl
+                      << ex.Message() << std::endl;
+            ImGui::Text("Exception %s %s", ex.Name(), ex.Message());
+        } catch (...) {
+            std::cerr << "Unhandled exception" << std::endl;
         }
         ImGui::Render();
         glViewport(0, 0, (int)io.DisplaySize.x, (int)io.DisplaySize.y);
@@ -271,14 +311,10 @@ int main(int argc, char *argv[]) {
                      clear_color.z * clear_color.w, clear_color.w);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-        SDL_GL_SwapWindow(window);
+        SDL_GL_SwapWindow(sdl_gl_gui.window);
     }
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplSDL2_Shutdown();
     ImGui::DestroyContext();
-
-    SDL_GL_DeleteContext(gl_context);
-    SDL_DestroyWindow(window);
-    SDL_Quit();
     return 0;
 }
