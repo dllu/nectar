@@ -1,7 +1,7 @@
 close all;
 a = [];
-p = '/home/dllu/pictures/linescan/2023-02-14-12:05:51'
-for ind=0:20
+p = '/home/dllu/pictures/linescan/2023-02-14-12:42:23'
+for ind=20:40
     ind
     f = fopen(sprintf([p '/im%06d.bin'], ind));
     ff = fread(f, 16777216);

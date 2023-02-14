@@ -322,7 +322,6 @@ int main(int argc, char *argv[]) {
     std::string output_dir;
 
     while (!done) {
-        io.DisplaySize = ImVec2(2560, 1440);
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             ImGui_ImplSDL2_ProcessEvent(&event);
@@ -337,6 +336,11 @@ int main(int argc, char *argv[]) {
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
+        ImGui::SetNextWindowPos(ImVec2(0, 0));
+        ImGui::SetNextWindowSize(io.DisplaySize);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+        ImGui::Begin("nectar", nullptr,
+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoResize);
         if (ImGui::Button("Quit")) {
             done = true;
         }
@@ -364,7 +368,8 @@ int main(int argc, char *argv[]) {
             ImGui::SliderInt("cds_gain", &nc.cds_gain, 0, 1);
             ImGui::SliderInt("shutterspeed", &nc.shutterspeed, 0, 10000);
         } else {
-            ImGui::Text("Saving to: %s; saved %d", output_dir.c_str(), nc.frame_id);
+            ImGui::Text("Saving to: %s; saved %d", output_dir.c_str(),
+                        nc.frame_id);
         }
         try {
             nc.capture(cam);
@@ -375,6 +380,8 @@ int main(int argc, char *argv[]) {
         } catch (...) {
             std::cerr << "Unhandled exception" << std::endl;
         }
+        ImGui::End();
+        ImGui::PopStyleVar(1);
         ImGui::Render();
         glViewport(0, 0, (int)io.DisplaySize.x, (int)io.DisplaySize.y);
         glClearColor(clear_color.x * clear_color.w,
