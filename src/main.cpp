@@ -7,6 +7,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -21,23 +22,34 @@ class NectarCapturer {
     int analog_gain = 10;
     int cds_gain = 1;
     int shutterspeed = 2000;
+    int frame_id = 0;
 
-    NectarCapturer() { std::fill(buffer.begin(), buffer.end(), 0); }
+    NectarCapturer()
+        : buffer(buffer_rows * cols * 2, 0),
+          rgb_image((buffer_rows / 2) * (cols / 2) * 3, 0),
+          rgb_image_cropped((buffer_rows / 2) * (cols / 8) * 3, 0) {
+        glGenTextures(1, &rgb_texture);
+        glGenTextures(1, &rgb_crop_texture);
+        glGenTextures(1, &hist_texture);
+    }
 
    private:
     std::chrono::time_point<std::chrono::steady_clock> last_frame_time;
-    int frame_id = 0;
     int capture_rows = 192;
     static constexpr int buffer_rows = 512;
     static constexpr int cols = 4096;
-    std::array<uint8_t, buffer_rows * cols * 2> buffer;
-    std::array<uint8_t, (buffer_rows / 2) * (cols / 2) * 3> rgb_image;
-    std::array<uint8_t, (buffer_rows / 2) * (cols / 8) * 3> rgb_image_cropped;
+    std::vector<uint8_t> buffer;
+    std::vector<uint8_t> rgb_image;
+    std::vector<uint8_t> rgb_image_cropped;
     int buffer_row_id = 0;
 
     static constexpr int hist_h = 256;
     static constexpr int hist_w = 512;
     static constexpr int histogram_size = hist_h * hist_w * 3;
+
+    GLuint rgb_texture;
+    GLuint rgb_crop_texture;
+    GLuint hist_texture;
 
     std::array<uint8_t, histogram_size> histogram;
     void viz() {
@@ -102,10 +114,9 @@ class NectarCapturer {
         }
     }
 
-    void draw_image(const uint8_t *const image_data, const int w, const int h,
-                    const int w_disp, const int h_disp) {
-        GLuint image_texture;
-        glGenTextures(1, &image_texture);
+    void draw_image(const GLuint image_texture, const uint8_t *const image_data,
+                    const int w, const int h, const int w_disp,
+                    const int h_disp) {
         glBindTexture(GL_TEXTURE_2D, image_texture);
 
         // Setup filtering parameters for display
@@ -139,50 +150,58 @@ class NectarCapturer {
         }
         // whyy
         new_rows *= 16;
+        const int new_capture_rows = std::min(buffer_rows, new_rows);
 
-        if (new_rows != capture_rows) {
+        if (capture_rows != new_capture_rows) {
             cam.SetAcquire(false);
             cam.SetImageSizeX(cols);
-            cam.SetImageSizeY(new_rows);
+            cam.SetImageSizeY(new_capture_rows);
             cam.SetAcquire(true);
-            capture_rows = new_rows;
+            buffer_row_id = 0;
+            capture_rows = new_capture_rows;
         }
+        const auto t0 = std::chrono::steady_clock::now();
+        const int capture_frames = std::max(1, new_rows / buffer_rows);
+        for (int capture_ind = 0; capture_ind < capture_frames; capture_ind++) {
+            // Get new frame
+            const auto raw_image = cam.GetRawData();
 
-        // Get new frame
-        const auto raw_image = cam.GetRawData();
-
-        for (int i = 0; i < capture_rows; i++) {
-            for (int j = 0; j < cols; j++) {
-                for (int k = 0; k < 2; k++) {
-                    buffer[2 * ((i + buffer_row_id) * cols + j) + k] =
-                        raw_image[2 * (i * cols + j) + k];
+            for (int i = 0; i < capture_rows; i++) {
+                for (int j = 0; j < cols; j++) {
+                    for (int k = 0; k < 2; k++) {
+                        buffer[2 * ((i + buffer_row_id) * cols + j) + k] =
+                            raw_image[2 * (i * cols + j) + k];
+                    }
                 }
             }
+            viz();
+            buffer_row_id = (buffer_row_id + capture_rows) % buffer_rows;
+
+            if (save && buffer_row_id == 0) {
+                std::ofstream fout;
+                std::stringstream ss;
+
+                ss << "im" << std::setfill('0') << std::setw(6) << frame_id++
+                   << ".bin";
+                fout.open(ss.str(), std::ios::out | std::ios::binary);
+                fout.write((char *)buffer.data(), buffer.size());
+                fout.close();
+            }
         }
-        buffer_row_id = (buffer_row_id + capture_rows) % buffer_rows;
 
-        viz();
-
-        if (save && buffer_row_id == 0) {
-            std::ofstream fout;
-            std::stringstream ss;
-
-            ss << "im" << std::setfill('0') << std::setw(6) << frame_id++
-               << ".bin";
-            fout.open(ss.str(), std::ios::out | std::ios::binary);
-            fout.write((char *)raw_image.Data(), raw_image.Size());
-            fout.close();
-        }
-        const auto t = std::chrono::steady_clock::now();
-        ImGui::Text("fps = %lf", 1e9 / (t - last_frame_time).count());
-
-        last_frame_time = t;
+        const auto t1 = std::chrono::steady_clock::now();
         ImGui::Text("rows = %d", capture_rows);
-        draw_image(rgb_image.data(), cols / 2, buffer_rows / 2, cols / 2,
-                   buffer_rows / 2);
-        draw_image(rgb_image_cropped.data(), cols / 8, buffer_rows / 2,
+        draw_image(rgb_texture, rgb_image.data(), cols / 2, buffer_rows / 2,
                    cols / 2, buffer_rows / 2);
-        draw_image(histogram.data(), hist_w, hist_h, hist_w, hist_h);
+        draw_image(rgb_crop_texture, rgb_image_cropped.data(), cols / 8,
+                   buffer_rows / 2, cols / 2, buffer_rows / 2);
+        draw_image(hist_texture, histogram.data(), hist_w, hist_h, hist_w,
+                   hist_h);
+        const auto t2 = std::chrono::steady_clock::now();
+        ImGui::Text("capture takes %ld ns", (t1 - t0).count());
+        ImGui::Text("drawing takes %ld ns", (t2 - t1).count());
+        ImGui::Text("fps = %lf", 1e9 / (t2 - last_frame_time).count());
+        last_frame_time = t2;
     }
 };
 
@@ -300,6 +319,7 @@ int main(int argc, char *argv[]) {
     bool done = false;
 
     NectarCapturer nc;
+    std::string output_dir;
 
     while (!done) {
         io.DisplaySize = ImVec2(2560, 1440);
@@ -317,16 +337,34 @@ int main(int argc, char *argv[]) {
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
-        if (ImGui::Button("Save")) {
-            nc.save = !nc.save;
-        }
         if (ImGui::Button("Quit")) {
             done = true;
+        }
+        if (nc.save) {
+            if (ImGui::Button("Stop saving")) {
+                nc.save = false;
+            }
+        } else {
+            if (ImGui::Button("Start saving")) {
+                nc.save = true;
+                nc.frame_id = 0;
+                std::stringstream ss;
+                const auto now = std::chrono::system_clock::now();
+                const time_t itt = std::chrono::system_clock::to_time_t(now);
+                const auto gt = std::gmtime(&itt);
+                ss << "/home/dllu/pictures/linescan/"
+                   << std::put_time(gt, "%F-%T");
+                output_dir = ss.str();
+                std::filesystem::create_directory(output_dir);
+                std::filesystem::current_path(output_dir);
+            }
         }
         if (!nc.save) {
             ImGui::SliderInt("analog_gain", &nc.analog_gain, 0, 20);
             ImGui::SliderInt("cds_gain", &nc.cds_gain, 0, 1);
             ImGui::SliderInt("shutterspeed", &nc.shutterspeed, 0, 10000);
+        } else {
+            ImGui::Text("Saving to: %s; saved %d", output_dir.c_str(), nc.frame_id);
         }
         try {
             nc.capture(cam);
