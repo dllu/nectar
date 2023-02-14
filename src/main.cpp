@@ -5,6 +5,7 @@
 #include <imgui_impl_opengl3.h>
 #include <imgui_impl_sdl.h>
 
+#include <chrono>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
@@ -21,21 +22,25 @@ class NectarCapturer {
     int cds_gain = 1;
     int shutterspeed = 2000;
 
+    NectarCapturer() { std::fill(buffer.begin(), buffer.end(), 0); }
+
    private:
+    std::chrono::time_point<std::chrono::steady_clock> last_frame_time;
     int frame_id = 0;
-    int rows = 192;
-    int cols = 4096;
+    int capture_rows = 192;
+    static constexpr int buffer_rows = 512;
+    static constexpr int cols = 4096;
+    std::array<uint8_t, buffer_rows * cols * 2> buffer;
+    std::array<uint8_t, (buffer_rows / 2) * (cols / 2) * 3> rgb_image;
+    std::array<uint8_t, (buffer_rows / 2) * (cols / 8) * 3> rgb_image_cropped;
+    int buffer_row_id = 0;
 
-    const int hist_h = 256;
-    const int hist_w = 512;
-    const int histogram_size = hist_h * hist_w * 3;
+    static constexpr int hist_h = 256;
+    static constexpr int hist_w = 512;
+    static constexpr int histogram_size = hist_h * hist_w * 3;
 
-    template <class T>
-    std::tuple<std::vector<uint8_t>, std::vector<uint8_t>, std::vector<uint8_t>>
-    viz(const T &raw_image) {
-        std::vector<uint8_t> rgb_image((rows / 2) * (cols / 2) * 3, 0);
-        std::vector<uint8_t> rgb_image_cropped((rows / 2) * (cols / 8) * 3, 0);
-
+    std::array<uint8_t, histogram_size> histogram;
+    void viz() {
         std::array<int, 256> reds;
         std::array<int, 256> greens;
         std::array<int, 256> blues;
@@ -43,19 +48,19 @@ class NectarCapturer {
         std::fill(greens.begin(), greens.end(), 0);
         std::fill(blues.begin(), blues.end(), 0);
 
-        std::vector<uint8_t> histogram(histogram_size, 0);
+        std::fill(histogram.begin(), histogram.end(), 0);
         // make image
-        for (int i = 0; i < rows / 2; i++) {
+        for (int i = buffer_row_id / 2; i < (buffer_row_id + capture_rows) / 2;
+             i++) {
             for (int j = 0; j < cols / 2; j++) {
                 const int ind = (j + cols / 2 * i) * 3;
-                rgb_image[ind] =
-                    raw_image[2 * (2 * i * cols + (2 * j + 1)) + 1];
+                rgb_image[ind] = buffer[2 * ((2 * i + 1) * cols + 2 * j) + 1];
                 rgb_image[ind + 1] =
-                    (raw_image[2 * ((2 * i + 1) * cols + (2 * j + 1)) + 1] +
-                     raw_image[2 * (2 * i * cols + 2 * j) + 1]) /
+                    (buffer[2 * ((2 * i + 1) * cols + (2 * j + 1)) + 1] +
+                     buffer[2 * (2 * i * cols + 2 * j) + 1]) /
                     2;
                 rgb_image[ind + 2] =
-                    raw_image[2 * ((2 * i + 1) * cols + 2 * j) + 1];
+                    buffer[2 * (2 * i * cols + (2 * j + 1)) + 1];
 
                 reds[rgb_image[ind]]++;
                 greens[rgb_image[ind + 1]]++;
@@ -63,13 +68,14 @@ class NectarCapturer {
             }
         }
         // punched in
-        for (int i = 0; i < rows / 2; i++) {
+        for (int i = buffer_row_id / 2; i < (buffer_row_id + capture_rows) / 2;
+             i++) {
             for (int j = 0; j < cols / 8; j++) {
                 const int ind_cropped = (j + cols / 8 * i) * 3;
                 const int ind =
                     (j + (cols / 2 - cols / 8) / 2 + cols / 2 * i) * 3;
                 for (int k = 0; k < 3; k++) {
-                    // rgb_image_cropped[ind_cropped + k] = rgb_image[ind + k];
+                    rgb_image_cropped[ind_cropped + k] = rgb_image[ind + k];
                 }
             }
         }
@@ -94,7 +100,6 @@ class NectarCapturer {
                 }
             }
         }
-        return make_tuple(rgb_image, rgb_image_cropped, histogram);
     }
 
     void draw_image(const uint8_t *const image_data, const int w, const int h,
@@ -126,25 +131,39 @@ class NectarCapturer {
         cam.SetShutter(shutterspeed);
 
         // rows * shutter = 1000000 / 30 microseconds
-        int new_rows = std::ceil(1.0e6 / 30.0 / shutterspeed);
-        new_rows = (new_rows / 16 + 1) * 16;
-        if (new_rows != rows) {
+        const int new_rows_desired = std::ceil(1.0e6 / 30.0 / shutterspeed);
+
+        int new_rows = 1;
+        while (new_rows <= new_rows_desired) {
+            new_rows *= 2;
+        }
+        // whyy
+        new_rows *= 16;
+
+        if (new_rows != capture_rows) {
             cam.SetAcquire(false);
             cam.SetImageSizeX(cols);
             cam.SetImageSizeY(new_rows);
             cam.SetAcquire(true);
-            rows = new_rows;
+            capture_rows = new_rows;
         }
 
         // Get new frame
         const auto raw_image = cam.GetRawData();
-        const auto [rgb_image, rgb_image_cropped, histogram] = viz(raw_image);
-        ImGui::Text("rows = %d", rows);
-        draw_image(rgb_image.data(), cols / 2, rows / 2, cols / 2, rows / 2);
-        draw_image(rgb_image_cropped.data(), cols / 8, rows / 2, cols / 2,
-                   rows / 2);
-        draw_image(histogram.data(), hist_w, hist_h, hist_w, hist_h);
-        if (save) {
+
+        for (int i = 0; i < capture_rows; i++) {
+            for (int j = 0; j < cols; j++) {
+                for (int k = 0; k < 2; k++) {
+                    buffer[2 * ((i + buffer_row_id) * cols + j) + k] =
+                        raw_image[2 * (i * cols + j) + k];
+                }
+            }
+        }
+        buffer_row_id = (buffer_row_id + capture_rows) % buffer_rows;
+
+        viz();
+
+        if (save && buffer_row_id == 0) {
             std::ofstream fout;
             std::stringstream ss;
 
@@ -154,6 +173,16 @@ class NectarCapturer {
             fout.write((char *)raw_image.Data(), raw_image.Size());
             fout.close();
         }
+        const auto t = std::chrono::steady_clock::now();
+        ImGui::Text("fps = %lf", 1e9 / (t - last_frame_time).count());
+
+        last_frame_time = t;
+        ImGui::Text("rows = %d", capture_rows);
+        draw_image(rgb_image.data(), cols / 2, buffer_rows / 2, cols / 2,
+                   buffer_rows / 2);
+        draw_image(rgb_image_cropped.data(), cols / 8, buffer_rows / 2,
+                   cols / 2, buffer_rows / 2);
+        draw_image(histogram.data(), hist_w, hist_h, hist_w, hist_h);
     }
 };
 
@@ -271,8 +300,9 @@ int main(int argc, char *argv[]) {
     bool done = false;
 
     NectarCapturer nc;
+
     while (!done) {
-        io.DisplaySize = ImVec2(1920, 1080);
+        io.DisplaySize = ImVec2(2560, 1440);
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             ImGui_ImplSDL2_ProcessEvent(&event);
