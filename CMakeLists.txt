@@ -35,7 +35,3 @@ add_executable(necta
     src/main.cpp
 )
 target_link_libraries(necta ${NECTA_LIBRARIES})
-add_executable(capture
-    src/capture.cpp
-)
-target_link_libraries(capture ${NECTA_LIBRARIES})
