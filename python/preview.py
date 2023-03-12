@@ -15,7 +15,7 @@ def process_preview(g: Path):
     finish = 0
     for i, (dat0, dat1) in enumerate(zip(all_data[:-1], all_data[1:])):
         score = np.max(np.abs(dat0 - dat1)) / np.max(dat0)
-        if score > 0.3:
+        if score > 0.4:
             start = min(start, i)
             finish = max(finish, i + 1)
     data = np.concatenate(all_data[start : finish + 1])
@@ -23,9 +23,14 @@ def process_preview(g: Path):
     data = data.astype(np.float32)
     print(g, len(bins), data.shape)
 
-    red = data[0::2, 1::2]
-    green = (data[1::2, 1::2] + data[0::2, 0::2]) / 2
-    blue = data[1::2, 0::2]
+    raw_red = data[0::2, 1::2]
+    raw_green = (data[1::2, 1::2] + data[0::2, 0::2]) / 2
+    raw_blue = data[1::2, 0::2]
+
+    blue = 1.7 * (raw_blue - 0.2 * raw_red - 0.2 * raw_green)
+    green = raw_green - 0.3 * raw_red - 0.3 * raw_blue
+    red = 0.75 * (raw_red - 0.3 * raw_green - 0.3 * raw_blue)
+
 
     rgb = np.concatenate(
         (np.expand_dims(red, 2), np.expand_dims(green, 2), np.expand_dims(blue, 2)),
@@ -33,10 +38,15 @@ def process_preview(g: Path):
     )
 
     rgb_blurred = cv2.GaussianBlur(rgb, (0, 0), 1)
-    rgb = rgb - 0.15 * rgb_blurred
-    for c in range(3):
-        rgb[:, :, c] -= np.min(rgb[:, :, c])
-        rgb[:, :, c] /= np.max(rgb[:, :, c])
+    rgb = rgb - 0.2 * rgb_blurred
+    rgb -= np.percentile(rgb, 2)
+    rgb += 0.1
+    rgb /= np.percentile(rgb, 95) * 0.9
+    rgb[rgb < 0] = 0
+    rgb[rgb > 1] = 1
+    #for c in range(3):
+        #rgb[:, :, c] -= np.min(rgb[:, :, c])
+        #rgb[:, :, c] /= np.max(rgb[:, :, c])
     rgb = rgb[::-1, :, :]
     rgb = np.sqrt(rgb)
     rgb *= 255
@@ -50,7 +60,8 @@ def main():
             continue
 
         if (g / preview).exists():
-            continue
+            #continue
+            ...
         process_preview(g)
 
 
