@@ -3,16 +3,17 @@
 #include <SDL_opengl.h>
 #include <imgui.h>
 #include <imgui_impl_opengl3.h>
-#include <imgui_impl_sdl.h>
+#include <imgui_impl_sdl2.h>
 
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <opencv2/core/core.hpp>
 #include <sstream>
+#include <vector>
 
 using namespace CAlkUSB3;
 

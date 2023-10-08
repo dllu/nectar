@@ -8,4 +8,5 @@ Some simple programs for capturing images from Alkeria Necta line scan camera.
 ## Prerequisites
 
 1. Alkeria Necta USB3 camera with proprietary binary drivers.
-2. OpenCV
+2. imgui 1.89.9 and above
+3. SDL2
