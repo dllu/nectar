@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 from pathlib import Path
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 # linescans = Path("/home/dllu/pictures/linescan")
 linescans = Path("/mnt/data14/pictures/linescan")
@@ -94,21 +95,50 @@ def sharpen(rgb: np.ndarray) -> np.ndarray:
     return rgb
 
 
+def calibrate_black_point(data, top: int = 256, bottom: int = 256):
+    mean_top = np.mean(data[:top, :], axis=1)
+    mean_bottom = np.mean(data[-bottom:, :], axis=1)
+    height = data.shape[0]
+    rows = np.linspace(0, 1, num=height)
+    x = np.concatenate((rows[:top], rows[-bottom:]))
+    data2 = np.zeros_like(data)
+    for col in tqdm(range(data.shape[1]), desc="calibrating black point"):
+        y = np.concatenate((
+            mean_top - data[:top, col],
+            mean_bottom - data[-bottom:, col],
+        ))
+        poly = np.polynomial.Polynomial.fit(x, y, 1)
+        data2[:, col] = data[:, col] + poly.linspace(height)[1]
+    return data2
+
+
 def process_preview(g: Path):
-    bins = sorted(list(g.glob("*.bin")))[:100]
-    all_data = [np.fromfile(bin, dtype=np.uint16).astype(np.float32) for bin in bins]
+    bins = sorted(list(g.glob("*.bin")))
+
+    dat0 = np.fromfile(bins[0], dtype=np.uint16).astype(np.float32)
 
     start = np.inf
     finish = 0
-    for i, (dat0, dat1) in enumerate(zip(all_data[:-1], all_data[1:])):
-        score = np.max(np.abs(dat0 - dat1)) / np.max(dat0)
-        if score > 0.4:
+    for i, bin in enumerate(bins):
+        dat1 = np.fromfile(bin, dtype=np.uint16).astype(np.float32)
+        score = np.sum(np.abs(dat0 - dat1) / np.max(dat0) > 0.2) / dat0.shape[0]
+        if score > 0.1:
             start = min(start, i)
             finish = max(finish, i + 1)
-    data = np.concatenate(all_data[start : finish + 1])
+        if finish - start > 50:
+            break
+    if start == np.inf:
+        start = 0
+
+    all_data = [
+        np.fromfile(bin, dtype=np.uint16).astype(np.float32)
+        for bin in bins[start : finish + 1]
+    ]
+    data = np.concatenate(all_data)
     data = np.reshape(data, (-1, 4096)).T[:, :32768]
     data = data.astype(np.float32)
-    print(g, len(bins), data.shape)
+
+    print(g, len(bins), start, finish, data.shape)
 
     rgb = bin_to_rgb(data)
 
@@ -120,11 +150,16 @@ def main():
         if not g.is_dir():
             continue
 
+        print(g)
         if (g / preview).exists():
-            # continue
-            ...
-        process_preview(g)
-        break
+            continue
+        try:
+            process_preview(g)
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            print(f"oh no! {g} {e}")
+            continue
 
 
 if __name__ == "__main__":
