@@ -59,9 +59,9 @@ def bin_to_rgb(data: np.ndarray) -> np.ndarray:
     raw_green_1 = data[1::2, 1::2]
     raw_green_2 = data[0::2, 0::2]
 
-    plt.plot(raw_green_1[:, 10000])
-    plt.plot(raw_green_2[:, 10000])
-    plt.show()
+    # plt.plot(raw_green_1[:, 10000])
+    # plt.plot(raw_green_2[:, 10000])
+    # plt.show()
 
     raw_blue = data[1::2, 0::2]
 
@@ -75,7 +75,7 @@ def bin_to_rgb(data: np.ndarray) -> np.ndarray:
 
     blue = 1.7 * (raw_blue - 0.2 * raw_red - 0.2 * raw_green)
     green = raw_green - 0.3 * raw_red - 0.3 * raw_blue
-    red = 0.75 * (raw_red - 0.3 * raw_green - 0.3 * raw_blue)
+    red = 0.7 * (raw_red - 0.3 * raw_green - 0.3 * raw_blue)
 
     rgb = np.concatenate(
         (np.expand_dims(red, 2), np.expand_dims(green, 2), np.expand_dims(blue, 2)),
@@ -155,9 +155,7 @@ def process_preview(g: Path, padding: int = 2, max_chunks: int = 126):
 
 
 def main():
-    process_preview(linescans / "2024-08-19-00:15:44")
-    return
-    for g in sorted(list(linescans.glob("2024*"))):
+    for g in sorted(list(linescans.glob("*"))):
         if not g.is_dir():
             continue
 
