@@ -1,0 +1,20 @@
+# Maintainer: Your Name <daniel@lawrence.lu>
+pkgname=libalkusb3
+pkgver=1.11.0
+pkgrel=1
+pkgdesc="Alkeria libalkusb3"
+arch=('x86_64')
+url="https://www.alkeria.com/download-area/file/258-sdk-linux-maestrousb3-v1-11-0"
+license=('custom')
+depends=('udev' 'libusb')
+source=('libalkusb3_1.11.0_amd64.deb')
+md5sums=('SKIP')
+
+package() {
+  # Extract the .deb files
+  deb="${srcdir}/libalkusb3_1.11.0_amd64.deb"
+  mkdir -p "$srcdir/extracted"
+  bsdtar -xf "$deb" -C "$srcdir/extracted"
+  bsdtar -xf "$srcdir/extracted/data.tar.gz" -C "${pkgdir}/"
+  rm -rf "$srcdir/extracted"
+}

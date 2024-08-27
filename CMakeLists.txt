@@ -8,12 +8,12 @@ set(NECTA_INCLUDE_DIRS
 	${PROJECT_SOURCE_DIR}/src
     ${OPENGL_INCLUDE_DIR}
     ${SDL2_INCLUDE_DIRS}
-    /usr/local/include/libalkusb3-1.6.1
+    /usr/include/libalkusb3/
 )
 set(NECTA_LIBRARIES
     ${OPENGL_LIBRARIES}
     ${SDL2_LIBRARIES}
-    /usr/local/lib/libalkusb3-1.6.1.so
+    /usr/lib/libalkusb3.so.1.11.0
     /usr/lib/libimgui.so
 )
 
