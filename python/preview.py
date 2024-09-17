@@ -2,12 +2,15 @@
 import cv2
 import numpy as np
 from pathlib import Path
-import matplotlib.pyplot as plt
+import time
+
+# import matplotlib.pyplot as plt
 from tqdm import tqdm
+import scipy
 
 # linescans = Path("/home/dllu/pictures/linescan")
-linescans = Path("/mnt/data14/pictures/linescan")
-preview = "preview_2.png"
+linescans = Path("/home/dllu/pictures/linescan")
+preview = "preview.png"
 
 
 def windowed_cross_correlation(
@@ -47,8 +50,8 @@ def windowed_cross_correlation(
 
         ys.append(refined_peak_idx - corr_half)
 
-    plt.plot(xs, ys)
-    plt.show()
+    # plt.plot(xs, ys)
+    # plt.show()
 
 
 def bin_to_rgb(data: np.ndarray) -> np.ndarray:
@@ -82,6 +85,8 @@ def bin_to_rgb(data: np.ndarray) -> np.ndarray:
         axis=2,
     )
 
+    # rgb = patch_denoise(rgb)
+
     rgb = sharpen(rgb)
     rgb -= np.percentile(rgb, 2)
     rgb += 0.1
@@ -104,24 +109,108 @@ def sharpen(rgb: np.ndarray) -> np.ndarray:
     return rgb
 
 
-def calibrate_black_point(data: np.ndarray, top: int = 256, bottom: int = 256):
-    mean_top = np.mean(data[:top, :], axis=1)
-    mean_bottom = np.mean(data[-bottom:, :], axis=1)
+def calibrate_black_point(
+    data: np.ndarray,
+    top: int = 256,
+    bottom: int = 256,
+    similarity_thresh: float = 1000,
+    min_px: int = 64,
+):
+    median_top = np.median(data[:top, :], axis=1)
+    median_bottom = np.median(data[-bottom:, :], axis=1)
     height = data.shape[0]
     rows = np.linspace(0, 1, num=height)
     x = np.concatenate((rows[:top], rows[-bottom:]))
     data2 = np.zeros_like(data)
     for col in tqdm(range(data.shape[1]), desc="calibrating black point"):
-        y = np.concatenate((
-            mean_top - data[:top, col],
-            mean_bottom - data[-bottom:, col],
-        ))
-        poly = np.polynomial.Polynomial.fit(x, y, 1)
+        y = np.concatenate(
+            (
+                median_top - data[:top, col],
+                median_bottom - data[-bottom:, col],
+            )
+        )
+
+        mask = np.abs(y) < similarity_thresh
+        if np.sum(mask) < min_px:
+            continue
+        poly = np.polynomial.Polynomial.fit(x[mask], y[mask], 1)
         data2[:, col] = data[:, col] + poly.linspace(height)[1]
     return data2
 
 
-def process_preview(g: Path, padding: int = 2, max_chunks: int = 126):
+def patch_denoise(
+    data: np.ndarray, neighbour_size: int = 256, similarity_thresh: float = 7
+):
+    # patch based denoising by searching horizontally along rows for similar 3x3 patches
+    denoised = data.copy()
+
+    time_ab = 0
+    time_bc = 0
+    time_cd = 0
+
+    # since the data is poisson distributed, the standard deviation is proportional to sqrt
+    # so we sqrt it first so that we just need to compare it to a constant
+    sqrt_data = np.sqrt(data)
+
+    feature_size = 9
+    for row in tqdm(range(1, data.shape[0] - 1), desc="denoising"):
+        # for row in tqdm(range(1000, 1050), desc="denoising"):
+        time_a = time.time()
+        feature = np.zeros((3 * feature_size, data.shape[1] - 2))
+        for channel in range(3):
+            feature[0 + channel * feature_size] = sqrt_data[row, 1:-1, channel]
+            feature[1 + channel * feature_size] = sqrt_data[row, :-2, channel]
+            feature[2 + channel * feature_size] = sqrt_data[row, 2:, channel]
+            feature[3 + channel * feature_size] = sqrt_data[row - 1, 1:-1, channel]
+            feature[4 + channel * feature_size] = sqrt_data[row - 1, :-2, channel]
+            feature[5 + channel * feature_size] = sqrt_data[row - 1, 2:, channel]
+            feature[6 + channel * feature_size] = sqrt_data[row + 1, 1:-1, channel]
+            feature[7 + channel * feature_size] = sqrt_data[row + 1, :-2, channel]
+            feature[8 + channel * feature_size] = sqrt_data[row + 1, 2:, channel]
+        feature_mean = np.mean(feature, axis=0)
+
+        time_b = time.time()
+
+        sort_index = np.argsort(feature_mean)
+        feature_sorted = feature[:, sort_index]
+        index_in_sorted = np.argsort(sort_index)
+
+        # kd = scipy.spatial.KDTree(feature.T)
+        # dist, ind = kd.query(feature.T, neighbour_size)
+
+        time_c = time.time()
+
+        similars = 0
+        for col in range(data.shape[1] - 2):
+            sorted_col = index_in_sorted[col]
+            neighbours = feature_sorted[
+                :,
+                max(0, sorted_col - neighbour_size) : min(
+                    data.shape[1] - 2, sorted_col + neighbour_size
+                ),
+            ]
+            # neighbours = feature[:, ind[col, :]]
+            neighbour_mask = (
+                np.max(np.abs(neighbours - feature[:, col : col + 1]), axis=0)
+                < similarity_thresh
+            )
+            similars += np.sum(neighbour_mask)
+            for channel in range(3):
+                denoised[row, col + 1, channel] = np.square(
+                    np.mean(neighbours[channel * feature_size, neighbour_mask])
+                )
+
+        time_d = time.time()
+        print(similars / (data.shape[1] - 2))
+
+        time_ab += time_b - time_a
+        time_bc += time_c - time_b
+        time_cd += time_d - time_c
+    print("times", time_ab, time_bc, time_cd)
+    return denoised
+
+
+def process_preview(g: Path, padding: int = 2, max_chunks: int = 96):
     bins = sorted(list(g.glob("*.bin")))
 
     dat0 = np.fromfile(bins[0], dtype=np.uint16).astype(np.float32)
@@ -155,7 +244,10 @@ def process_preview(g: Path, padding: int = 2, max_chunks: int = 126):
 
 
 def main():
-    for g in sorted(list(linescans.glob("*"))):
+    # g = sorted(list(linescans.glob("2024-09*")))[-1]
+    # process_preview(g)
+    # return
+    for g in sorted(list(linescans.glob("2024-09-*"))):
         if not g.is_dir():
             continue
 
@@ -169,7 +261,7 @@ def main():
             break
         except Exception as e:
             print(f"oh no! {g} {e}")
-            continue
+            continue  # anyway
 
 
 if __name__ == "__main__":

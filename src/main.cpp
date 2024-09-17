@@ -358,7 +358,7 @@ int main(int argc, char *argv[]) {
                 const time_t itt = std::chrono::system_clock::to_time_t(now);
                 const auto gt = std::gmtime(&itt);
                 ss << "/home/dllu/pictures/linescan/"
-                   << std::put_time(gt, "%F-%T");
+                   << std::put_time(gt, "%F-%H-%M-%S");
                 output_dir = ss.str();
                 std::filesystem::create_directory(output_dir);
                 std::filesystem::current_path(output_dir);
