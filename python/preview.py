@@ -10,7 +10,7 @@ import scipy
 
 # linescans = Path("/home/dllu/pictures/linescan")
 linescans = Path("/home/dllu/pictures/linescan")
-preview = "preview.png"
+preview = "preview_raw.png"
 
 
 def windowed_cross_correlation(
@@ -72,9 +72,9 @@ def bin_to_rgb(data: np.ndarray) -> np.ndarray:
 
     raw_green = (raw_green_1 + raw_green_2) / 2
 
-    raw_red = calibrate_black_point(raw_red)
-    raw_green = calibrate_black_point(raw_green)
-    raw_blue = calibrate_black_point(raw_blue)
+    # raw_red = calibrate_black_point(raw_red)
+    # raw_green = calibrate_black_point(raw_green)
+    # raw_blue = calibrate_black_point(raw_blue)
 
     blue = 1.7 * (raw_blue - 0.2 * raw_red - 0.2 * raw_green)
     green = raw_green - 0.3 * raw_red - 0.3 * raw_blue
@@ -111,8 +111,8 @@ def sharpen(rgb: np.ndarray) -> np.ndarray:
 
 def calibrate_black_point(
     data: np.ndarray,
-    top: int = 256,
-    bottom: int = 256,
+    top: int = 512,
+    bottom: int = 512,
     similarity_thresh: float = 1000,
     min_px: int = 64,
 ):
@@ -247,13 +247,14 @@ def main():
     # g = sorted(list(linescans.glob("2024-09*")))[-1]
     # process_preview(g)
     # return
-    for g in sorted(list(linescans.glob("2024-09-*"))):
+    # for g in sorted(list(linescans.glob("2024-09-14-01-22-06"))):
+    for g in sorted(list(linescans.glob("2024-09-17*"))):
         if not g.is_dir():
             continue
 
         print(g)
         if (g / preview).exists():
-            # continue
+            continue
             ...
         try:
             process_preview(g)

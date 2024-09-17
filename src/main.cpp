@@ -8,14 +8,67 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <deque>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <sstream>
+#include <thread>
 #include <vector>
 
 using namespace CAlkUSB3;
+
+class WorkQueue {
+    std::mutex mtx_;
+    std::condition_variable cv_;
+    std::deque<std::packaged_task<void()>> tasks_;
+    bool stop_ = false;
+    std::vector<std::thread> work_threads_;
+
+   public:
+    int num_waiting_tasks() {
+        std::unique_lock<std::mutex> lock(mtx_);
+        return tasks_.size();
+    }
+
+    void enqueue(std::packaged_task<void()> &&t) {
+        {
+            std::unique_lock<std::mutex> lock(mtx_);
+            tasks_.push_back(std::move(t));
+        }
+        cv_.notify_one();
+    }
+
+    void run_tasks(int n_threads) {
+        for (int i = 0; i < n_threads; i++) {
+            work_threads_.push_back(std::thread([this]() {
+                while (true) {
+                    std::unique_lock<std::mutex> lock(mtx_);
+                    cv_.wait(lock,
+                             [this]() { return !tasks_.empty() || stop_; });
+                    if (tasks_.empty() && stop_) break;
+                    auto task = std::move(tasks_.front());
+                    tasks_.pop_front();
+                    lock.unlock();
+                    task();
+                }
+            }));
+        }
+    }
+
+    void stop() {
+        {
+            std::unique_lock<std::mutex> lock(mtx_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        for (auto &t : work_threads_) t.join();
+    }
+};
 
 class NectarCapturer {
    public:
@@ -39,7 +92,10 @@ class NectarCapturer {
     int capture_rows = 192;
     static constexpr int buffer_rows = 512;
     static constexpr int cols = 4096;
+
     std::vector<uint8_t> buffer;
+    std::vector<Array<uint8_t>> raw_buffers;
+
     std::vector<uint8_t> rgb_image;
     std::vector<uint8_t> rgb_image_cropped;
     int buffer_row_id = 0;
@@ -51,6 +107,7 @@ class NectarCapturer {
     GLuint rgb_texture;
     GLuint rgb_crop_texture;
     GLuint hist_texture;
+    WorkQueue wq;
 
     std::array<uint8_t, histogram_size> histogram;
     void viz() {
@@ -138,9 +195,11 @@ class NectarCapturer {
 
    public:
     void capture(INectaCamera &cam) {
-        cam.SetGain(analog_gain);
-        cam.SetCDSGain(cds_gain);
-        cam.SetShutter(shutterspeed);
+        if (!save) {
+            cam.SetGain(analog_gain);
+            cam.SetCDSGain(cds_gain);
+            cam.SetShutter(shutterspeed);
+        }
 
         // rows * shutter = 1000000 / 30 microseconds
         const int new_rows_desired = std::ceil(1.0e6 / 30.0 / shutterspeed);
@@ -160,49 +219,112 @@ class NectarCapturer {
             cam.SetAcquire(true);
             buffer_row_id = 0;
             capture_rows = new_capture_rows;
+            raw_buffers.clear();
         }
         const auto t0 = std::chrono::steady_clock::now();
         const int capture_frames = std::max(1, new_rows / buffer_rows);
+        std::chrono::steady_clock::duration capture_time{0};
+        std::chrono::steady_clock::duration transpose_time{0};
+        std::chrono::steady_clock::duration viz_time{0};
+
         for (int capture_ind = 0; capture_ind < capture_frames; capture_ind++) {
             // Get new frame
+            const auto t_capture_0 = std::chrono::steady_clock::now();
             const auto raw_image = cam.GetRawData();
+            const auto t_capture_1 = std::chrono::steady_clock::now();
+            capture_time += t_capture_1 - t_capture_0;
 
-            for (int i = 0; i < capture_rows; i++) {
-                for (int j = 0; j < cols; j++) {
-                    for (int k = 0; k < 2; k++) {
-                        buffer[2 * ((i + buffer_row_id) * cols + j) + k] =
-                            raw_image[2 * (i * cols + j) + k];
-                    }
+            if (save) {
+                raw_buffers.push_back(std::move(raw_image));
+                if (raw_buffers.size() * capture_rows == buffer_rows) {
+                    wq.enqueue(std::packaged_task<void()>(
+                        [frame_id = frame_id, buffer_rows = buffer_rows,
+                         capture_rows = capture_rows, cols = cols,
+                         raw_buffers = std::move(raw_buffers)]() {
+                            std::vector<uint8_t> buf(buffer_rows * cols * 2);
+                            int buffer_row_id = 0;
+                            for (const auto &raw_image : raw_buffers) {
+                                for (int i = 0; i < capture_rows; i++) {
+                                    for (int j = 0; j < cols; j++) {
+                                        for (int k = 0; k < 2; k++) {
+                                            buf[2 * (buffer_row_id * cols + j) +
+                                                k] =
+                                                raw_image[2 * (i * cols + j) +
+                                                          k];
+                                        }
+                                    }
+                                    buffer_row_id =
+                                        (buffer_row_id + 1) % buffer_rows;
+                                }
+                            }
+
+                            std::ofstream fout;
+                            std::stringstream ss;
+
+                            ss << "im" << std::setfill('0') << std::setw(6)
+                               << frame_id << ".bin";
+                            fout.open(ss.str(),
+                                      std::ios::out | std::ios::binary);
+                            fout.write((char *)buf.data(), buf.size());
+                            fout.close();
+                        }));
+                    frame_id++;
+
+                    raw_buffers = std::vector<Array<uint8_t>>();
                 }
-            }
-            viz();
-            buffer_row_id = (buffer_row_id + capture_rows) % buffer_rows;
-
-            if (save && buffer_row_id == 0) {
-                std::ofstream fout;
-                std::stringstream ss;
-
-                ss << "im" << std::setfill('0') << std::setw(6) << frame_id++
-                   << ".bin";
-                fout.open(ss.str(), std::ios::out | std::ios::binary);
-                fout.write((char *)buffer.data(), buffer.size());
-                fout.close();
+            } else {
+                if (capture_ind == 0) {
+                    for (int i = 0; i < capture_rows; i++) {
+                        const auto t_transpose_0 =
+                            std::chrono::steady_clock::now();
+                        for (int j = 0; j < cols; j++) {
+                            for (int k = 0; k < 2; k++) {
+                                buffer[2 * (buffer_row_id * cols + j) + k] =
+                                    raw_image[2 * (i * cols + j) + k];
+                            }
+                        }
+                        buffer_row_id = (buffer_row_id + 1) % buffer_rows;
+                        const auto t_write_0 = std::chrono::steady_clock::now();
+                        transpose_time += t_write_0 - t_transpose_0;
+                    }
+                    const auto t_viz_0 = std::chrono::steady_clock::now();
+                    viz();
+                    const auto t_viz_1 = std::chrono::steady_clock::now();
+                    viz_time += t_viz_1 - t_viz_0;
+                }
             }
         }
 
         const auto t1 = std::chrono::steady_clock::now();
         ImGui::Text("rows = %d", capture_rows);
-        draw_image(rgb_texture, rgb_image.data(), cols / 2, buffer_rows / 2,
-                   cols / 2, buffer_rows / 2);
-        draw_image(rgb_crop_texture, rgb_image_cropped.data(), cols / 8,
-                   buffer_rows / 2, cols / 2, buffer_rows / 2);
-        draw_image(hist_texture, histogram.data(), hist_w, hist_h, hist_w,
-                   hist_h);
+        if (!save) {
+            draw_image(rgb_texture, rgb_image.data(), cols / 2, buffer_rows / 2,
+                       cols / 2, buffer_rows / 2);
+            draw_image(rgb_crop_texture, rgb_image_cropped.data(), cols / 8,
+                       buffer_rows / 2, cols / 2, buffer_rows / 2);
+            draw_image(hist_texture, histogram.data(), hist_w, hist_h, hist_w,
+                       hist_h);
+        }
         const auto t2 = std::chrono::steady_clock::now();
-        ImGui::Text("capture takes %ld ns", (t1 - t0).count());
-        ImGui::Text("drawing takes %ld ns", (t2 - t1).count());
+        ImGui::Text("capture frames: %d", capture_frames);
+        ImGui::Text("main loop takes: %ld ns", (t1 - t0).count());
+        ImGui::Text("capture takes:   %ld ns", capture_time.count());
+        ImGui::Text("transpose takes: %ld ns", transpose_time.count());
+        ImGui::Text("viz takes:       %ld ns", viz_time.count());
+        ImGui::Text("drawing takes:   %ld ns", (t2 - t1).count());
         ImGui::Text("fps = %lf", 1e9 / (t2 - last_frame_time).count());
         last_frame_time = t2;
+    }
+
+    void start_saving() {
+        save = true;
+        frame_id = 0;
+        wq.run_tasks(4);
+    }
+
+    void stop_saving() {
+        save = false;
+        wq.stop();
     }
 };
 
@@ -347,12 +469,11 @@ int main(int argc, char *argv[]) {
         }
         if (nc.save) {
             if (ImGui::Button("Stop saving")) {
-                nc.save = false;
+                nc.stop_saving();
             }
         } else {
             if (ImGui::Button("Start saving")) {
-                nc.save = true;
-                nc.frame_id = 0;
+                nc.start_saving();
                 std::stringstream ss;
                 const auto now = std::chrono::system_clock::now();
                 const time_t itt = std::chrono::system_clock::to_time_t(now);
@@ -369,8 +490,7 @@ int main(int argc, char *argv[]) {
             ImGui::SliderInt("cds_gain", &nc.cds_gain, 0, 1);
             ImGui::SliderInt("shutterspeed", &nc.shutterspeed, 0, 10000);
         } else {
-            ImGui::Text("Saving to: %s; saved %d", output_dir.c_str(),
-                        nc.frame_id);
+            ImGui::Text("Saving to: %s", output_dir.c_str());
         }
         try {
             nc.capture(cam);
