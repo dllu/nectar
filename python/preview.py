@@ -210,28 +210,42 @@ def patch_denoise(
     return denoised
 
 
-def process_preview(g: Path, padding: int = 2, max_chunks: int = 96):
+def process_preview(g: Path, padding: int = 5, max_chunks: int = 96):
     bins = sorted(list(g.glob("*.bin")))
 
     dat0 = np.fromfile(bins[0], dtype=np.uint16).astype(np.float32)
 
     start = np.inf
     finish = 0
-    for i, bin in enumerate(bins):
+    for i, bin in tqdm(enumerate(bins), desc="Finding moving region"):
         dat1 = np.fromfile(bin, dtype=np.uint16).astype(np.float32)
-        score = np.sum(np.abs(dat0 - dat1) / np.max(dat0) > 0.2) / dat0.shape[0]
-        if score > 0.1:
+        dat1_reshaped = np.reshape(dat1, (-1, 4096)).T
+        raw_green = dat1_reshaped[1::2, 1::2]
+        score = np.max(np.max(raw_green, axis=1) - np.min(raw_green, axis=1))
+        print(score)
+        if score > 40000:
             start = min(start, max(i - padding, 0))
             finish = max(finish, min(i + padding, len(bins)))
-        if finish - start >= max_chunks:
-            break
     if start == np.inf:
         start = 0
+    if finish == 0:
+        finish = len(bins) - 1
 
-    all_data = [
-        np.fromfile(bin, dtype=np.uint16).astype(np.float32)
-        for bin in bins[start : finish + 1]
-    ]
+    print(start, finish)
+
+    if finish - start <= max_chunks:
+        all_data = [
+            np.fromfile(bin, dtype=np.uint16).astype(np.float32)
+            for bin in bins[start : finish + 1]
+        ]
+    else:
+        all_data = [
+            np.fromfile(bin, dtype=np.uint16).astype(np.float32)
+            for bin in bins[start : start + max_chunks // 2]
+        ] + [
+            np.fromfile(bin, dtype=np.uint16).astype(np.float32)
+            for bin in bins[finish - max_chunks // 2 : finish + 1]
+        ]
     data = np.concatenate(all_data)
     data = np.reshape(data, (-1, 4096)).T
     data = data.astype(np.float32)
@@ -248,7 +262,7 @@ def main():
     # process_preview(g)
     # return
     # for g in sorted(list(linescans.glob("2024-09-14-01-22-06"))):
-    for g in sorted(list(linescans.glob("2024-09-17*"))):
+    for g in sorted(list(linescans.glob("2024-10*"))):
         if not g.is_dir():
             continue
 
