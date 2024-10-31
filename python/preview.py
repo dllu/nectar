@@ -9,7 +9,8 @@ from tqdm import tqdm
 import scipy
 
 # linescans = Path("/home/dllu/pictures/linescan")
-linescans = Path("/home/dllu/pictures/linescan")
+# linescans = Path("/home/dllu/pictures/linescan")
+linescans = Path('/mnt/data14/pictures/linescan')
 preview = "preview_raw.png"
 
 
@@ -76,14 +77,16 @@ def bin_to_rgb(data: np.ndarray) -> np.ndarray:
     # raw_green = calibrate_black_point(raw_green)
     # raw_blue = calibrate_black_point(raw_blue)
 
-    blue = 1.7 * (raw_blue - 0.2 * raw_red - 0.2 * raw_green)
-    green = raw_green - 0.3 * raw_red - 0.3 * raw_blue
-    red = 0.7 * (raw_red - 0.3 * raw_green - 0.3 * raw_blue)
+    raw_stack = np.stack((raw_red, raw_green, raw_blue), axis=2)
 
-    rgb = np.concatenate(
-        (np.expand_dims(red, 2), np.expand_dims(green, 2), np.expand_dims(blue, 2)),
-        axis=2,
-    )
+    color_calibration = np.array([
+        [0.9, -0.3, -0.3],
+        [-0.8, 1.6, -0.3],
+        [-0.5, -0.5, 2.0]
+    ])
+
+    rgb = np.dot(raw_stack, color_calibration.T)
+    rgb = np.clip(rgb, 0, 65536)
 
     # rgb = patch_denoise(rgb)
 
@@ -248,13 +251,12 @@ def main():
     # process_preview(g)
     # return
     # for g in sorted(list(linescans.glob("2024-09-14-01-22-06"))):
-    for g in sorted(list(linescans.glob("2024-09-17*"))):
+    for g in sorted(list(linescans.glob("2024-08*"))):
         if not g.is_dir():
             continue
 
         print(g)
         if (g / preview).exists():
-            continue
             ...
         try:
             process_preview(g)
