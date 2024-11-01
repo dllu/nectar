@@ -10,7 +10,7 @@ import scipy
 
 # linescans = Path("/home/dllu/pictures/linescan")
 # linescans = Path("/home/dllu/pictures/linescan")
-linescans = Path('/mnt/data14/pictures/linescan')
+linescans = Path("/mnt/data14/pictures/linescan")
 preview = "preview_raw.png"
 
 
@@ -82,7 +82,7 @@ def bin_to_rgb(data: np.ndarray) -> np.ndarray:
     color_calibration = np.array([
         [0.9, -0.3, -0.3],
         [-0.8, 1.6, -0.3],
-        [-0.5, -0.5, 2.0]
+        [-0.5, -0.5, 2.0],
     ])
 
     rgb = np.dot(raw_stack, color_calibration.T)
@@ -126,12 +126,10 @@ def calibrate_black_point(
     x = np.concatenate((rows[:top], rows[-bottom:]))
     data2 = np.zeros_like(data)
     for col in tqdm(range(data.shape[1]), desc="calibrating black point"):
-        y = np.concatenate(
-            (
-                median_top - data[:top, col],
-                median_bottom - data[-bottom:, col],
-            )
-        )
+        y = np.concatenate((
+            median_top - data[:top, col],
+            median_bottom - data[-bottom:, col],
+        ))
 
         mask = np.abs(y) < similarity_thresh
         if np.sum(mask) < min_px:
@@ -216,25 +214,44 @@ def patch_denoise(
 def process_preview(g: Path, padding: int = 5, max_chunks: int = 96):
     bins = sorted(list(g.glob("*.bin")))
 
-    dat0 = np.fromfile(bins[0], dtype=np.uint16).astype(np.float32)
-
     start = np.inf
     finish = 0
-    for i, bin in tqdm(enumerate(bins), desc="Finding moving region"):
+    max_green = 0
+    for i, bin in tqdm(enumerate(bins), total=len(bins)):
         dat1 = np.fromfile(bin, dtype=np.uint16).astype(np.float32)
         dat1_reshaped = np.reshape(dat1, (-1, 4096)).T
         raw_green = dat1_reshaped[1::2, 1::2]
-        score = np.max(np.max(raw_green, axis=1) - np.min(raw_green, axis=1))
-        print(score)
-        if score > 40000:
+        max_green = max(max_green, np.max(raw_green))
+
+    scores = []
+    for i, bin in tqdm(enumerate(bins), total=len(bins), desc="Finding moving region"):
+        dat1 = np.fromfile(bin, dtype=np.uint16).astype(np.float32)
+        dat1_reshaped = np.reshape(dat1, (-1, 4096)).T
+        raw_green = dat1_reshaped[1::2, 1::2]
+
+        raw_green = (
+            raw_green[::2, ::2]
+            + raw_green[1::2, ::2]
+            + raw_green[::2, 1::2]
+            + raw_green[1::2, 1::2]
+        ) / 4
+        grad_y, grad_x = np.gradient(raw_green)
+        magnitude = np.sqrt(grad_x**2 + grad_y**2) + 0.1 * max_green
+        energy = np.abs(grad_x) / magnitude
+        cv2.imwrite(f"/home/dllu/test/{i:05d}.png", energy * 255)
+        score = np.percentile(energy, 99)
+        scores.append(score)
+
+    min_score = min(scores)
+    for i, score in enumerate(scores):
+        if score > min_score * 1.5:
             start = min(start, max(i - padding, 0))
             finish = max(finish, min(i + padding, len(bins)))
+    print(start, finish)
     if start == np.inf:
         start = 0
     if finish == 0:
         finish = len(bins) - 1
-
-    print(start, finish)
 
     if finish - start <= max_chunks:
         all_data = [
@@ -261,11 +278,7 @@ def process_preview(g: Path, padding: int = 5, max_chunks: int = 96):
 
 
 def main():
-    # g = sorted(list(linescans.glob("2024-09*")))[-1]
-    # process_preview(g)
-    # return
-    # for g in sorted(list(linescans.glob("2024-09-14-01-22-06"))):
-    for g in sorted(list(linescans.glob("2024-*"))):
+    for g in sorted(list(linescans.glob("20*"))):
         if not g.is_dir():
             continue
 

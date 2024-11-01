@@ -11,7 +11,6 @@
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
-#include <fstream>
 #include <future>
 #include <iomanip>
 #include <iostream>
@@ -44,6 +43,10 @@ class WorkQueue {
     }
 
     void run_tasks(int n_threads) {
+        {
+            std::unique_lock<std::mutex> lock(mtx_);
+            stop_ = false;
+        }
         for (int i = 0; i < n_threads; i++) {
             work_threads_.push_back(std::thread([this]() {
                 while (true) {
