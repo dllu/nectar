@@ -193,7 +193,7 @@ class NectarCapturer {
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGB,
                      GL_UNSIGNED_BYTE, image_data);
 
-        ImGui::Image((void *)(intptr_t)image_texture, ImVec2(w_disp, h_disp));
+        ImGui::Image((intptr_t)image_texture, ImVec2(w_disp, h_disp));
     }
 
    public:
