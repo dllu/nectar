@@ -14,7 +14,6 @@ set(NECTA_LIBRARIES
     ${OPENGL_LIBRARIES}
     ${SDL2_LIBRARIES}
     /usr/lib/libalkusb3.so.1.11.0
-    /usr/lib/libimgui.so
 )
 
 ################################################################
@@ -30,8 +29,12 @@ link_directories(${NECTA_LIBRARY_DIRS})
 
 include_directories(imgui)
 add_executable(necta
-    imgui/imgui_impl_sdl2.cpp
+    imgui/imgui.cpp
+    imgui/imgui_draw.cpp
     imgui/imgui_impl_opengl3.cpp
+    imgui/imgui_impl_sdl2.cpp
+    imgui/imgui_tables.cpp
+    imgui/imgui_widgets.cpp
     src/main.cpp
 )
 target_link_libraries(necta ${NECTA_LIBRARIES})

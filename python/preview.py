@@ -8,9 +8,8 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 import scipy
 
-# linescans = Path("/home/dllu/pictures/linescan")
-# linescans = Path("/home/dllu/pictures/linescan")
-linescans = Path("/mnt/data14/pictures/linescan")
+linescans = Path("/home/dllu/pictures/linescan")
+# linescans = Path("/mnt/data14/pictures/linescan")
 preview = "preview_raw.png"
 
 
