@@ -114,6 +114,7 @@ class NectarCapturer {
     WorkQueue wq;
 
     std::chrono::steady_clock::time_point last_capture_ts;
+    int dropped_frames = 0;
 
     std::array<uint8_t, histogram_size> histogram;
     void viz() {
@@ -244,7 +245,6 @@ class NectarCapturer {
         std::chrono::steady_clock::duration viz_time{0};
 
         for (int capture_ind = 0; capture_ind < capture_frames; capture_ind++) {
-            // Get new frame
             const auto t_capture_0 = std::chrono::steady_clock::now();
             const auto raw_image = cam.GetRawData();
             const auto t_capture_1 = std::chrono::steady_clock::now();
@@ -285,12 +285,12 @@ class NectarCapturer {
                                << frame_id << ".bin";
                             fout.open(ss.str(),
                                       std::ios::out | std::ios::binary);
-                            fout.write((char *)buf.data(), buf.size());
+                            fout.write(reinterpret_cast<char *>(buf.data()),
+                                       buf.size());
                             fout.close();
                         }));
                     frame_id++;
-
-                    raw_buffers = std::vector<Array<uint8_t>>();
+                    raw_buffers.clear();
                 }
             } else {
                 if (capture_ind == 0) {
@@ -334,34 +334,54 @@ class NectarCapturer {
         ImGui::Text("drawing takes:   %ld ns", (t2 - t1).count());
         ImGui::Text("fps = %lf", 1e9 / (t2 - last_frame_time).count());
 
-        std::cerr << "capture frames:" << capture_frames << "\n";
-        std::cerr << "main loop takes:" << (t1 - t0).count() << "\n";
-        std::cerr << "capture takes:  " << capture_time.count() << "\n";
-        std::cerr << "transpose takes:" << transpose_time.count() << "\n";
-        std::cerr << "viz takes:      " << viz_time.count() << "\n";
-        std::cerr << "drawing takes:  " << (t2 - t1).count() << "\n";
-        std::cerr << "Capture time: " << capture_time_2.count()
-                  << " vs expected: "
-                  << static_cast<int64_t>(line_period_s * (capture_rows / 2) *
-                                          capture_frames * 1e9)
-                  << " ns" << std::endl;
-        std::cerr << "theoretical bitrate: "
-                  << (1.0 / line_period_s) * 2 * 4096 * 2 << " bytes per second"
-                  << std::endl;
-        std::cerr << "actual bitrate: "
-                  << (1e9 / capture_time_2.count()) * capture_rows * 4096 * 2
-                  << " bytes per second" << std::endl;
-        std::cerr << "----" << std::endl;
+        const double theoretical_bitrate = (1.0 / line_period_s) * 2 * 4096 * 2;
+        const double actual_bitrate = (1e9 / capture_time_2.count()) *
+                                      capture_rows * 4096 * 2 * capture_frames;
+
+        if (actual_bitrate < theoretical_bitrate * 0.9 ||
+            actual_bitrate > theoretical_bitrate * 1.1) {
+            std::cerr << "capture frames:" << capture_frames << "\n";
+            std::cerr << "main loop takes:" << (t1 - t0).count() << "\n";
+            std::cerr << "capture takes:  " << capture_time.count() << "\n";
+            std::cerr << "transpose takes:" << transpose_time.count() << "\n";
+            std::cerr << "viz takes:      " << viz_time.count() << "\n";
+            std::cerr << "drawing takes:  " << (t2 - t1).count() << "\n";
+            std::cerr << "Capture time: " << capture_time_2.count()
+                      << " vs expected: "
+                      << static_cast<int64_t>(line_period_s *
+                                              (capture_rows / 2) *
+                                              capture_frames * 1e9)
+                      << " ns" << std::endl;
+            std::cerr << "theoretical bitrate: " << theoretical_bitrate
+                      << " bytes per second" << std::endl;
+            std::cerr << "actual bitrate: " << actual_bitrate
+                      << " bytes per second" << std::endl;
+            std::cerr << "theoretical / actual: "
+                      << theoretical_bitrate / actual_bitrate << std::endl;
+            std::cerr << "----" << std::endl;
+            if (actual_bitrate < theoretical_bitrate) {
+                const int amount =
+                    std::round(theoretical_bitrate / actual_bitrate) - 1;
+                if (amount < 100) {
+                    // hack: the first frame has a huge amount since
+                    // last_capture_ts is 0
+                    dropped_frames += amount;
+                }
+            }
+        }
+        ImGui::Text("dropped frames %d", dropped_frames);
         last_frame_time = t2;
     }
 
     void start_saving() {
+        dropped_frames = 0;
         save = true;
         frame_id = 0;
         wq.run_tasks(4);
     }
 
     void stop_saving() {
+        dropped_frames = 0;
         save = false;
         wq.stop();
     }
@@ -387,18 +407,15 @@ INectaCamera &get_camera() {
     cam.SetCamera(0);
     cam.Init();
 
+    std::cerr << "bulk: " << cam.GetUseBulkEndPoint() << std::endl;
+    cam.SetUseBulkEndPoint(false);
+    std::cerr << "bulk: " << cam.GetUseBulkEndPoint() << std::endl;
+
     cam.SetADCResolution(12);
     cam.SetVideoMode(1);
     cam.SetColorCoding(ColorCoding::Raw16);
 
     cam.SetPacketSize(cam.GetMaxPacketSize());
-    /*
-    const auto limits = cam.GetAllowedBandwidthLimits();
-    for (const auto &l : limits) {
-        std::cerr << "Limit: " << l << std::endl;
-    }
-    cam.SetBandwidthLimits({*(limits.End() - 1)});
-    */
     cam.SetAcquire(true);
     return cam;
 }
@@ -534,7 +551,8 @@ int main(int argc, char *argv[]) {
         if (!nc.save) {
             ImGui::SliderInt("analog_gain", &nc.analog_gain, 0, 20);
             ImGui::SliderInt("cds_gain", &nc.cds_gain, 0, 1);
-            ImGui::SliderInt("shutterspeed", &nc.shutterspeed, 0, 10000);
+            ImGui::SliderInt("shutterspeed (* 100 ns)", &nc.shutterspeed, 0,
+                             10000);
         } else {
             ImGui::Text("Saving to: %s", output_dir.c_str());
         }
