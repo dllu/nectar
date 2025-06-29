@@ -70,6 +70,7 @@ class WorkQueue {
         }
         cv_.notify_all();
         for (auto &t : work_threads_) t.join();
+        work_threads_.clear();
     }
 };
 
@@ -111,6 +112,8 @@ class NectarCapturer {
     GLuint rgb_crop_texture;
     GLuint hist_texture;
     WorkQueue wq;
+
+    std::chrono::steady_clock::time_point last_capture_ts;
 
     std::array<uint8_t, histogram_size> histogram;
     void viz() {
@@ -204,16 +207,25 @@ class NectarCapturer {
             cam.SetShutter(shutterspeed);
         }
 
-        // rows * shutter = 1000000 / 30 microseconds
-        const int new_rows_desired = std::ceil(1.0e6 / 30.0 / shutterspeed);
+        // shutter is in 100 ns, i.e. 1e-7 seconds, and line period is equal to
+        // shutter period + 2.1 us from the manual
+        const double line_period_s = shutterspeed * 1e-7 + 2.1e-6;
+
+        // number of rows that we can scan at 30 Hz, we want to get at least as
+        // many rows as the UI refreshing at 30 Hz
+        //
+        // also, note that each capture gets two rows
+        const int new_rows_desired = 2 * std::ceil(1.0 / 30.0 / line_period_s);
 
         int new_rows = 1;
         while (new_rows <= new_rows_desired) {
             new_rows *= 2;
         }
         // whyy
-        new_rows *= 16;
-        const int new_capture_rows = std::min(buffer_rows, new_rows);
+        const int new_capture_rows =
+            std::max(static_cast<int>(cam.GetMinImageSizeY()),
+                     std::min(static_cast<int>(cam.GetMaxImageSizeY()),
+                              std::min(buffer_rows, new_rows)));
 
         if (capture_rows != new_capture_rows) {
             cam.SetAcquire(false);
@@ -227,6 +239,7 @@ class NectarCapturer {
         const auto t0 = std::chrono::steady_clock::now();
         const int capture_frames = std::max(1, new_rows / buffer_rows);
         std::chrono::steady_clock::duration capture_time{0};
+        std::chrono::steady_clock::duration capture_time_2{0};
         std::chrono::steady_clock::duration transpose_time{0};
         std::chrono::steady_clock::duration viz_time{0};
 
@@ -235,6 +248,10 @@ class NectarCapturer {
             const auto t_capture_0 = std::chrono::steady_clock::now();
             const auto raw_image = cam.GetRawData();
             const auto t_capture_1 = std::chrono::steady_clock::now();
+
+            capture_time_2 += t_capture_1 - last_capture_ts;
+            last_capture_ts = t_capture_1;
+
             capture_time += t_capture_1 - t_capture_0;
 
             if (save) {
@@ -316,6 +333,25 @@ class NectarCapturer {
         ImGui::Text("viz takes:       %ld ns", viz_time.count());
         ImGui::Text("drawing takes:   %ld ns", (t2 - t1).count());
         ImGui::Text("fps = %lf", 1e9 / (t2 - last_frame_time).count());
+
+        std::cerr << "capture frames:" << capture_frames << "\n";
+        std::cerr << "main loop takes:" << (t1 - t0).count() << "\n";
+        std::cerr << "capture takes:  " << capture_time.count() << "\n";
+        std::cerr << "transpose takes:" << transpose_time.count() << "\n";
+        std::cerr << "viz takes:      " << viz_time.count() << "\n";
+        std::cerr << "drawing takes:  " << (t2 - t1).count() << "\n";
+        std::cerr << "Capture time: " << capture_time_2.count()
+                  << " vs expected: "
+                  << static_cast<int64_t>(line_period_s * (capture_rows / 2) *
+                                          capture_frames * 1e9)
+                  << " ns" << std::endl;
+        std::cerr << "theoretical bitrate: "
+                  << (1.0 / line_period_s) * 2 * 4096 * 2 << " bytes per second"
+                  << std::endl;
+        std::cerr << "actual bitrate: "
+                  << (1e9 / capture_time_2.count()) * capture_rows * 4096 * 2
+                  << " bytes per second" << std::endl;
+        std::cerr << "----" << std::endl;
         last_frame_time = t2;
     }
 
@@ -355,7 +391,14 @@ INectaCamera &get_camera() {
     cam.SetVideoMode(1);
     cam.SetColorCoding(ColorCoding::Raw16);
 
-    cam.SetPacketSize(std::min(16384U, cam.GetMaxPacketSize()));
+    cam.SetPacketSize(cam.GetMaxPacketSize());
+    /*
+    const auto limits = cam.GetAllowedBandwidthLimits();
+    for (const auto &l : limits) {
+        std::cerr << "Limit: " << l << std::endl;
+    }
+    cam.SetBandwidthLimits({*(limits.End() - 1)});
+    */
     cam.SetAcquire(true);
     return cam;
 }

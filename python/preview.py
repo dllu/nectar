@@ -323,7 +323,8 @@ def process_preview(g: Path, padding: int = 5, max_chunks: int = 192):
 
 
 def main():
-    for g in sorted(list(linescans.glob("2024-09-10-06-00-05*"))): # yamanote
+    for g in sorted(list(linescans.glob("2025-06*"))): # yamanote
+    # for g in sorted(list(linescans.glob("2024-09-10-06-00-05*"))): # yamanote
     # for g in sorted(list(linescans.glob("2024-09-19-03-33-57*"))): # fuxing
     # for g in sorted(list(linescans.glob("2024-09-14-02-13-13*"))): # hktram
     # for g in sorted(list(linescans.glob("nyc4"))):
