@@ -1,16 +1,174 @@
 #!/usr/bin/env python
-import cv2
-import numpy as np
-from pathlib import Path
+import math
 import time
+from pathlib import Path
 
+import cv2
 import matplotlib.pyplot as plt
+import numpy as np
+from scipy.interpolate import UnivariateSpline
 from tqdm import tqdm
-import scipy
 
-linescans = Path("/home/dllu/pictures/linescan")
-# linescans = Path("/mnt/data14/pictures/linescan")
-preview = "preview_raw.png"
+# Color calibration matrix for RGB conversion
+COLOR_CALIBRATION = np.array(
+    [
+        [0.9, -0.3, -0.3],
+        [-0.8, 1.6, -0.3],
+        [-0.5, -0.5, 2.0],
+    ]
+)
+
+# linescans = Path("/home/dllu/pictures/linescan")
+linescans = Path("/mnt/arch/mnt/data14/pictures/linescan")
+
+
+class FileDataCache:
+    def __init__(self, bin_paths, dtype, rows):
+        self.bin_paths = bin_paths
+        self.dtype = dtype
+        self.rows = rows
+        # determine columns per file
+        self.file_cols = []
+        for p in bin_paths:
+            size = p.stat().st_size
+            n_elems = size // np.dtype(dtype).itemsize
+            if n_elems % rows != 0:
+                raise ValueError(f"File {p} size not multiple of rows")
+            cols = n_elems // rows
+            self.file_cols.append(cols)
+        # cumulative column offsets
+        self.cum_cols = np.concatenate(([0], np.cumsum(self.file_cols)))
+        self.total_cols = int(self.cum_cols[-1])
+        self.height = rows
+        self.cache = {}
+
+    @property
+    def shape(self):
+        return (self.height, self.total_cols)
+
+    def _load_file(self, idx):
+        if idx not in self.cache:
+            # load and reshape file idx
+            data1d = np.fromfile(self.bin_paths[idx], dtype=self.dtype).astype(
+                np.float32
+            )
+            # reshape to (rows, cols) then transpose to (height, cols)
+            data2d = data1d.reshape(-1, self.height).T
+            self.cache[idx] = data2d
+        return self.cache[idx]
+
+    def __getitem__(self, key):
+        # Expect key as (rows, cols)
+        if not isinstance(key, tuple) or len(key) != 2:
+            raise IndexError("Invalid index for FileDataCache")
+        row_idx, col_idx = key
+        # handle integer column indexing
+        if isinstance(col_idx, int):
+            ci = col_idx if col_idx >= 0 else self.total_cols + col_idx
+            # find file containing this column
+            file_idx = np.searchsorted(self.cum_cols, ci, side="right") - 1
+            local = ci - self.cum_cols[file_idx]
+            arr_file = self._load_file(file_idx)
+            return arr_file[row_idx, local]
+        # handle slice of columns
+        if isinstance(col_idx, slice):
+            start = (
+                0
+                if col_idx.start is None
+                else (
+                    col_idx.start
+                    if col_idx.start >= 0
+                    else self.total_cols + col_idx.start
+                )
+            )
+            stop = (
+                self.total_cols
+                if col_idx.stop is None
+                else (
+                    col_idx.stop
+                    if col_idx.stop >= 0
+                    else self.total_cols + col_idx.stop
+                )
+            )
+            step = 1 if col_idx.step is None else col_idx.step
+            # collect blocks from each file
+            blocks = []
+            for i, cols_i in enumerate(self.file_cols):
+                fstart = self.cum_cols[i]
+                fend = self.cum_cols[i + 1]
+                if fend <= start or fstart >= stop:
+                    continue
+                lo = max(start, fstart) - fstart
+                hi = min(stop, fend) - fstart
+                arr_file = self._load_file(i)
+                blocks.append(arr_file[:, lo:hi])
+            if not blocks:
+                return np.empty((self.height, 0), dtype=np.float32)
+            arr = np.concatenate(blocks, axis=1)
+            # apply column step
+            if step != 1:
+                arr = arr[:, ::step]
+            # apply row indexing
+            return arr[row_idx, :]
+        # unsupported indexing
+        raise IndexError("Unsupported index type for FileDataCache")
+
+
+class ChannelView:
+    """
+    Lazy view of a single Bayer channel from FileDataCache.
+    """
+
+    def __init__(self, cache, row_offset, col_offset, row_step=2, col_step=2):
+        self.cache = cache
+        self.row_offset = row_offset
+        self.col_offset = col_offset
+        self.row_step = row_step
+        self.col_step = col_step
+        # compute channel dimensions
+        total_cols = cache.total_cols
+        self.height = (cache.height - row_offset + row_step - 1) // row_step
+        self.width = (total_cols - col_offset + col_step - 1) // col_step
+
+    @property
+    def shape(self):
+        """Shape of this channel view as (rows, cols)."""
+        return (self.height, self.width)
+
+    def __getitem__(self, key):
+        # key: (row_idx, col_idx)
+        if not isinstance(key, tuple) or len(key) != 2:
+            raise IndexError("ChannelView requires 2D indexing")
+        row_key, col_key = key
+        # map row_key to parent
+        if isinstance(row_key, slice):
+            start = 0 if row_key.start is None else row_key.start
+            stop = self.height if row_key.stop is None else row_key.stop
+            step = 1 if row_key.step is None else row_key.step
+            abs_row = slice(
+                self.row_offset + start * self.row_step,
+                self.row_offset + stop * self.row_step,
+                self.row_step * step,
+            )
+        else:
+            # single index
+            idx = row_key if row_key >= 0 else self.height + row_key
+            abs_row = self.row_offset + idx * self.row_step
+        # map col_key similarly
+        if isinstance(col_key, slice):
+            start = 0 if col_key.start is None else col_key.start
+            stop = self.width if col_key.stop is None else col_key.stop
+            step = 1 if col_key.step is None else col_key.step
+            abs_col = slice(
+                self.col_offset + start * self.col_step,
+                self.col_offset + stop * self.col_step,
+                self.col_step * step,
+            )
+        else:
+            idx = col_key if col_key >= 0 else self.width + col_key
+            abs_col = self.col_offset + idx * self.col_step
+        # fetch from parent cache
+        return self.cache[abs_row, abs_col]
 
 
 def subpixel_peak(y, sigma, initial):
@@ -26,129 +184,159 @@ def subpixel_peak(y, sigma, initial):
 def windowed_cross_correlation(
     green_1: np.ndarray,
     green_2: np.ndarray,
-    window_step: int = 512,
-    window_size: int = 2048,
-    corr_size: int = 31,
+    window_step: int = 256,
+    window_size: int = 4096,
+    corr_size: int = 15,
+    visualize: bool = False,
 ) -> np.ndarray:
     """
     green_1: (h, w) where w >> h and w >> window_size
     green_2: (h, w)
     """
 
-    # green_1 = green_1[1224:, :]
-    # green_2 = green_2[1224:, :]
-    xs = np.arange(0, green_1.shape[1] - window_size, window_step)
+    xs = np.arange(0, green_1.shape[1], window_step)
+    # xs = np.array([0])
     ys = []
     refined_ys = []
     good_xs = []
     corr_half = corr_size // 2
+    weights = []
 
     heatmap = np.zeros((len(xs), corr_size))
-    print(heatmap.shape)
 
-    for xi, x in enumerate(xs):
-        window_2 = green_2[:, x + corr_half : x + window_size - corr_half]
+    for xi, x in tqdm(
+        enumerate(xs[1:-1]), desc="train speed estimation", total=len(xs)
+    ):
+        window_1 = green_1[:, x : x + window_step]
 
         corrs = np.zeros((corr_size,))
         for corr_ind in range(corr_size):
             corr_x = corr_ind - corr_half
-            window_1 = green_1[
+            window_2 = green_2[
                 :,
-                x + corr_half + corr_x : x + window_size - corr_half + corr_x,
+                x + corr_x : x + window_step + corr_x,
             ]
 
             # corr_value = np.sum(window_1 * window_2)
             error = np.sum(np.abs(window_1 - window_2))
-            corr_value = -error
-            # corr_value = -np.log(error)
-
-            corrs[corr_ind] = corr_value
+            corrs[corr_ind] = -error
 
         peak_idx = np.argmax(corrs)
 
         if peak_idx <= 0 or peak_idx >= corr_size - 1:
             continue
 
-        # polyx = np.array([peak_idx - 1, peak_idx, peak_idx + 1])
-        # polyy = corrs[polyx]
-        # coeffs = np.polyfit(polyx, polyy, 2)
-
-        # The vertex of the parabola (peak of the quadratic fit) is at -b/(2a)
-        # refined_peak_idx = -coeffs[1] / (2 * coeffs[0])
-        ncorrs = corrs - np.min(corrs)
-        ncorrs = ncorrs / np.max(ncorrs)
-        refined_peak_idx = subpixel_peak(ncorrs, 1.5, peak_idx)
-
-        # plt.plot(ncorrs, 'b+')
-        # plt.plot([refined_peak_idx, refined_peak_idx], [0, 1], 'k--')
-        # plt.show()
-
-        # corrs -= np.min(corrs)
-        # corrs /= np.max(corrs)
         heatmap[xi, :] = corrs
 
-        ys.append(peak_idx - corr_half)
-        refined_ys.append(refined_peak_idx - corr_half)
-        good_xs.append(x)
-    plt.show()
+        if xi >= window_size // window_step:
+            ncorrs = np.sum(heatmap[xi - window_size // window_step : xi, :], axis=0)
+            weights.append(np.max(ncorrs) - np.min(ncorrs))
+            ncorrs = ncorrs - np.min(ncorrs)
+            ncorrs = ncorrs / np.max(ncorrs)
+            refined_peak_idx = subpixel_peak(ncorrs, 2.0, peak_idx)
 
-    plt.imshow(heatmap)
-    plt.show()
-    plt.plot(good_xs, ys, "b.")
-    plt.plot(good_xs, refined_ys, "r.")
-    plt.plot(xs, np.zeros_like(xs), "k--")
-    plt.show()
+            ys.append(peak_idx - corr_half)
+            refined_ys.append(refined_peak_idx - corr_half)
+            good_xs.append(xi * window_step + window_size // 2)
+
+    if visualize:
+        plt.imshow(heatmap)
+        plt.show()
+        plt.plot(good_xs, ys, "b.", label="Raw peaks")
+        plt.plot(good_xs, refined_ys, "r.", label="Subpixel refined peaks")
+        plt.plot(xs, np.zeros_like(xs), "k--")
+        plt.show()
+
+    weights = np.array(weights)
+    weights /= np.max(weights)
+    mask = weights > 0.1
+    return np.array(good_xs)[mask], np.array(refined_ys)[mask], weights[mask]
 
 
-def bin_to_rgb(data: np.ndarray) -> np.ndarray:
+def robust_bspline_fit(
+    x, y, weights, smoothness, g: Path, num_iter=10, c=4.685, visualize: bool = False
+):
     """
-    data: mosaiced rggb bayer array
+    Fit a robust cubic B-spline to (x, y) data with given weights using iterative re-weighting.
+
+    Parameters:
+      x          : 1D numpy array of independent variable values.
+      y          : 1D numpy array of dependent values.
+      weights    : 1D numpy array of initial weights (same shape as x and y).
+      smoothness : Smoothing factor (the s parameter in UnivariateSpline) that regularizes
+                   against rapid oscillations.
+      num_iter   : Maximum number of iterations for the IRLS procedure.
+      c          : Tuning constant for Tukey’s biweight (default ~4.685 for normal errors).
+
+    Returns:
+      spline     : A UnivariateSpline object representing the robustly fitted cubic B-spline.
+
+    Also plots the data and the final spline fit.
     """
+    current_weights = np.copy(weights)
+    spline = None
+
+    for i in range(num_iter):
+        # Use square-root weights as required by UnivariateSpline (least-squares weighting)
+        spline = UnivariateSpline(x, y, w=np.sqrt(current_weights), k=3, s=smoothness)
+        y_fit = spline(x)
+        residuals = y - y_fit
+
+        # Robust scale estimate via median absolute deviation (MAD)
+        mad = np.median(np.abs(residuals - np.median(residuals)))
+        scale = mad / 0.6745 if mad > 1e-6 else 1.0
+
+        # Compute scaled residuals and the Tukey biweight factors:
+        u = residuals / (c * scale)
+        robust_factor = np.square(1 - u**2)
+        robust_factor[np.abs(u) >= 1] = 0
+
+        new_weights = weights * robust_factor
+
+        # Check for convergence in weight updates.
+        if np.linalg.norm(new_weights - current_weights) < 1e-3 * np.linalg.norm(
+            current_weights
+        ):
+            current_weights = new_weights
+            break
+        current_weights = new_weights
+
+    # Plot the original data and the fitted spline on a dense grid.
+    plt.figure(figsize=(8, 5))
+    plt.plot(x, y, "bo", label="Data")
+    x_dense = np.linspace(np.min(x), np.max(x), 500)
+    y_dense = spline(x_dense)
+    plt.plot(x_dense, y_dense, "r-", lw=2, label="Robust Cubic B-spline")
+    plt.plot(x, np.zeros_like(x), "k--")
+    plt.title("Robust Cubic B-spline Fit")
+    plt.xlabel("x")
+    plt.ylabel("y")
+    plt.legend()
+    plt.savefig(g / "spline.png")
+    if visualize:
+        plt.show()
+
+    if (np.max(y_dense) > 0) != (np.min(y_dense) > 0):
+        raise ValueError("Oscillating spline found")
+
+    return spline
+
+
+def resample(n, spline):
+    xs = []
+    x = 0
+    while x < n:
+        xs.append(x)
+        x += spline[x]
+
+
+def raw_channels(data: np.ndarray):
     raw_red = data[0::2, 1::2]
     raw_green_1 = data[1::2, 1::2]
     raw_green_2 = data[0::2, 0::2]
-
-    # plt.plot(raw_green_1[:, 10000])
-    # plt.plot(raw_green_2[:, 10000])
-    # plt.show()
-
     raw_blue = data[1::2, 0::2]
 
-    windowed_cross_correlation(raw_green_1, raw_green_2)
-
-    raw_green = (raw_green_1 + raw_green_2) / 2
-
-    # raw_red = calibrate_black_point(raw_red)
-    # raw_green = calibrate_black_point(raw_green)
-    # raw_blue = calibrate_black_point(raw_blue)
-
-    raw_stack = np.stack((raw_red, raw_green, raw_blue), axis=2)
-
-    color_calibration = np.array([
-        [0.9, -0.3, -0.3],
-        [-0.8, 1.6, -0.3],
-        [-0.5, -0.5, 2.0],
-    ])
-
-    rgb = np.dot(raw_stack, color_calibration.T)
-    rgb = np.clip(rgb, 0, 65536)
-
-    # rgb = patch_denoise(rgb)
-
-    rgb = sharpen(rgb)
-    rgb -= np.percentile(rgb, 2)
-    rgb += 0.1
-    rgb /= np.percentile(rgb, 95) * 0.9
-    rgb[rgb < 0] = 0
-    rgb[rgb > 1] = 1
-    # for c in range(3):
-    # rgb[:, :, c] -= np.min(rgb[:, :, c])
-    # rgb[:, :, c] /= np.max(rgb[:, :, c])
-    rgb = rgb[::-1, :, :]
-    rgb = np.sqrt(rgb)
-    rgb *= 255
-
-    return rgb
+    return raw_red, raw_green_1, raw_green_2, raw_blue
 
 
 def sharpen(rgb: np.ndarray) -> np.ndarray:
@@ -171,10 +359,12 @@ def calibrate_black_point(
     x = np.concatenate((rows[:top], rows[-bottom:]))
     data2 = np.zeros_like(data)
     for col in tqdm(range(data.shape[1]), desc="calibrating black point"):
-        y = np.concatenate((
-            median_top - data[:top, col],
-            median_bottom - data[-bottom:, col],
-        ))
+        y = np.concatenate(
+            (
+                median_top - data[:top, col],
+                median_bottom - data[-bottom:, col],
+            )
+        )
 
         mask = np.abs(y) < similarity_thresh
         if np.sum(mask) < min_px:
@@ -256,11 +446,66 @@ def patch_denoise(
     return denoised
 
 
-def process_preview(g: Path, padding: int = 5, max_chunks: int = 192):
+def bin2to1(data):
+    return (data[::2, ::2] + data[1::2, ::2] + data[::2, 1::2] + data[1::2, 1::2]) / 4
+
+
+def get_percentile(hist, bin_edges, total, percent):
+    if total == 0:
+        return 0.0
+    cum = np.cumsum(hist)
+    thresh = (percent / 100.0) * total
+    idx = np.searchsorted(cum, thresh, side="left")
+    if idx == 0:
+        return bin_edges[0]
+    if idx == len(hist):
+        return bin_edges[-1]
+    prev_cum = cum[idx - 1]
+    needed = thresh - prev_cum
+    bin_count = hist[idx]
+    frac = needed / bin_count if bin_count > 0 else 0
+    bin_width = bin_edges[idx + 1] - bin_edges[idx]
+    return bin_edges[idx] + frac * bin_width
+
+
+def autoexposure(selected_bins):
+    num_bins = 65536
+    bin_edges = np.arange(0, num_bins + 1, dtype=np.float64)
+    histogram = np.zeros(num_bins, dtype=np.int64)
+    total_values = 0
+
+    for i, bin in tqdm(
+        enumerate(selected_bins), total=len(selected_bins), desc="autoexposure"
+    ):
+        dat1 = np.fromfile(bin, dtype=np.uint16).astype(np.float32)
+        dat1_reshaped = np.reshape(dat1, (-1, 4096)).T
+        raw_red = dat1_reshaped[0::2, 1::2]
+        raw_red = bin2to1(raw_red)
+
+        raw_blue = dat1_reshaped[1::2, 0::2]
+        raw_blue = bin2to1(raw_blue)
+
+        raw_green = dat1_reshaped[1::2, 1::2]
+        raw_green = bin2to1(raw_green)
+
+        rgb = np.tensordot(
+            np.stack((raw_red, raw_green, raw_blue), axis=2),
+            COLOR_CALIBRATION.T,
+            axes=([2], [0]),
+        )
+        rgb = np.clip(rgb, 0, 65536)
+
+        h, _ = np.histogram(rgb.ravel(), bins=bin_edges)
+        histogram += h
+        total_values += rgb.size
+    p2 = get_percentile(histogram, bin_edges, total_values, 2)
+    p98 = get_percentile(histogram, bin_edges, total_values, 98)
+    return p2, p98
+
+
+def process_preview(g: Path, padding: int = 3, max_chunks: int = 512):
     bins = sorted(list(g.glob("*.bin")))
 
-    start = np.inf
-    finish = 0
     max_green = 0
     for i, bin in tqdm(enumerate(bins), total=len(bins)):
         dat1 = np.fromfile(bin, dtype=np.uint16).astype(np.float32)
@@ -269,17 +514,13 @@ def process_preview(g: Path, padding: int = 5, max_chunks: int = 192):
         max_green = max(max_green, np.max(raw_green))
 
     scores = []
-    for i, bin in tqdm(enumerate(bins), total=len(bins), desc="Finding moving region"):
+    for i, bin in tqdm(enumerate(bins), total=len(bins), desc="finding moving region"):
         dat1 = np.fromfile(bin, dtype=np.uint16).astype(np.float32)
         dat1_reshaped = np.reshape(dat1, (-1, 4096)).T
-        raw_green = dat1_reshaped[1::2, 1::2]
 
-        raw_green = (
-            raw_green[::2, ::2]
-            + raw_green[1::2, ::2]
-            + raw_green[::2, 1::2]
-            + raw_green[1::2, 1::2]
-        ) / 4
+        raw_green = dat1_reshaped[1::2, 1::2]
+        raw_green = bin2to1(raw_green)
+
         grad_y, grad_x = np.gradient(raw_green)
         magnitude = np.sqrt(grad_x**2 + grad_y**2) + 0.1 * max_green
         energy = np.abs(grad_x) / magnitude
@@ -288,57 +529,140 @@ def process_preview(g: Path, padding: int = 5, max_chunks: int = 192):
         scores.append(score)
 
     min_score = min(scores)
+    selected = set()
     for i, score in enumerate(scores):
         if score > min_score * 1.5:
-            start = min(start, max(i - padding, 0))
-            finish = max(finish, min(i + padding, len(bins)))
-    print(start, finish)
-    if start == np.inf:
-        start = 0
-    if finish == 0:
-        finish = len(bins) - 1
+            for pi in range(-padding, padding + 1):
+                selected.add(i + pi)
+    selected = sorted(list(selected))
+    print("selected", selected)
 
-    if finish - start <= max_chunks:
-        all_data = [
-            np.fromfile(bin, dtype=np.uint16).astype(np.float32)
-            for bin in bins[start : finish + 1]
-        ]
+    selected_bins = [bins[s] for s in selected]
+
+    p2, p98 = autoexposure(selected_bins)
+
+    # lazily load binary data across selected files without full-memory concatenation
+    cache = FileDataCache(selected_bins, dtype=np.uint16, rows=4096)
+    data = cache
+
+    # set up lazy channel views for green channels
+    green1 = ChannelView(data, row_offset=1, col_offset=1)
+    green2 = ChannelView(data, row_offset=0, col_offset=0)
+    sample_xs, sample_ys, _weights = windowed_cross_correlation(green1, green2)
+
+    spline = robust_bspline_fit(
+        x=sample_xs,
+        y=sample_ys,
+        weights=np.ones_like(sample_xs),
+        smoothness=20000,
+        visualize=False,
+        g=g,
+    )
+
+    print(g, len(bins), data.shape)
+
+    # Build raw channel views
+    red_view = ChannelView(data, row_offset=0, col_offset=1)
+    green1 = ChannelView(data, row_offset=1, col_offset=1)
+    green2 = ChannelView(data, row_offset=0, col_offset=0)
+    blue_view = ChannelView(data, row_offset=1, col_offset=0)
+    # Generate sample positions from spline
+    xs = []
+    x = 0
+    # total width
+    n = data.total_cols // 2
+    if spline(sample_xs[0]) < 0:
+        x = n - 1
+    while 0 <= x < n:
+        xs.append(int(x))
+        if x < sample_xs[0]:
+            sx = spline(sample_xs[0])
+        elif x >= sample_xs[-1]:
+            sx = spline(sample_xs[-1])
+        else:
+            sx = spline(x)
+        # enforce minimum step
+        if -0.1 < sx < 0.1:
+            sx = 0.1 if sx > 0 else -0.1
+        x += 2 * sx
+    ind = np.array(xs, dtype=np.int32)
+    # compute window widths
+    if ind.size > 1:
+        deltas = np.diff(ind)
+        widths = np.empty_like(ind)
+        widths[0] = deltas[0]
+        widths[-1] = deltas[-1]
+        widths[1:-1] = ((deltas[:-1] + deltas[1:]) / 2).astype(np.int32)
     else:
-        all_data = [
-            np.fromfile(bin, dtype=np.uint16).astype(np.float32)
-            for bin in bins[start : start + max_chunks // 2]
-        ] + [
-            np.fromfile(bin, dtype=np.uint16).astype(np.float32)
-            for bin in bins[finish - max_chunks // 2 : finish + 1]
-        ]
-    data = np.concatenate(all_data)
-    data = np.reshape(data, (-1, 4096)).T
-    data = data.astype(np.float32)
+        widths = np.ones_like(ind)
+    widths = np.clip(widths, 1, n)
+    # chunk size for sampling
+    max_pix = 100000
+    nchunks = math.ceil(ind.size / max_pix)
 
-    print(g, len(bins), start, finish, data.shape)
-
-    rgb = bin_to_rgb(data)
-
-    cv2.imwrite(str(g / preview), rgb[:, :, ::-1])
+    for chunk_i in range(nchunks):
+        lo = chunk_i * max_pix
+        hi = min((chunk_i + 1) * max_pix, ind.size)
+        h_ch = green1.height
+        cr = np.zeros((h_ch, hi - lo, 3), dtype=np.float32)
+        out_name = f"rgb_{chunk_i}.png"
+        for j, (xi, wi) in tqdm(
+            enumerate(zip(ind[lo:hi], widths[lo:hi])),
+            total=len(ind),
+            desc="sampling " + out_name,
+        ):
+            half = wi // 2
+            start = max(xi - half, 0)
+            end = min(xi + half + 1, n)
+            r_win = red_view[:, slice(start, end)]
+            g1_win = green1[:, slice(start, end)]
+            g2_win = green2[:, slice(start, end)]
+            b_win = blue_view[:, slice(start, end)]
+            if r_win.shape[1] == 0:
+                cr[:, j, :] = 0
+            else:
+                cr[:, j, 0] = r_win.mean(axis=1)
+                cr[:, j, 1] = ((g1_win + g2_win) * 0.5).mean(axis=1)
+                cr[:, j, 2] = b_win.mean(axis=1)
+        # calibrate, clip, sharpen, tone-map
+        rgb = np.tensordot(cr, COLOR_CALIBRATION.T, axes=([2], [0]))
+        rgb = np.clip(rgb, 0, 65536)
+        rgb = sharpen(rgb)
+        rgb = rgb - p2
+        rgb += 0.1
+        rgb /= p98
+        rgb = np.clip(rgb, 0, 1)
+        rgb = rgb[::-1, :, :]
+        rgb = np.sqrt(rgb)
+        rgb *= 255
+        cv2.imwrite(str(g / out_name), rgb[:, :, ::-1].astype(np.uint8))
 
 
 def main():
-    for g in sorted(list(linescans.glob("2025-06*"))): # yamanote
     # for g in sorted(list(linescans.glob("2024-09-10-06-00-05*"))): # yamanote
+    # for g in sorted(list(linescans.glob("17-12-03-23-11-30-utc"))):  # bart
+    # for g in sorted(list(linescans.glob("2024-09-10-06-00-05*"))):  # yamanote
     # for g in sorted(list(linescans.glob("2024-09-19-03-33-57*"))): # fuxing
     # for g in sorted(list(linescans.glob("2024-09-14-02-13-13*"))): # hktram
+    # for g in sorted(list(linescans.glob("2024-09*"))):  # hktram
+    # for g in sorted(list(linescans.glob("2024-09-12-01-31-01*"))):  # hk bus
     # for g in sorted(list(linescans.glob("nyc4"))):
+    # for g in sorted(list(linescans.glob("18*"))):
+    # for g in sorted(list(linescans.glob("18-10-06-13-52-16-utc*"))):  # pato
+    # for g in sorted(list(linescans.glob("18-08-04*"))):  # amtrak
+    # for g in sorted(list(linescans.glob("2023*"))):
+    # for g in sorted(list(linescans.glob("17-10-01-23-46-50-utc"))):
+    for g in sorted(list(linescans.glob("*"))):
         if not g.is_dir():
             continue
 
         print(g)
-        if (g / preview).exists():
-            ...
+        process_preview(g)
+        """
         try:
             process_preview(g)
         except KeyboardInterrupt:
             break
-        """
         except Exception as e:
             print(f"oh no! {g} {e}")
             continue  # anyway
