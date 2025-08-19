@@ -83,8 +83,7 @@ class NectarCapturer {
     int frame_id = 0;
 
     NectarCapturer()
-        : buffer(buffer_rows * cols * 2, 0),
-          rgb_image((buffer_rows / 2) * (cols / 2) * 3, 0),
+        : rgb_image((buffer_rows / 2) * (cols / 2) * 3, 0),
           rgb_image_cropped((buffer_rows / 2) * (cols / 8) * 3, 0) {
         glGenTextures(1, &rgb_texture);
         glGenTextures(1, &rgb_crop_texture);
@@ -97,12 +96,10 @@ class NectarCapturer {
     static constexpr int buffer_rows = 512;
     static constexpr int cols = 4096;
 
-    std::vector<uint8_t> buffer;
     std::vector<Array<uint8_t>> raw_buffers;
 
     std::vector<uint8_t> rgb_image;
     std::vector<uint8_t> rgb_image_cropped;
-    int buffer_row_id = 0;
 
     static constexpr int hist_h = 256;
     static constexpr int hist_w = 512;
@@ -117,7 +114,7 @@ class NectarCapturer {
     int dropped_frames = 0;
 
     std::array<uint8_t, histogram_size> histogram;
-    void viz() {
+    void viz(const uint8_t *const raw_buf) {
         std::array<int, 256> reds;
         std::array<int, 256> greens;
         std::array<int, 256> blues;
@@ -126,27 +123,25 @@ class NectarCapturer {
         std::fill(blues.begin(), blues.end(), 0);
 
         std::fill(histogram.begin(), histogram.end(), 0);
-        // make image
-        for (int i = buffer_row_id / 2; i < (buffer_row_id + capture_rows) / 2;
-             i++) {
+        // make image from raw buffer
+        for (int i = 0; i < capture_rows / 2; i++) {
             for (int j = 0; j < cols / 2; j++) {
                 const int ind = (j + cols / 2 * i) * 3;
-                rgb_image[ind] = buffer[2 * ((2 * i + 1) * cols + 2 * j) + 1];
+                rgb_image[ind] = raw_buf[2 * ((2 * i + 1) * cols + 2 * j) + 1];
                 rgb_image[ind + 1] =
-                    (buffer[2 * ((2 * i + 1) * cols + (2 * j + 1)) + 1] +
-                     buffer[2 * (2 * i * cols + 2 * j) + 1]) /
+                    (raw_buf[2 * ((2 * i + 1) * cols + (2 * j + 1)) + 1] +
+                     raw_buf[2 * (2 * i * cols + 2 * j) + 1]) /
                     2;
                 rgb_image[ind + 2] =
-                    buffer[2 * (2 * i * cols + (2 * j + 1)) + 1];
+                    raw_buf[2 * (2 * i * cols + (2 * j + 1)) + 1];
 
                 reds[rgb_image[ind]]++;
                 greens[rgb_image[ind + 1]]++;
                 blues[rgb_image[ind + 2]]++;
             }
         }
-        // punched in
-        for (int i = buffer_row_id / 2; i < (buffer_row_id + capture_rows) / 2;
-             i++) {
+        // punched in crop
+        for (int i = 0; i < capture_rows / 2; i++) {
             for (int j = 0; j < cols / 8; j++) {
                 const int ind_cropped = (j + cols / 8 * i) * 3;
                 const int ind =
@@ -233,7 +228,6 @@ class NectarCapturer {
             cam.SetImageSizeX(cols);
             cam.SetImageSizeY(new_capture_rows);
             cam.SetAcquire(true);
-            buffer_row_id = 0;
             capture_rows = new_capture_rows;
             raw_buffers.clear();
         }
@@ -241,7 +235,6 @@ class NectarCapturer {
         const int capture_frames = std::max(1, new_rows / buffer_rows);
         std::chrono::steady_clock::duration capture_time{0};
         std::chrono::steady_clock::duration capture_time_2{0};
-        std::chrono::steady_clock::duration transpose_time{0};
         std::chrono::steady_clock::duration viz_time{0};
 
         for (int capture_ind = 0; capture_ind < capture_frames; capture_ind++) {
@@ -294,21 +287,8 @@ class NectarCapturer {
                 }
             } else {
                 if (capture_ind == 0) {
-                    for (int i = 0; i < capture_rows; i++) {
-                        const auto t_transpose_0 =
-                            std::chrono::steady_clock::now();
-                        for (int j = 0; j < cols; j++) {
-                            for (int k = 0; k < 2; k++) {
-                                buffer[2 * (buffer_row_id * cols + j) + k] =
-                                    raw_image[2 * (i * cols + j) + k];
-                            }
-                        }
-                        buffer_row_id = (buffer_row_id + 1) % buffer_rows;
-                        const auto t_write_0 = std::chrono::steady_clock::now();
-                        transpose_time += t_write_0 - t_transpose_0;
-                    }
                     const auto t_viz_0 = std::chrono::steady_clock::now();
-                    viz();
+                    viz(raw_image.Data());
                     const auto t_viz_1 = std::chrono::steady_clock::now();
                     viz_time += t_viz_1 - t_viz_0;
                 }
@@ -318,10 +298,10 @@ class NectarCapturer {
         const auto t1 = std::chrono::steady_clock::now();
         ImGui::Text("rows = %d", capture_rows);
         if (!save) {
-            draw_image(rgb_texture, rgb_image.data(), cols / 2, buffer_rows / 2,
-                       cols / 2, buffer_rows / 2);
+            draw_image(rgb_texture, rgb_image.data(), cols / 2, capture_rows / 2,
+                       cols / 2, capture_rows / 2);
             draw_image(rgb_crop_texture, rgb_image_cropped.data(), cols / 8,
-                       buffer_rows / 2, cols / 2, buffer_rows / 2);
+                       capture_rows / 2, cols / 2, capture_rows / 2);
             draw_image(hist_texture, histogram.data(), hist_w, hist_h, hist_w,
                        hist_h);
         }
@@ -329,7 +309,7 @@ class NectarCapturer {
         ImGui::Text("capture frames: %d", capture_frames);
         ImGui::Text("main loop takes: %ld ns", (t1 - t0).count());
         ImGui::Text("capture takes:   %ld ns", capture_time.count());
-        ImGui::Text("transpose takes: %ld ns", transpose_time.count());
+        // removed transpose step timing
         ImGui::Text("viz takes:       %ld ns", viz_time.count());
         ImGui::Text("drawing takes:   %ld ns", (t2 - t1).count());
         ImGui::Text("fps = %lf", 1e9 / (t2 - last_frame_time).count());
@@ -343,7 +323,6 @@ class NectarCapturer {
             std::cerr << "capture frames:" << capture_frames << "\n";
             std::cerr << "main loop takes:" << (t1 - t0).count() << "\n";
             std::cerr << "capture takes:  " << capture_time.count() << "\n";
-            std::cerr << "transpose takes:" << transpose_time.count() << "\n";
             std::cerr << "viz takes:      " << viz_time.count() << "\n";
             std::cerr << "drawing takes:  " << (t2 - t1).count() << "\n";
             std::cerr << "Capture time: " << capture_time_2.count()
