@@ -9,6 +9,7 @@ from numpy.lib.stride_tricks import sliding_window_view
 import numpy as np
 from scipy.interpolate import UnivariateSpline
 from tqdm import tqdm
+import itertools
 
 # Color calibration matrix for RGB conversion
 COLOR_CALIBRATION = np.array(
@@ -679,14 +680,14 @@ def process_preview(g: Path, padding: int = 3, max_chunks: int = 512):
     green2 = ChannelView(data, row_offset=0, col_offset=0)
     blue_view = ChannelView(data, row_offset=1, col_offset=0)
     # Generate sample positions from spline
-    xs = []
+    sample_positions = []
+    widths = []
     x = 0
     # total width
     n = data.total_cols // 2
     if spline(sample_xs[0]) < 0:
         x = n - 1
     while 0 <= x < n:
-        xs.append(int(x))
         if x < sample_xs[0]:
             sx = spline(sample_xs[0])
         elif x >= sample_xs[-1]:
@@ -696,54 +697,55 @@ def process_preview(g: Path, padding: int = 3, max_chunks: int = 512):
         # enforce minimum step
         if -0.1 < sx < 0.1:
             sx = 0.1 if sx > 0 else -0.1
+
+        sample_positions.append(x)
+        widths.append(abs(sx * 2))
         x += sx
-    ind = np.array(xs, dtype=np.int32)
-    # compute window widths
-    if ind.size > 1:
-        deltas = np.diff(ind)
-        widths = np.empty_like(ind)
-        widths[0] = deltas[0]
-        widths[-1] = deltas[-1]
-        widths[1:-1] = ((deltas[:-1] + deltas[1:]) / 2).astype(np.int32)
-    else:
-        widths = np.ones_like(ind)
+
     widths = np.clip(widths, 1, n)
     # chunk size for sampling
-    max_pix = 100000
-    nchunks = math.ceil(ind.size / max_pix)
+    max_pix = 65535
 
-    for chunk_i in range(nchunks):
-        lo = chunk_i * max_pix
-        hi = min((chunk_i + 1) * max_pix, ind.size)
-        h_ch = green1.height
-        raw_sampled = np.zeros((2 * h_ch, hi - lo, 3), dtype=np.float32)
-        out_name = f"rgb_{chunk_i}_denoised.png"
+    for chunk_i, batch in enumerate(
+        itertools.batched(zip(sample_positions, widths), max_pix)
+    ):
+        out_name = f"rgb_{chunk_i}_hann.png"
+        raw_sampled = np.zeros((2 * green1.height, len(batch), 3), dtype=np.float32)
+
         for j, (xi, wi) in tqdm(
-            enumerate(zip(ind[lo:hi], widths[lo:hi])),
-            total=len(ind[lo:hi]),
+            enumerate(batch),
+            total=len(batch),
             desc="sampling " + out_name,
         ):
-            half = wi // 2
-            start = max(xi - half, 0)
-            end = min(xi + half + 1, n)
+            start = max(int(math.floor(xi - wi)), 0)
+            end = min(int(math.ceil(xi + wi) + 1), green1.width - 1)
+
             r_win = red_view[:, slice(start, end)]
             g1_win = green1[:, slice(start, end)]
             g2_win = green2[:, slice(start, end)]
             b_win = blue_view[:, slice(start, end)]
 
-            r_win = r_win.mean(axis=1)
+            # hann window
+            dist = np.arange(start, end) - xi
+            weights = np.zeros_like(dist)
+            mask = np.abs(dist) < wi
+            weights[mask] = 1 + np.cos(np.pi * dist[mask] / wi)
+            sum_weight = np.sum(weights)
+
+            r_win = np.sum(r_win * weights, axis=1) / sum_weight
+            g1_win = np.sum(g1_win * weights, axis=1) / sum_weight
+            g2_win = np.sum(g2_win * weights, axis=1) / sum_weight
+            b_win = np.sum(b_win * weights, axis=1) / sum_weight
+
             r_interp = interpolate_upsample(r_win, 0)
-            g1_win = g1_win.mean(axis=1)
             g1_interp = interpolate_upsample(g1_win, 1)
-            g2_win = g2_win.mean(axis=1)
             g2_interp = interpolate_upsample(g2_win, 0)
-            b_win = b_win.mean(axis=1)
             b_interp = interpolate_upsample(b_win, 1)
 
             if j == 0:
                 raw_sampled[:, 0, 0] = r_interp
                 raw_sampled[:, 0, 1] += g1_interp * 0.5
-            if j < hi - lo - 1:
+            if j < len(batch) - 1:
                 raw_sampled[:, j + 1, 0] = r_interp
                 raw_sampled[:, j + 1, 1] += g1_interp * 0.5
             raw_sampled[:, j, 1] += g2_interp * 0.5
@@ -774,12 +776,12 @@ def main():
     # for g in sorted(list(linescans.glob("2024-09-12-01-31-01*"))):  # hk bus
     # for g in sorted(list(linescans.glob("nyc4"))):
     # for g in sorted(list(linescans.glob("18*"))):
-    # for g in sorted(list(linescans.glob("18-10-06-13-52-16-utc*"))):  # pato
+    for g in sorted(list(linescans.glob("18-10-06-13-52-16-utc*"))):  # pato
     # for g in sorted(list(linescans.glob("18-08-04*"))):  # amtrak
     # for g in sorted(list(linescans.glob("2023*"))):
     # for g in sorted(list(linescans.glob("17-10-01-23-46-50-utc"))):
     # for g in sorted(list(linescans.glob("*"))):
-    for g in sorted(list(linescans.glob("18*"))):
+    # for g in sorted(list(linescans.glob("18*"))):
         if not g.is_dir():
             continue
 
