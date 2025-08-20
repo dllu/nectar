@@ -5,6 +5,7 @@ from pathlib import Path
 
 import cv2
 import matplotlib.pyplot as plt
+from numpy.lib.stride_tricks import sliding_window_view
 import numpy as np
 from scipy.interpolate import UnivariateSpline
 from tqdm import tqdm
@@ -19,7 +20,7 @@ COLOR_CALIBRATION = np.array(
 )
 
 # linescans = Path("/home/dllu/pictures/linescan")
-linescans = Path("/mnt/arch/mnt/data14/pictures/linescan")
+linescans = Path("/mnt/data14/pictures/linescan")
 
 
 class FileDataCache:
@@ -322,14 +323,6 @@ def robust_bspline_fit(
     return spline
 
 
-def resample(n, spline):
-    xs = []
-    x = 0
-    while x < n:
-        xs.append(x)
-        x += spline[x]
-
-
 def raw_channels(data: np.ndarray):
     raw_red = data[0::2, 1::2]
     raw_green_1 = data[1::2, 1::2]
@@ -340,8 +333,8 @@ def raw_channels(data: np.ndarray):
 
 
 def sharpen(rgb: np.ndarray) -> np.ndarray:
-    rgb_blurred = cv2.GaussianBlur(rgb, (0, 0), 1)
-    rgb = rgb - 0.2 * rgb_blurred
+    rgb_blurred = cv2.GaussianBlur(rgb, (0, 0), 1) + cv2.GaussianBlur(rgb, (0, 0), 2)
+    rgb = 1.4 * rgb - 0.2 * rgb_blurred
     return rgb
 
 
@@ -374,8 +367,8 @@ def calibrate_black_point(
     return data2
 
 
-def patch_denoise(
-    data: np.ndarray, neighbour_size: int = 256, similarity_thresh: float = 7
+def patch_denoise_old(
+    data: np.ndarray, neighbour_size: int = 128, similarity_thresh: float = 3
 ):
     # patch based denoising by searching horizontally along rows for similar 3x3 patches
     denoised = data.copy()
@@ -437,11 +430,105 @@ def patch_denoise(
                 )
 
         time_d = time.time()
-        print(similars / (data.shape[1] - 2))
+        # print(similars / (data.shape[1] - 2))
 
         time_ab += time_b - time_a
         time_bc += time_c - time_b
         time_cd += time_d - time_c
+    print("times", time_ab, time_bc, time_cd)
+    return denoised
+
+
+def patch_denoise(
+    data: np.ndarray, neighbour_size: int = 256, similarity_thresh: float = 3
+):
+    # Patch-based denoising by searching horizontally along rows for similar 3x3 patches.
+    denoised = data.copy().astype(np.float32)  # Ensure float32 for speed/memory.
+    sqrt_data = np.sqrt(data).astype(np.float32)
+
+    feature_size = 9
+    height, width, channels = data.shape
+    N = width - 2  # Number of patches per row.
+
+    # Center indices in the feature vector (one per channel).
+    center_indices = np.array([0, feature_size, 2 * feature_size])
+
+    time_ab = 0
+    time_bc = 0
+    time_cd = 0
+
+    for row in tqdm(range(1, height - 1), desc="denoising"):
+        time_a = time.time()
+
+        # Extract features (27 x N, float32).
+        feature = np.zeros((3 * feature_size, N), dtype=np.float32)
+        for channel in range(3):
+            offset = channel * feature_size
+            feature[offset + 0] = sqrt_data[row, 1:-1, channel]  # Center.
+            feature[offset + 1] = sqrt_data[row, :-2, channel]  # Left.
+            feature[offset + 2] = sqrt_data[row, 2:, channel]  # Right.
+            feature[offset + 3] = sqrt_data[row - 1, 1:-1, channel]  # Top center.
+            feature[offset + 4] = sqrt_data[row - 1, :-2, channel]  # Top left.
+            feature[offset + 5] = sqrt_data[row - 1, 2:, channel]  # Top right.
+            feature[offset + 6] = sqrt_data[row + 1, 1:-1, channel]  # Bottom center.
+            feature[offset + 7] = sqrt_data[row + 1, :-2, channel]  # Bottom left.
+            feature[offset + 8] = sqrt_data[row + 1, 2:, channel]  # Bottom right.
+
+        time_b = time.time()
+
+        # Better sorting key: project onto first principal component for max variance direction.
+        data_centered = feature.T - np.mean(feature.T, axis=0)
+        _, _, Vt = np.linalg.svd(data_centered, full_matrices=False)
+        proj = data_centered @ Vt[0, :].T
+        sort_index = np.argsort(proj)
+
+        # Sort features.
+        feature_sorted = feature[:, sort_index]
+
+        time_c = time.time()
+
+        # Pad sorted features to handle edge windows (use -100 to ensure diffs exceed thresh).
+        pad_value = -100.0
+        w = 2 * neighbour_size + 1
+        padded = np.pad(
+            feature_sorted,
+            ((0, 0), (neighbour_size, neighbour_size)),
+            mode="constant",
+            constant_values=pad_value,
+        )
+
+        # Sliding window view: (27, N, w).
+        windows = sliding_window_view(padded, w, axis=1)
+
+        # Center position in each window.
+        center_pos = neighbour_size
+
+        # Compute mask (N, w) by accumulating per-dimension checks (saves memory).
+        mask = np.ones((N, w), dtype=bool)
+        for dim in range(feature.shape[0]):
+            dim_window = windows[dim, :, :]  # (N, w)
+            center_dim = dim_window[:, center_pos]  # (N,)
+            abs_diff = np.abs(dim_window - center_dim[:, np.newaxis])  # (N, w)
+            mask &= abs_diff < similarity_thresh
+
+        # Total similars (excluding self, but includes for averaging).
+        similars = np.sum(mask) - N  # Self always included.
+
+        # Average centers for each channel using masked arrays.
+        for ch in range(3):
+            center_window = windows[center_indices[ch], :, :]  # (N, w)
+            masked = np.ma.masked_array(center_window, mask=~mask)
+            means_sqrt = np.ma.mean(masked, axis=1)
+            # Assign to original positions.
+            original_cols = sort_index + 1  # Offset for image indexing.
+            denoised[row, original_cols, ch] = means_sqrt**2
+
+        time_d = time.time()
+
+        time_ab += time_b - time_a
+        time_bc += time_c - time_b
+        time_cd += time_d - time_c
+
     print("times", time_ab, time_bc, time_cd)
     return denoised
 
@@ -501,6 +588,31 @@ def autoexposure(selected_bins):
     p2 = get_percentile(histogram, bin_edges, total_values, 2)
     p98 = get_percentile(histogram, bin_edges, total_values, 98)
     return p2, p98
+
+
+def interpolate_upsample(arr, off):
+    arr = np.asarray(arr)
+    n = len(arr)
+    if n == 0:
+        return np.empty(0)
+    res = np.zeros(2 * n)
+    if off == 0:
+        # Place original at even indices
+        res[::2] = arr
+        # Interpolate inner odd indices
+        if n > 1:
+            res[1:-1:2] = (res[:-2:2] + res[2::2]) / 2
+        # Repeat at the end for the last odd index
+        res[-1] = res[-2]
+    elif off == 1:
+        # Place original at odd indices
+        res[1::2] = arr
+        # Interpolate inner even indices (starting from 2)
+        if n > 1:
+            res[2::2] = (res[1:-1:2] + res[3::2]) / 2
+        # Repeat at the start for index 0
+        res[0] = res[1]
+    return res
 
 
 def process_preview(g: Path, padding: int = 3, max_chunks: int = 512):
@@ -584,7 +696,7 @@ def process_preview(g: Path, padding: int = 3, max_chunks: int = 512):
         # enforce minimum step
         if -0.1 < sx < 0.1:
             sx = 0.1 if sx > 0 else -0.1
-        x += 2 * sx
+        x += sx
     ind = np.array(xs, dtype=np.int32)
     # compute window widths
     if ind.size > 1:
@@ -604,11 +716,11 @@ def process_preview(g: Path, padding: int = 3, max_chunks: int = 512):
         lo = chunk_i * max_pix
         hi = min((chunk_i + 1) * max_pix, ind.size)
         h_ch = green1.height
-        cr = np.zeros((h_ch, hi - lo, 3), dtype=np.float32)
-        out_name = f"rgb_{chunk_i}.png"
+        raw_sampled = np.zeros((2 * h_ch, hi - lo, 3), dtype=np.float32)
+        out_name = f"rgb_{chunk_i}_denoised.png"
         for j, (xi, wi) in tqdm(
             enumerate(zip(ind[lo:hi], widths[lo:hi])),
-            total=len(ind),
+            total=len(ind[lo:hi]),
             desc="sampling " + out_name,
         ):
             half = wi // 2
@@ -618,14 +730,28 @@ def process_preview(g: Path, padding: int = 3, max_chunks: int = 512):
             g1_win = green1[:, slice(start, end)]
             g2_win = green2[:, slice(start, end)]
             b_win = blue_view[:, slice(start, end)]
-            if r_win.shape[1] == 0:
-                cr[:, j, :] = 0
-            else:
-                cr[:, j, 0] = r_win.mean(axis=1)
-                cr[:, j, 1] = ((g1_win + g2_win) * 0.5).mean(axis=1)
-                cr[:, j, 2] = b_win.mean(axis=1)
+
+            r_win = r_win.mean(axis=1)
+            r_interp = interpolate_upsample(r_win, 0)
+            g1_win = g1_win.mean(axis=1)
+            g1_interp = interpolate_upsample(g1_win, 1)
+            g2_win = g2_win.mean(axis=1)
+            g2_interp = interpolate_upsample(g2_win, 0)
+            b_win = b_win.mean(axis=1)
+            b_interp = interpolate_upsample(b_win, 1)
+
+            if j == 0:
+                raw_sampled[:, 0, 0] = r_interp
+                raw_sampled[:, 0, 1] += g1_interp * 0.5
+            if j < hi - lo - 1:
+                raw_sampled[:, j + 1, 0] = r_interp
+                raw_sampled[:, j + 1, 1] += g1_interp * 0.5
+            raw_sampled[:, j, 1] += g2_interp * 0.5
+            raw_sampled[:, j, 2] = b_interp
+        # denoised_sampled = patch_denoise(raw_sampled)
+        denoised_sampled = raw_sampled
         # calibrate, clip, sharpen, tone-map
-        rgb = np.tensordot(cr, COLOR_CALIBRATION.T, axes=([2], [0]))
+        rgb = np.tensordot(denoised_sampled, COLOR_CALIBRATION.T, axes=([2], [0]))
         rgb = np.clip(rgb, 0, 65536)
         rgb = sharpen(rgb)
         rgb = rgb - p2
@@ -643,7 +769,7 @@ def main():
     # for g in sorted(list(linescans.glob("17-12-03-23-11-30-utc"))):  # bart
     # for g in sorted(list(linescans.glob("2024-09-10-06-00-05*"))):  # yamanote
     # for g in sorted(list(linescans.glob("2024-09-19-03-33-57*"))): # fuxing
-    # for g in sorted(list(linescans.glob("2024-09-14-02-13-13*"))): # hktram
+    # for g in sorted(list(linescans.glob("2024-09-14-02-13-13*"))):  # hktram
     # for g in sorted(list(linescans.glob("2024-09*"))):  # hktram
     # for g in sorted(list(linescans.glob("2024-09-12-01-31-01*"))):  # hk bus
     # for g in sorted(list(linescans.glob("nyc4"))):
@@ -652,13 +778,12 @@ def main():
     # for g in sorted(list(linescans.glob("18-08-04*"))):  # amtrak
     # for g in sorted(list(linescans.glob("2023*"))):
     # for g in sorted(list(linescans.glob("17-10-01-23-46-50-utc"))):
-    for g in sorted(list(linescans.glob("*"))):
+    # for g in sorted(list(linescans.glob("*"))):
+    for g in sorted(list(linescans.glob("18*"))):
         if not g.is_dir():
             continue
 
         print(g)
-        process_preview(g)
-        """
         try:
             process_preview(g)
         except KeyboardInterrupt:
@@ -666,7 +791,6 @@ def main():
         except Exception as e:
             print(f"oh no! {g} {e}")
             continue  # anyway
-        """
 
 
 if __name__ == "__main__":
