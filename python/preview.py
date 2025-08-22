@@ -189,7 +189,7 @@ def windowed_cross_correlation(
     window_step: int = 256,
     window_size: int = 4096,
     corr_size: int = 15,
-    visualize: bool = False,
+    output_dir: Path = None,
 ) -> np.ndarray:
     """
     green_1: (h, w) where w >> h and w >> window_size
@@ -197,7 +197,6 @@ def windowed_cross_correlation(
     """
 
     xs = np.arange(0, green_1.shape[1], window_step)
-    # xs = np.array([0])
     ys = []
     refined_ys = []
     good_xs = []
@@ -235,19 +234,36 @@ def windowed_cross_correlation(
             weights.append(np.max(ncorrs) - np.min(ncorrs))
             ncorrs = ncorrs - np.min(ncorrs)
             ncorrs = ncorrs / np.max(ncorrs)
+            peak_idx = np.argmax(ncorrs)
             refined_peak_idx = subpixel_peak(ncorrs, 2.0, peak_idx)
 
             ys.append(peak_idx - corr_half)
             refined_ys.append(refined_peak_idx - corr_half)
             good_xs.append(xi * window_step + window_size // 2)
 
-    if visualize:
+            if output_dir is not None and x > 20000 and x < 25000:
+                plt.figure(figsize=(16, 9), dpi=300)
+                plt.plot(ncorrs, "b.", label="Raw peaks")
+                plt.plot([peak_idx], [ncorrs[peak_idx]], "r.", label="Naive peak")
+                plt.plot(
+                    [refined_peak_idx, refined_peak_idx],
+                    [0, np.max(ncorrs)],
+                    "g--",
+                    label="Subpixel refined peaks",
+                )
+                plt.legend()
+                plt.savefig(output_dir / f"mean_shift_{xi:04d}.png")
+
+    if output_dir is not None:
         plt.imshow(heatmap)
-        plt.show()
+        plt.savefig(output_dir / "heatmap.png")
+
+        plt.figure(figsize=(16, 9), dpi=300)
         plt.plot(good_xs, ys, "b.", label="Raw peaks")
         plt.plot(good_xs, refined_ys, "r.", label="Subpixel refined peaks")
         plt.plot(xs, np.zeros_like(xs), "k--")
-        plt.show()
+        plt.legend()
+        plt.savefig(output_dir / "subpixel_peaks.png")
 
     weights = np.array(weights)
     weights /= np.max(weights)
@@ -304,7 +320,7 @@ def robust_bspline_fit(
         current_weights = new_weights
 
     # Plot the original data and the fitted spline on a dense grid.
-    plt.figure(figsize=(8, 5))
+    plt.figure(figsize=(16, 9), dpi=300)
     plt.plot(x, y, "bo", label="Data")
     x_dense = np.linspace(np.min(x), np.max(x), 500)
     y_dense = spline(x_dense)
@@ -339,109 +355,8 @@ def sharpen(rgb: np.ndarray) -> np.ndarray:
     return rgb
 
 
-def calibrate_black_point(
-    data: np.ndarray,
-    top: int = 512,
-    bottom: int = 512,
-    similarity_thresh: float = 1000,
-    min_px: int = 64,
-):
-    median_top = np.median(data[:top, :], axis=1)
-    median_bottom = np.median(data[-bottom:, :], axis=1)
-    height = data.shape[0]
-    rows = np.linspace(0, 1, num=height)
-    x = np.concatenate((rows[:top], rows[-bottom:]))
-    data2 = np.zeros_like(data)
-    for col in tqdm(range(data.shape[1]), desc="calibrating black point"):
-        y = np.concatenate(
-            (
-                median_top - data[:top, col],
-                median_bottom - data[-bottom:, col],
-            )
-        )
-
-        mask = np.abs(y) < similarity_thresh
-        if np.sum(mask) < min_px:
-            continue
-        poly = np.polynomial.Polynomial.fit(x[mask], y[mask], 1)
-        data2[:, col] = data[:, col] + poly.linspace(height)[1]
-    return data2
-
-
-def patch_denoise_old(
-    data: np.ndarray, neighbour_size: int = 128, similarity_thresh: float = 3
-):
-    # patch based denoising by searching horizontally along rows for similar 3x3 patches
-    denoised = data.copy()
-
-    time_ab = 0
-    time_bc = 0
-    time_cd = 0
-
-    # since the data is poisson distributed, the standard deviation is proportional to sqrt
-    # so we sqrt it first so that we just need to compare it to a constant
-    sqrt_data = np.sqrt(data)
-
-    feature_size = 9
-    for row in tqdm(range(1, data.shape[0] - 1), desc="denoising"):
-        # for row in tqdm(range(1000, 1050), desc="denoising"):
-        time_a = time.time()
-        feature = np.zeros((3 * feature_size, data.shape[1] - 2))
-        for channel in range(3):
-            feature[0 + channel * feature_size] = sqrt_data[row, 1:-1, channel]
-            feature[1 + channel * feature_size] = sqrt_data[row, :-2, channel]
-            feature[2 + channel * feature_size] = sqrt_data[row, 2:, channel]
-            feature[3 + channel * feature_size] = sqrt_data[row - 1, 1:-1, channel]
-            feature[4 + channel * feature_size] = sqrt_data[row - 1, :-2, channel]
-            feature[5 + channel * feature_size] = sqrt_data[row - 1, 2:, channel]
-            feature[6 + channel * feature_size] = sqrt_data[row + 1, 1:-1, channel]
-            feature[7 + channel * feature_size] = sqrt_data[row + 1, :-2, channel]
-            feature[8 + channel * feature_size] = sqrt_data[row + 1, 2:, channel]
-        feature_mean = np.mean(feature, axis=0)
-
-        time_b = time.time()
-
-        sort_index = np.argsort(feature_mean)
-        feature_sorted = feature[:, sort_index]
-        index_in_sorted = np.argsort(sort_index)
-
-        # kd = scipy.spatial.KDTree(feature.T)
-        # dist, ind = kd.query(feature.T, neighbour_size)
-
-        time_c = time.time()
-
-        similars = 0
-        for col in range(data.shape[1] - 2):
-            sorted_col = index_in_sorted[col]
-            neighbours = feature_sorted[
-                :,
-                max(0, sorted_col - neighbour_size) : min(
-                    data.shape[1] - 2, sorted_col + neighbour_size
-                ),
-            ]
-            # neighbours = feature[:, ind[col, :]]
-            neighbour_mask = (
-                np.max(np.abs(neighbours - feature[:, col : col + 1]), axis=0)
-                < similarity_thresh
-            )
-            similars += np.sum(neighbour_mask)
-            for channel in range(3):
-                denoised[row, col + 1, channel] = np.square(
-                    np.mean(neighbours[channel * feature_size, neighbour_mask])
-                )
-
-        time_d = time.time()
-        # print(similars / (data.shape[1] - 2))
-
-        time_ab += time_b - time_a
-        time_bc += time_c - time_b
-        time_cd += time_d - time_c
-    print("times", time_ab, time_bc, time_cd)
-    return denoised
-
-
 def patch_denoise(
-    data: np.ndarray, neighbour_size: int = 256, similarity_thresh: float = 3
+    data: np.ndarray, neighbour_size: int = 64, similarity_thresh: float = 3
 ):
     # Patch-based denoising by searching horizontally along rows for similar 3x3 patches.
     denoised = data.copy().astype(np.float32)  # Ensure float32 for speed/memory.
@@ -477,18 +392,12 @@ def patch_denoise(
 
         time_b = time.time()
 
-        # Better sorting key: project onto first principal component for max variance direction.
-        data_centered = feature.T - np.mean(feature.T, axis=0)
-        _, _, Vt = np.linalg.svd(data_centered, full_matrices=False)
-        proj = data_centered @ Vt[0, :].T
-        sort_index = np.argsort(proj)
+        sort_index = np.argsort(np.sum(feature, axis=0))
 
-        # Sort features.
         feature_sorted = feature[:, sort_index]
 
         time_c = time.time()
 
-        # Pad sorted features to handle edge windows (use -100 to ensure diffs exceed thresh).
         pad_value = -100.0
         w = 2 * neighbour_size + 1
         padded = np.pad(
@@ -512,14 +421,35 @@ def patch_denoise(
             abs_diff = np.abs(dim_window - center_dim[:, np.newaxis])  # (N, w)
             mask &= abs_diff < similarity_thresh
 
-        # Total similars (excluding self, but includes for averaging).
-        similars = np.sum(mask) - N  # Self always included.
+        # Compute Gaussian weights based on distances for valid patches only
+        gaussian_weights = np.zeros((N, w), dtype=np.float32)
+        for i in range(N):
+            center_feature = feature_sorted[:, i]  # (27,)
+            window_features = windows[:, i, :]  # (27, w)
+            valid_mask = mask[i, :] & (
+                window_features[0, :] != pad_value
+            )  # Valid patches (True in mask and not padded)
+            valid_window = window_features[:, valid_mask]  # (27, num_valid)
+            if valid_window.size > 0:  # Only compute if there are valid patches
+                diff = valid_window - center_feature[:, np.newaxis]  # (27, num_valid)
+                distances = np.sqrt(np.sum(diff**2, axis=0))  # (num_valid,)
+                weights = np.exp(
+                    -0.5 * (distances**2) / (similarity_thresh**2)
+                )  # (num_valid,)
+                weights_sum = np.sum(weights)
+                if weights_sum > 0:  # Avoid division by zero
+                    weights /= weights_sum  # Normalize to sum to 1
+                gaussian_weights[i, valid_mask] = weights  # Assign to valid positions
 
-        # Average centers for each channel using masked arrays.
+        # Compute weighted means for each channel using Gaussian weights.
         for ch in range(3):
             center_window = windows[center_indices[ch], :, :]  # (N, w)
             masked = np.ma.masked_array(center_window, mask=~mask)
-            means_sqrt = np.ma.mean(masked, axis=1)
+            # Apply Gaussian weights to the valid (unmasked) data
+            weighted = masked * gaussian_weights
+            means_sqrt = np.ma.sum(
+                weighted, axis=1
+            )  # Weighted sum (normalized to mean)
             # Assign to original positions.
             original_cols = sort_index + 1  # Offset for image indexing.
             denoised[row, original_cols, ch] = means_sqrt**2
@@ -591,6 +521,206 @@ def autoexposure(selected_bins):
     return p2, p98
 
 
+def weighted_linear_regression(y, x, w):
+    """
+    Perform weighted linear regression: y = a + b*x + c*ind
+    where ind = np.arange(len(x))
+
+    Parameters:
+    y : 1D numpy array
+    x : 1D numpy array (same size as y)
+    w : 1D numpy array of non-negative weights (same size as y)
+
+    Returns:
+    np.array([a, b, c])
+    """
+    n = len(x)
+    ind = np.arange(n)
+
+    # Design matrix: columns [1, x, ind]
+    X = np.column_stack((np.ones_like(x), x, ind))
+    wX = w[:, None] * X  # n x 3
+    XtWX = X.T @ wX  # 3 x 3
+
+    # Compute X^T W y: X.T @ (w * y)
+    XtWy = X.T @ (w * y)  # 3 x 1
+
+    # Solve XtWX @ beta = XtWy for beta
+    damping = 0
+    beta = np.linalg.solve(XtWX + damping * np.eye(X.shape[1]), XtWy)
+    return beta
+
+
+def apply_column_correction(x, beta):
+    ind = np.arange(len(x))
+    return beta[0] + x * beta[1] + ind * beta[2]
+
+
+def compose_model(beta1, beta2):
+    return np.array(
+        [
+            beta1[0] + beta1[1] * beta2[0],
+            beta1[1] * beta2[1],
+            beta1[2] + beta1[1] * beta2[2],
+        ]
+    )
+
+
+def invert_model(beta):
+    return np.array([-beta[0] / beta[1], 1 / beta[1], -beta[2] / beta[1]])
+
+
+def column_exposure_jitter_correction(
+    red_view, green1, green2, blue_view, g: Path, sigma=500
+):
+    n_cols = red_view.width
+
+    off_r = np.zeros(n_cols)
+    off_g = np.zeros(n_cols)
+    off_b = np.zeros(n_cols)
+
+    locs = [7095, 7390]
+
+    green_currs_to_plot = []
+
+    betas = np.column_stack(
+        [np.zeros(n_cols - 1), np.ones(n_cols - 1), np.zeros(n_cols - 1)]
+    )
+
+    red_prev = red_view[:, 0]
+    green_prev = 0.5 * (green1[:, 0] + green2[:, 0])
+    blue_prev = blue_view[:, 0]
+    for col in tqdm(range(1, n_cols), desc="column exposure jitter"):
+        red_curr = red_view[:, col]
+        green_curr = 0.5 * (green1[:, col] + green2[:, col])
+        blue_curr = blue_view[:, col]
+
+        red_delta = red_curr - red_prev
+        green_delta = green_curr - green_prev
+        blue_delta = blue_curr - blue_prev
+
+        beta = np.array([0, 1, 0])
+        for iter in range(3):
+            red_delta = red_curr - apply_column_correction(red_prev, beta)
+            green_delta = green_curr - apply_column_correction(green_prev, beta)
+            blue_delta = blue_curr - apply_column_correction(blue_prev, beta)
+
+            iter_sigma2 = 0.5**iter / (sigma * sigma)
+            weight = np.exp(
+                -(np.square(red_delta) + np.square(green_delta) + np.square(blue_delta))
+                * iter_sigma2
+            )
+
+            weight[400:1600] = 0  # exclude middle region likely to include subject
+
+            weight = weight * weight
+
+            gray_curr = np.column_stack((red_curr, green_curr, blue_curr)).mean(axis=1)
+            gray_prev = np.column_stack((red_prev, green_prev, blue_prev)).mean(axis=1)
+            beta = weighted_linear_regression(gray_curr, gray_prev, weight)
+
+        betas[col - 1, :] = beta
+
+        red_prev = red_curr
+        green_prev = green_curr
+        blue_prev = blue_curr
+
+    beta = np.array([0, 1, 0])
+    global_models = np.zeros((n_cols, 3))
+    for col in range(n_cols):
+        global_models[col] = beta
+        if col < n_cols - 1:
+            lamb = 0.02
+            beta = (1 - lamb) * compose_model(
+                invert_model(betas[col]), beta
+            ) + lamb * np.array([0, 1, 0])
+    return global_models
+
+    # DEBUG!!!
+    beta = np.array([0, 1, 0])
+    for iter in range(3):
+        red_prev = red_view[:, locs[0]]
+        green_prev = green1[:, locs[0]] + green2[:, locs[0]]
+        blue_prev = blue_view[:, locs[0]]
+
+        red_curr = red_view[:, locs[1]]
+        green_curr = green1[:, locs[1]] + green2[:, locs[1]]
+        blue_curr = blue_view[:, locs[1]]
+
+        red_delta = red_curr - apply_column_correction(red_prev, beta)
+        green_delta = green_curr - apply_column_correction(green_prev, beta)
+        blue_delta = blue_curr - apply_column_correction(blue_prev, beta)
+
+        iter_sigma2 = 0.5**iter / (sigma * sigma)
+        weight = np.exp(
+            -(np.square(red_delta) + np.square(green_delta) + np.square(blue_delta))
+            * iter_sigma2
+        )
+
+        weight = weight * weight
+        beta = weighted_linear_regression(green_curr, green_prev, weight)
+
+    red_prev = red_view[:, locs[0]]
+    green_prev = green1[:, locs[0]] + green2[:, locs[0]]
+    blue_prev = blue_view[:, locs[0]]
+
+    red_curr = red_view[:, locs[1]]
+    green_curr = green1[:, locs[1]] + green2[:, locs[1]]
+    blue_curr = blue_view[:, locs[1]]
+
+    fig = plt.figure(figsize=(32, 18), dpi=300)
+    gs = fig.add_gridspec(5, 1)
+
+    # Main plot (takes up top 3/4 of the figure)
+    ax1 = fig.add_subplot(gs[0:3, 0])
+    ax1.plot(green_prev, "", label="prev")
+    ax1.plot(green_curr, "", label="curr")
+    ax1.plot(apply_column_correction(green_prev, beta), "", label="model(prev)")
+    ax1.plot([0, 2047], [0, 0], "k--")
+    ax1.set_xlim(0, 2047)
+    ax1.set_ylabel("intensity")
+    ax1.legend()
+
+    # Weight plot (takes up bottom 1/4 of the figure)
+    ax2 = fig.add_subplot(gs[3, 0])
+    ax2.plot(weight / np.max(weight), "k", label="weight")
+    ax2.set_xlim(0, 2047)
+    ax2.set_ylabel("weight")
+    ax2.set_title("weight")
+    ax2.legend()
+
+    ax3 = fig.add_subplot(gs[4, 0])
+    ax3.plot(
+        np.square(weight * (green_curr - green_prev)), label="weighted initial error"
+    )
+    ax3.plot(
+        np.square(weight * (green_curr - apply_column_correction(green_prev, beta))),
+        label="weighted final error",
+    )
+    ax3.plot([0, 2047], [0, 0], "k--")
+    ax3.set_xlim(0, 2047)
+    ax3.set_ylabel("intensity")
+    ax3.set_title("squared error")
+    ax3.legend()
+    plt.savefig(g / "jitter_debug.png")
+
+    plt.figure(figsize=(32, 18), dpi=300)
+    plt.plot(green_prev, green_curr, "k.")
+    plt.plot(apply_column_correction(green_prev, beta), green_curr, "r.")
+    plt.xlabel("prev")
+    plt.ylabel("curr")
+    plt.savefig(g / "jitter_debug_2.png")
+
+    plt.figure(figsize=(32, 18), dpi=300)
+    for label, val in green_currs_to_plot:
+        plt.plot(val, label=label)
+    plt.xlabel("x")
+    plt.ylabel("y")
+    plt.legend()
+    plt.savefig(g / "green_currs.png")
+    return off_r, off_g, off_b
+
+
 def interpolate_upsample(arr, off):
     arr = np.asarray(arr)
     n = len(arr)
@@ -637,7 +767,7 @@ def process_preview(g: Path, padding: int = 3, max_chunks: int = 512):
         grad_y, grad_x = np.gradient(raw_green)
         magnitude = np.sqrt(grad_x**2 + grad_y**2) + 0.1 * max_green
         energy = np.abs(grad_x) / magnitude
-        # cv2.imwrite(f"/home/dllu/test/{i:05d}.png", energy * 255)
+        # cv2.imwrite(str(g / f"score_{i:05d}.png"), energy * 255)
         score = np.percentile(energy, 99)
         scores.append(score)
 
@@ -658,9 +788,15 @@ def process_preview(g: Path, padding: int = 3, max_chunks: int = 512):
     cache = FileDataCache(selected_bins, dtype=np.uint16, rows=4096)
     data = cache
 
-    # set up lazy channel views for green channels
+    red_view = ChannelView(data, row_offset=0, col_offset=1)
+    blue_view = ChannelView(data, row_offset=1, col_offset=0)
     green1 = ChannelView(data, row_offset=1, col_offset=1)
     green2 = ChannelView(data, row_offset=0, col_offset=0)
+
+    jitter_models = column_exposure_jitter_correction(
+        red_view, green1, green2, blue_view, g=g
+    )
+
     sample_xs, sample_ys, _weights = windowed_cross_correlation(green1, green2)
 
     spline = robust_bspline_fit(
@@ -674,11 +810,6 @@ def process_preview(g: Path, padding: int = 3, max_chunks: int = 512):
 
     print(g, len(bins), data.shape)
 
-    # Build raw channel views
-    red_view = ChannelView(data, row_offset=0, col_offset=1)
-    green1 = ChannelView(data, row_offset=1, col_offset=1)
-    green2 = ChannelView(data, row_offset=0, col_offset=0)
-    blue_view = ChannelView(data, row_offset=1, col_offset=0)
     # Generate sample positions from spline
     sample_positions = []
     widths = []
@@ -699,17 +830,18 @@ def process_preview(g: Path, padding: int = 3, max_chunks: int = 512):
             sx = 0.1 if sx > 0 else -0.1
 
         sample_positions.append(x)
-        widths.append(abs(sx * 2))
+        widths.append(abs(sx))
         x += sx
 
     widths = np.clip(widths, 1, n)
     # chunk size for sampling
-    max_pix = 65535
+    max_pix = 16384
 
     for chunk_i, batch in enumerate(
         itertools.batched(zip(sample_positions, widths), max_pix)
     ):
-        out_name = f"rgb_{chunk_i}_hann.png"
+        out_name = f"rgb_{chunk_i}_prod_no_denoise"
+
         raw_sampled = np.zeros((2 * green1.height, len(batch), 3), dtype=np.float32)
 
         for j, (xi, wi) in tqdm(
@@ -725,6 +857,21 @@ def process_preview(g: Path, padding: int = 3, max_chunks: int = 512):
             g2_win = green2[:, slice(start, end)]
             b_win = blue_view[:, slice(start, end)]
 
+            for col in range(start, end):
+                win_i = col - start
+                r_win[:, win_i] = apply_column_correction(
+                    r_win[:, win_i], jitter_models[col, :]
+                )
+                g1_win[:, win_i] = apply_column_correction(
+                    g1_win[:, win_i], jitter_models[col, :]
+                )
+                g2_win[:, win_i] = apply_column_correction(
+                    g2_win[:, win_i], jitter_models[col, :]
+                )
+                b_win[:, win_i] = apply_column_correction(
+                    b_win[:, win_i], jitter_models[col, :]
+                )
+
             # hann window
             dist = np.arange(start, end) - xi
             weights = np.zeros_like(dist)
@@ -732,15 +879,15 @@ def process_preview(g: Path, padding: int = 3, max_chunks: int = 512):
             weights[mask] = 1 + np.cos(np.pi * dist[mask] / wi)
             sum_weight = np.sum(weights)
 
-            r_win = np.sum(r_win * weights, axis=1) / sum_weight
-            g1_win = np.sum(g1_win * weights, axis=1) / sum_weight
-            g2_win = np.sum(g2_win * weights, axis=1) / sum_weight
-            b_win = np.sum(b_win * weights, axis=1) / sum_weight
+            r_weighted = np.sum(r_win * weights, axis=1) / sum_weight
+            g1_weighted = np.sum(g1_win * weights, axis=1) / sum_weight
+            g2_weighted = np.sum(g2_win * weights, axis=1) / sum_weight
+            b_weighted = np.sum(b_win * weights, axis=1) / sum_weight
 
-            r_interp = interpolate_upsample(r_win, 0)
-            g1_interp = interpolate_upsample(g1_win, 1)
-            g2_interp = interpolate_upsample(g2_win, 0)
-            b_interp = interpolate_upsample(b_win, 1)
+            r_interp = interpolate_upsample(r_weighted, 0)
+            g1_interp = interpolate_upsample(g1_weighted, 1)
+            g2_interp = interpolate_upsample(g2_weighted, 0)
+            b_interp = interpolate_upsample(b_weighted, 1)
 
             if j == 0:
                 raw_sampled[:, 0, 0] = r_interp
@@ -763,36 +910,43 @@ def process_preview(g: Path, padding: int = 3, max_chunks: int = 512):
         rgb = rgb[::-1, :, :]
         rgb = np.sqrt(rgb)
         rgb *= 255
-        cv2.imwrite(str(g / out_name), rgb[:, :, ::-1].astype(np.uint8))
+
+        for ext in (".jpg", ".png"):
+            cv2.imwrite(str(g / (out_name + ext)), rgb[:, :, ::-1].astype(np.uint8))
 
 
 def main():
-    # for g in sorted(list(linescans.glob("2024-09-10-06-00-05*"))): # yamanote
-    # for g in sorted(list(linescans.glob("17-12-03-23-11-30-utc"))):  # bart
-    # for g in sorted(list(linescans.glob("2024-09-10-06-00-05*"))):  # yamanote
-    # for g in sorted(list(linescans.glob("2024-09-19-03-33-57*"))): # fuxing
-    # for g in sorted(list(linescans.glob("2024-09-14-02-13-13*"))):  # hktram
-    # for g in sorted(list(linescans.glob("2024-09*"))):  # hktram
-    # for g in sorted(list(linescans.glob("2024-09-12-01-31-01*"))):  # hk bus
-    # for g in sorted(list(linescans.glob("nyc4"))):
-    # for g in sorted(list(linescans.glob("18*"))):
-    for g in sorted(list(linescans.glob("18-10-06-13-52-16-utc*"))):  # pato
-    # for g in sorted(list(linescans.glob("18-08-04*"))):  # amtrak
-    # for g in sorted(list(linescans.glob("2023*"))):
-    # for g in sorted(list(linescans.glob("17-10-01-23-46-50-utc"))):
-    # for g in sorted(list(linescans.glob("*"))):
-    # for g in sorted(list(linescans.glob("18*"))):
+    # globs = linescans.glob("17-12-03-23-11-30-utc")  # bart
+    # globs = linescans.glob("2024-09-10-06-00-05*")  # yamanote
+    globs = linescans.glob("2024-09-19*") # fuxing
+    # globs = linescans.glob("2024-09-14-02-13-13*")  # hktram
+    # globs = linescans.glob("2024-09*")  # hktram
+    # globs = linescans.glob("2024-09-12-01-31-01*")  # hk bus
+    # globs = linescans.glob("nyc4")
+    # globs = linescans.glob("18*")
+    # globs = linescans.glob("18-08-04*")  # amtrak
+    # globs = linescans.glob("2023*")
+    # globs = linescans.glob("17-10-01-23-46-50-utc")
+    # globs = linescans.glob("*")
+    # globs = linescans.glob("18*")
+    # globs = linescans.glob("18-10-06-13-52-16-utc*") # pato
+
+    globs = sorted(list(globs))
+    for g in globs:
         if not g.is_dir():
             continue
 
         print(g)
-        try:
+        if len(globs) == 1:
             process_preview(g)
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            print(f"oh no! {g} {e}")
-            continue  # anyway
+        else:
+            try:
+                process_preview(g)
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                print(f"oh no! {g} {e}")
+                continue  # anyway
 
 
 if __name__ == "__main__":
