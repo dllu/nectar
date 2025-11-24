@@ -11,17 +11,80 @@ from scipy.interpolate import UnivariateSpline
 from tqdm import tqdm
 import itertools
 
-# Color calibration matrix for RGB conversion
-COLOR_CALIBRATION = np.array(
+try:
+    import tifffile
+except ImportError:  # pragma: no cover - optional dependency
+    tifffile = None
+
+# Color calibration components for RGB conversion
+RAW_COLOR_CORRECTION = np.array(
     [
         [0.9, -0.3, -0.3],
-        [-0.8, 1.6, -0.3],
-        [-0.5, -0.5, 2.0],
-    ]
+        [-0.8, 1.5, -0.3],
+        [-0.5, -0.5, 1.7],
+    ],
+    dtype=np.float32,
 )
 
+CAMERA_MODEL_NAME = "Nectar LineScan Prototype"
+
+def _normalize_rows(matrix: np.ndarray) -> np.ndarray:
+    row_sums = matrix.sum(axis=1, keepdims=True)
+    deficit = 1.0 - row_sums
+    adjusted = matrix.astype(np.float32).copy()
+    diag = np.arange(adjusted.shape[0])
+    adjusted[diag, diag] += deficit[:, 0]
+    return adjusted
+
+
+COLOR_CORRECTION = _normalize_rows(RAW_COLOR_CORRECTION)
+
+
+def apply_color_transform(
+    raw_rgb: np.ndarray,
+    white_balance: np.ndarray,
+    color_matrix: np.ndarray = COLOR_CORRECTION,
+) -> np.ndarray:
+    """Apply per-channel white balance followed by the 3x3 color matrix."""
+    wb = np.asarray(white_balance, dtype=np.float32).reshape(1, 1, 3)
+    balanced = raw_rgb * wb
+    return np.tensordot(balanced, color_matrix.T, axes=([2], [0]))
+
+
+def write_linear_dng(path: Path, raw_rgb: np.ndarray, white_balance: np.ndarray) -> None:
+    if tifffile is None:
+        raise RuntimeError(
+            "tifffile is required for DNG export. Install it via `uv pip install tifffile`."
+        )
+
+    linear = np.clip(raw_rgb[::-1, :, :], 0, 65535).astype(np.uint16)
+    wb = np.asarray(white_balance, dtype=np.float64)
+    safe_wb = np.clip(wb, 1e-6, None)
+    as_shot_neutral = 1.0 / safe_wb
+    if as_shot_neutral[1] != 0:
+        as_shot_neutral /= as_shot_neutral[1]
+
+    color_matrix = COLOR_CORRECTION.astype(np.float64).ravel()
+    extratags = [
+        (50706, "B", 4, (1, 4, 0, 0)),  # DNGVersion
+        (50707, "B", 4, (1, 2, 0, 0)),  # DNGBackwardVersion
+        (50708, "s", len(CAMERA_MODEL_NAME) + 1, CAMERA_MODEL_NAME),  # UniqueCameraModel
+        (50721, "d", len(color_matrix), tuple(color_matrix)),  # ColorMatrix1
+        (50728, "d", 3, tuple(as_shot_neutral.tolist())),  # AsShotNeutral
+        (50730, "H", 1, 21),  # CalibrationIlluminant1 = D65
+    ]
+
+    tifffile.imwrite(
+        path,
+        linear,
+        photometric="rgb",
+        metadata={"Software": "nectar-preview"},
+        extratags=extratags,
+    )
+
+
 # linescans = Path("/home/dllu/pictures/linescan")
-linescans = Path("/mnt/data14/pictures/linescan")
+linescans = Path("/mnt/external/pictures/linescan")
 
 
 class FileDataCache:
@@ -234,7 +297,7 @@ def windowed_cross_correlation(
             weights.append(np.max(ncorrs) - np.min(ncorrs))
             ncorrs = ncorrs - np.min(ncorrs)
             ncorrs = ncorrs / np.max(ncorrs)
-            peak_idx = np.argmax(ncorrs)
+            # peak_idx = np.argmax(ncorrs)
             refined_peak_idx = subpixel_peak(ncorrs, 2.0, peak_idx)
 
             ys.append(peak_idx - corr_half)
@@ -468,6 +531,36 @@ def bin2to1(data):
     return (data[::2, ::2] + data[1::2, ::2] + data[::2, 1::2] + data[1::2, 1::2]) / 4
 
 
+def estimate_white_balance(bin_paths, max_samples: int = 8) -> np.ndarray:
+    if not bin_paths:
+        return np.ones(3, dtype=np.float32)
+
+    channel_sum = np.zeros(3, dtype=np.float64)
+    total_pixels = 0
+
+    for bin_path in tqdm(
+        bin_paths[:max_samples],
+        desc="white balance",
+    ):
+        dat1 = np.fromfile(bin_path, dtype=np.uint16).astype(np.float32)
+        dat1_reshaped = np.reshape(dat1, (-1, 4096)).T
+        raw_red = bin2to1(dat1_reshaped[0::2, 1::2])
+        raw_green = bin2to1(dat1_reshaped[1::2, 1::2])
+        raw_blue = bin2to1(dat1_reshaped[1::2, 0::2])
+
+        channel_sum[0] += raw_red.sum()
+        channel_sum[1] += raw_green.sum()
+        channel_sum[2] += raw_blue.sum()
+        total_pixels += raw_red.size
+
+    means = channel_sum / max(total_pixels, 1)
+    mean_of_means = np.mean(means)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        white_balance = mean_of_means / means
+    white_balance[~np.isfinite(white_balance)] = 1.0
+    return white_balance.astype(np.float32)
+
+
 def get_percentile(hist, bin_edges, total, percent):
     if total == 0:
         return 0.0
@@ -486,7 +579,7 @@ def get_percentile(hist, bin_edges, total, percent):
     return bin_edges[idx] + frac * bin_width
 
 
-def autoexposure(selected_bins):
+def autoexposure(selected_bins, white_balance):
     num_bins = 65536
     bin_edges = np.arange(0, num_bins + 1, dtype=np.float64)
     histogram = np.zeros(num_bins, dtype=np.int64)
@@ -506,11 +599,8 @@ def autoexposure(selected_bins):
         raw_green = dat1_reshaped[1::2, 1::2]
         raw_green = bin2to1(raw_green)
 
-        rgb = np.tensordot(
-            np.stack((raw_red, raw_green, raw_blue), axis=2),
-            COLOR_CALIBRATION.T,
-            axes=([2], [0]),
-        )
+        stacked = np.stack((raw_red, raw_green, raw_blue), axis=2)
+        rgb = apply_color_transform(stacked, white_balance)
         rgb = np.clip(rgb, 0, 65536)
 
         h, _ = np.histogram(rgb.ravel(), bins=bin_edges)
@@ -776,13 +866,17 @@ def process_preview(g: Path, padding: int = 3, max_chunks: int = 512):
     for i, score in enumerate(scores):
         if score > min_score * 1.5:
             for pi in range(-padding, padding + 1):
-                selected.add(i + pi)
+                if i + pi >= 0 and i + pi < len(bins):
+                    selected.add(i + pi)
     selected = sorted(list(selected))
     print("selected", selected)
 
     selected_bins = [bins[s] for s in selected]
 
-    p2, p98 = autoexposure(selected_bins)
+    white_balance = estimate_white_balance(selected_bins)
+    print("white balance", white_balance)
+
+    p2, p98 = autoexposure(selected_bins, white_balance)
 
     # lazily load binary data across selected files without full-memory concatenation
     cache = FileDataCache(selected_bins, dtype=np.uint16, rows=4096)
@@ -793,9 +887,11 @@ def process_preview(g: Path, padding: int = 3, max_chunks: int = 512):
     green1 = ChannelView(data, row_offset=1, col_offset=1)
     green2 = ChannelView(data, row_offset=0, col_offset=0)
 
+    """
     jitter_models = column_exposure_jitter_correction(
         red_view, green1, green2, blue_view, g=g
     )
+    """
 
     sample_xs, sample_ys, _weights = windowed_cross_correlation(green1, green2)
 
@@ -859,6 +955,7 @@ def process_preview(g: Path, padding: int = 3, max_chunks: int = 512):
 
             for col in range(start, end):
                 win_i = col - start
+                """
                 r_win[:, win_i] = apply_column_correction(
                     r_win[:, win_i], jitter_models[col, :]
                 )
@@ -871,6 +968,7 @@ def process_preview(g: Path, padding: int = 3, max_chunks: int = 512):
                 b_win[:, win_i] = apply_column_correction(
                     b_win[:, win_i], jitter_models[col, :]
                 )
+                """
 
             # hann window
             dist = np.arange(start, end) - xi
@@ -899,8 +997,9 @@ def process_preview(g: Path, padding: int = 3, max_chunks: int = 512):
             raw_sampled[:, j, 2] = b_interp
         # denoised_sampled = patch_denoise(raw_sampled)
         denoised_sampled = raw_sampled
+        write_linear_dng(g / f"{out_name}_linear.dng", denoised_sampled, white_balance)
         # calibrate, clip, sharpen, tone-map
-        rgb = np.tensordot(denoised_sampled, COLOR_CALIBRATION.T, axes=([2], [0]))
+        rgb = apply_color_transform(denoised_sampled, white_balance)
         rgb = np.clip(rgb, 0, 65536)
         rgb = sharpen(rgb)
         rgb = rgb - p2
@@ -918,7 +1017,7 @@ def process_preview(g: Path, padding: int = 3, max_chunks: int = 512):
 def main():
     # globs = linescans.glob("17-12-03-23-11-30-utc")  # bart
     # globs = linescans.glob("2024-09-10-06-00-05*")  # yamanote
-    globs = linescans.glob("2024-09-19*") # fuxing
+    # globs = linescans.glob("2024-09-19*") # fuxing
     # globs = linescans.glob("2024-09-14-02-13-13*")  # hktram
     # globs = linescans.glob("2024-09*")  # hktram
     # globs = linescans.glob("2024-09-12-01-31-01*")  # hk bus
@@ -930,8 +1029,10 @@ def main():
     # globs = linescans.glob("*")
     # globs = linescans.glob("18*")
     # globs = linescans.glob("18-10-06-13-52-16-utc*") # pato
+    # globs = linescans.glob("2025-11*") # pano
+    globs = linescans.glob("2025-09-13-09-18-45*") # picadilly
 
-    globs = sorted(list(globs))
+    globs = sorted(list(globs))[-1:]
     for g in globs:
         if not g.is_dir():
             continue

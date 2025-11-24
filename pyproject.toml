@@ -1,0 +1,20 @@
+[project]
+name = "nectar-preview"
+version = "0.1.0"
+description = "Preview and calibration tools for the Nectar line-scan camera"
+requires-python = ">=3.10"
+dependencies = [
+    "matplotlib>=3.8",
+    "numpy>=1.26",
+    "opencv-python>=4.10",
+    "scipy>=1.11",
+    "tifffile>=2024.2",
+    "tqdm>=4.66",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.uv]
+package = true
