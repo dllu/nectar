@@ -10,11 +10,7 @@ import numpy as np
 from scipy.interpolate import UnivariateSpline
 from tqdm import tqdm
 import itertools
-
-try:
-    import tifffile
-except ImportError:  # pragma: no cover - optional dependency
-    tifffile = None
+import tifffile
 
 # Color calibration components for RGB conversion
 RAW_COLOR_CORRECTION = np.array(
@@ -26,7 +22,8 @@ RAW_COLOR_CORRECTION = np.array(
     dtype=np.float32,
 )
 
-CAMERA_MODEL_NAME = "Nectar LineScan Prototype"
+CAMERA_MODEL_NAME = "Alkeria Necta N4K2-7C"
+
 
 def _normalize_rows(matrix: np.ndarray) -> np.ndarray:
     row_sums = matrix.sum(axis=1, keepdims=True)
@@ -51,7 +48,9 @@ def apply_color_transform(
     return np.tensordot(balanced, color_matrix.T, axes=([2], [0]))
 
 
-def write_linear_dng(path: Path, raw_rgb: np.ndarray, white_balance: np.ndarray) -> None:
+def write_linear_dng(
+    path: Path, raw_rgb: np.ndarray, white_balance: np.ndarray
+) -> None:
     if tifffile is None:
         raise RuntimeError(
             "tifffile is required for DNG export. Install it via `uv pip install tifffile`."
@@ -68,7 +67,12 @@ def write_linear_dng(path: Path, raw_rgb: np.ndarray, white_balance: np.ndarray)
     extratags = [
         (50706, "B", 4, (1, 4, 0, 0)),  # DNGVersion
         (50707, "B", 4, (1, 2, 0, 0)),  # DNGBackwardVersion
-        (50708, "s", len(CAMERA_MODEL_NAME) + 1, CAMERA_MODEL_NAME),  # UniqueCameraModel
+        (
+            50708,
+            "s",
+            len(CAMERA_MODEL_NAME) + 1,
+            CAMERA_MODEL_NAME,
+        ),  # UniqueCameraModel
         (50721, "d", len(color_matrix), tuple(color_matrix)),  # ColorMatrix1
         (50728, "d", 3, tuple(as_shot_neutral.tolist())),  # AsShotNeutral
         (50730, "H", 1, 21),  # CalibrationIlluminant1 = D65
@@ -84,7 +88,7 @@ def write_linear_dng(path: Path, raw_rgb: np.ndarray, white_balance: np.ndarray)
 
 
 # linescans = Path("/home/dllu/pictures/linescan")
-linescans = Path("/mnt/external/pictures/linescan")
+linescans = Path("/mnt/dataz/pictures/linescan")
 
 
 class FileDataCache:
@@ -528,7 +532,17 @@ def patch_denoise(
 
 
 def bin2to1(data):
-    return (data[::2, ::2] + data[1::2, ::2] + data[::2, 1::2] + data[1::2, 1::2]) / 4
+    h = (data.shape[0] // 2) * 2
+    w = (data.shape[1] // 2) * 2
+    if h == 0 or w == 0:
+        return np.empty((0, 0), dtype=data.dtype)
+    data = data[:h, :w]
+    return (
+        data[::2, ::2]
+        + data[1::2, ::2]
+        + data[::2, 1::2]
+        + data[1::2, 1::2]
+    ) / 4
 
 
 def estimate_white_balance(bin_paths, max_samples: int = 8) -> np.ndarray:
@@ -836,7 +850,236 @@ def interpolate_upsample(arr, off):
     return res
 
 
-def process_preview(g: Path, padding: int = 3, max_chunks: int = 512):
+def generate_sample_positions(spline, sample_xs, width):
+    sample_positions = []
+    widths = []
+    x = 0
+    if spline(sample_xs[0]) < 0:
+        x = width - 1
+    while 0 <= x < width:
+        if x < sample_xs[0]:
+            sx = spline(sample_xs[0])
+        elif x >= sample_xs[-1]:
+            sx = spline(sample_xs[-1])
+        else:
+            sx = spline(x)
+        # enforce minimum step
+        if -0.1 < sx < 0.1:
+            sx = 0.1 if sx > 0 else -0.1
+
+        sample_positions.append(x)
+        widths.append(abs(sx))
+        x += sx
+
+    widths = np.clip(widths, 1, width)
+    return sample_positions, widths
+
+
+def truncate_sample_positions_for_skew(
+    sample_positions,
+    widths,
+    *,
+    skew: float,
+    row_offsets: np.ndarray,
+    width: int,
+):
+    if not sample_positions:
+        return sample_positions, widths
+    positions = np.asarray(sample_positions, dtype=np.float32)
+    widths_arr = np.asarray(widths, dtype=np.float32)
+    skew_offsets = skew * row_offsets
+    min_offset = float(np.min(skew_offsets))
+    max_offset = float(np.max(skew_offsets))
+
+    min_center = positions + min_offset - widths_arr
+    max_center = positions + max_offset + widths_arr
+    valid = (min_center >= 0.0) & (max_center <= (width - 1))
+    if not np.any(valid):
+        return [], []
+
+    first = int(np.argmax(valid))
+    last = int(len(valid) - 1 - np.argmax(valid[::-1]))
+    return sample_positions[first : last + 1], widths[first : last + 1]
+
+
+def sample_motion_corrected_chunks(
+    red_view,
+    green1,
+    green2,
+    blue_view,
+    sample_positions,
+    widths,
+    *,
+    stride_x: int = 1,
+    stride_y: int = 1,
+    skew: float = 0.0,
+    max_pix: int = 16384,
+):
+    indices = list(range(0, len(sample_positions), stride_x))
+    if not indices:
+        return
+
+    out_height = green1.height * 2
+    center_y = (out_height - 1) / 2.0
+    row_offsets = (2 * np.arange(green1.height) - center_y).astype(np.float32)
+
+    chunk_i = 0
+    for start in range(0, len(indices), max_pix):
+        batch_indices = indices[start : start + max_pix]
+        pad_left = start > 0
+        if pad_left:
+            use_indices = [indices[start - 1]] + batch_indices
+        else:
+            use_indices = list(batch_indices)
+
+        out_width = len(use_indices)
+        raw_sampled = np.zeros((2 * green1.height, out_width, 3), dtype=np.float32)
+
+        for j, sample_idx in tqdm(
+            enumerate(use_indices),
+            total=len(use_indices),
+            desc="sampling chunk",
+        ):
+            xi = sample_positions[sample_idx]
+            wi = widths[sample_idx]
+
+            centers = xi + skew * row_offsets
+            window_half = int(math.ceil(wi))
+            offsets = np.arange(-window_half, window_half + 1, dtype=np.int32)
+            base = np.floor(centers).astype(np.int32)
+            window_indices = base[:, None] + offsets[None, :]
+            valid = (window_indices >= 0) & (window_indices < green1.width)
+            indices_clipped = np.clip(window_indices, 0, green1.width - 1)
+
+            start_col = int(indices_clipped.min())
+            end_col = int(indices_clipped.max()) + 1
+            if end_col <= start_col:
+                continue
+
+            r_win = red_view[:, slice(start_col, end_col)]
+            g1_win = green1[:, slice(start_col, end_col)]
+            g2_win = green2[:, slice(start_col, end_col)]
+            b_win = blue_view[:, slice(start_col, end_col)]
+
+            indices_local = indices_clipped - start_col
+            indices_local = np.clip(indices_local, 0, r_win.shape[1] - 1)
+            row_idx = np.arange(green1.height)[:, None]
+
+            r_vals = r_win[row_idx, indices_local]
+            g1_vals = g1_win[row_idx, indices_local]
+            g2_vals = g2_win[row_idx, indices_local]
+            b_vals = b_win[row_idx, indices_local]
+
+            dist = window_indices.astype(np.float32) - centers[:, None].astype(
+                np.float32
+            )
+            weights = np.zeros_like(dist, dtype=np.float32)
+            mask = (np.abs(dist) < wi) & valid
+            weights[mask] = 1 + np.cos(np.pi * dist[mask] / wi)
+            sum_weight = np.sum(weights, axis=1)
+            sum_weight[sum_weight == 0] = 1.0
+
+            r_weighted = np.sum(r_vals * weights, axis=1) / sum_weight
+            g1_weighted = np.sum(g1_vals * weights, axis=1) / sum_weight
+            g2_weighted = np.sum(g2_vals * weights, axis=1) / sum_weight
+            b_weighted = np.sum(b_vals * weights, axis=1) / sum_weight
+
+            r_interp = interpolate_upsample(r_weighted, 0)
+            g1_interp = interpolate_upsample(g1_weighted, 1)
+            g2_interp = interpolate_upsample(g2_weighted, 0)
+            b_interp = interpolate_upsample(b_weighted, 1)
+
+            if j == 0:
+                raw_sampled[:, 0, 0] = r_interp
+                raw_sampled[:, 0, 1] += g1_interp * 0.5
+            if j < len(use_indices) - 1:
+                raw_sampled[:, j + 1, 0] = r_interp
+                raw_sampled[:, j + 1, 1] += g1_interp * 0.5
+            raw_sampled[:, j, 1] += g2_interp * 0.5
+            raw_sampled[:, j, 2] = b_interp
+
+        if pad_left:
+            raw_sampled = raw_sampled[:, 1:, :]
+        if stride_y > 1:
+            raw_sampled = raw_sampled[::stride_y, :, :]
+
+        yield chunk_i, raw_sampled
+        chunk_i += 1
+
+
+def estimate_skew_hough(
+    chunk_iter,
+    *,
+    g: Path,
+    stride_x: int,
+    stride_y: int,
+    skew_min: float = -0.03,
+    skew_max: float = 0.03,
+    bins: int = 32,
+    energy_percentile: float = 98.0,
+):
+    skews = np.linspace(skew_min, skew_max, bins, dtype=np.float32)
+    scores = np.zeros_like(skews, dtype=np.float64)
+
+    for _chunk_i, chunk in tqdm(chunk_iter, desc="estimating skew"):
+        if chunk.size == 0:
+            continue
+        gray = chunk[:, :, 1].astype(np.float32)
+        grad_y, grad_x = np.gradient(gray)
+        magnitude = np.sqrt(grad_x**2 + grad_y**2) + 0.1 * np.max(gray)
+        energy = np.abs(grad_x) / magnitude
+
+        thresh = np.percentile(energy, energy_percentile)
+        mask = energy >= thresh
+        if not np.any(mask):
+            continue
+
+        if _chunk_i == 0:
+            cv2.imwrite(str(g / "skew_energy.png"), energy * 255)
+            cv2.imwrite(str(g / "skew_mask.png"), mask * 255)
+
+        weights = energy * mask
+        width = chunk.shape[1]
+        xs = np.arange(width, dtype=np.int32)
+        ys = np.arange(chunk.shape[0], dtype=np.int32)
+        scale = stride_y / stride_x
+
+        chunk_scores = np.zeros_like(skews, dtype=np.float64)
+        for i, skew in enumerate(skews):
+            skew_ds = skew * scale
+            hist = np.zeros(width, dtype=np.float64)
+            for row_idx, y in enumerate(ys):
+                shift = int(round(skew_ds * y))
+                b_idx = xs - shift
+                valid = (b_idx >= 0) & (b_idx < width)
+                if not np.any(valid):
+                    continue
+                hist += np.bincount(
+                    b_idx[valid],
+                    weights=weights[row_idx, valid],
+                    minlength=width,
+                )
+            if hist.size:
+                chunk_scores[i] += float(np.max(hist))
+        print("chunk", _chunk_i, ":", chunk_scores)
+
+        plt.figure(figsize=(16, 9), dpi=300)
+        plt.plot(chunk_scores, "b.", label="Skew response")
+        plt.legend()
+        plt.savefig(g / f"skew_response_{_chunk_i:04d}.png")
+        scores += chunk_scores
+
+    if np.all(scores == 0):
+        return 0.0
+    return float(skews[int(np.argmax(scores))])
+
+
+def process_preview(
+    g: Path,
+    padding: int = 3,
+    max_chunks: int = 512,
+    preview_stride: int = 4,
+):
     bins = sorted(list(g.glob("*.bin")))
 
     max_green = 0
@@ -906,98 +1149,70 @@ def process_preview(g: Path, padding: int = 3, max_chunks: int = 512):
 
     print(g, len(bins), data.shape)
 
-    # Generate sample positions from spline
-    sample_positions = []
-    widths = []
-    x = 0
-    # total width
-    n = data.total_cols // 2
-    if spline(sample_xs[0]) < 0:
-        x = n - 1
-    while 0 <= x < n:
-        if x < sample_xs[0]:
-            sx = spline(sample_xs[0])
-        elif x >= sample_xs[-1]:
-            sx = spline(sample_xs[-1])
-        else:
-            sx = spline(x)
-        # enforce minimum step
-        if -0.1 < sx < 0.1:
-            sx = 0.1 if sx > 0 else -0.1
-
-        sample_positions.append(x)
-        widths.append(abs(sx))
-        x += sx
-
-    widths = np.clip(widths, 1, n)
+    sample_positions, widths = generate_sample_positions(
+        spline, sample_xs, green1.width
+    )
     # chunk size for sampling
     max_pix = 16384
 
-    for chunk_i, batch in enumerate(
-        itertools.batched(zip(sample_positions, widths), max_pix)
+    skew = estimate_skew_hough(
+        sample_motion_corrected_chunks(
+            red_view,
+            green1,
+            green2,
+            blue_view,
+            sample_positions,
+            widths,
+            stride_x=preview_stride,
+            stride_y=preview_stride,
+            skew=0.0,
+            max_pix=max_pix,
+        ),
+        g=g,
+        stride_x=preview_stride,
+        stride_y=preview_stride,
+    )
+    print("estimated skew", skew)
+
+    out_height = green1.height * 2
+    center_y = (out_height - 1) / 2.0
+    row_offsets = (2 * np.arange(green1.height) - center_y).astype(np.float32)
+    sample_positions, widths = truncate_sample_positions_for_skew(
+        sample_positions,
+        widths,
+        skew=skew,
+        row_offsets=row_offsets,
+        width=green1.width,
+    )
+
+    n = len(sample_positions)
+    target = 32768
+    n_chunks = max(1, int(math.ceil(n / target)))
+    chunk_size = max(1, n // n_chunks)
+    n_use = chunk_size * n_chunks
+    if n_use < n:
+        sample_positions = sample_positions[:n_use]
+        widths = widths[:n_use]
+
+    stacked_preview = []
+    for chunk_i, raw_sampled in sample_motion_corrected_chunks(
+        red_view,
+        green1,
+        green2,
+        blue_view,
+        sample_positions,
+        widths,
+        stride_x=1,
+        stride_y=1,
+        skew=skew,
+        max_pix=chunk_size,
     ):
-        out_name = f"rgb_{chunk_i}_prod_no_denoise"
-
-        raw_sampled = np.zeros((2 * green1.height, len(batch), 3), dtype=np.float32)
-
-        for j, (xi, wi) in tqdm(
-            enumerate(batch),
-            total=len(batch),
-            desc="sampling " + out_name,
-        ):
-            start = max(int(math.floor(xi - wi)), 0)
-            end = min(int(math.ceil(xi + wi) + 1), green1.width - 1)
-
-            r_win = red_view[:, slice(start, end)]
-            g1_win = green1[:, slice(start, end)]
-            g2_win = green2[:, slice(start, end)]
-            b_win = blue_view[:, slice(start, end)]
-
-            for col in range(start, end):
-                win_i = col - start
-                """
-                r_win[:, win_i] = apply_column_correction(
-                    r_win[:, win_i], jitter_models[col, :]
-                )
-                g1_win[:, win_i] = apply_column_correction(
-                    g1_win[:, win_i], jitter_models[col, :]
-                )
-                g2_win[:, win_i] = apply_column_correction(
-                    g2_win[:, win_i], jitter_models[col, :]
-                )
-                b_win[:, win_i] = apply_column_correction(
-                    b_win[:, win_i], jitter_models[col, :]
-                )
-                """
-
-            # hann window
-            dist = np.arange(start, end) - xi
-            weights = np.zeros_like(dist)
-            mask = np.abs(dist) < wi
-            weights[mask] = 1 + np.cos(np.pi * dist[mask] / wi)
-            sum_weight = np.sum(weights)
-
-            r_weighted = np.sum(r_win * weights, axis=1) / sum_weight
-            g1_weighted = np.sum(g1_win * weights, axis=1) / sum_weight
-            g2_weighted = np.sum(g2_win * weights, axis=1) / sum_weight
-            b_weighted = np.sum(b_win * weights, axis=1) / sum_weight
-
-            r_interp = interpolate_upsample(r_weighted, 0)
-            g1_interp = interpolate_upsample(g1_weighted, 1)
-            g2_interp = interpolate_upsample(g2_weighted, 0)
-            b_interp = interpolate_upsample(b_weighted, 1)
-
-            if j == 0:
-                raw_sampled[:, 0, 0] = r_interp
-                raw_sampled[:, 0, 1] += g1_interp * 0.5
-            if j < len(batch) - 1:
-                raw_sampled[:, j + 1, 0] = r_interp
-                raw_sampled[:, j + 1, 1] += g1_interp * 0.5
-            raw_sampled[:, j, 1] += g2_interp * 0.5
-            raw_sampled[:, j, 2] = b_interp
+        out_name = f"rgb_{chunk_i:02d}_prod_no_denoise_deskewed"
         # denoised_sampled = patch_denoise(raw_sampled)
         denoised_sampled = raw_sampled
-        write_linear_dng(g / f"{out_name}_linear.dng", denoised_sampled, white_balance)
+        write_linear_dng(
+            g / f"{out_name}_linear_deskewed.dng", denoised_sampled, white_balance
+        )
         # calibrate, clip, sharpen, tone-map
         rgb = apply_color_transform(denoised_sampled, white_balance)
         rgb = np.clip(rgb, 0, 65536)
@@ -1010,8 +1225,23 @@ def process_preview(g: Path, padding: int = 3, max_chunks: int = 512):
         rgb = np.sqrt(rgb)
         rgb *= 255
 
+        rgb_u8 = rgb[:, :, ::-1].astype(np.uint8)
         for ext in (".jpg", ".png"):
-            cv2.imwrite(str(g / (out_name + ext)), rgb[:, :, ::-1].astype(np.uint8))
+            cv2.imwrite(str(g / (out_name + ext)), rgb_u8)
+
+        rgb_float = rgb_u8.astype(np.float32)
+        binned = np.stack(
+            [
+                bin2to1(bin2to1(rgb_float[:, :, ch]))
+                for ch in range(rgb_float.shape[2])
+            ],
+            axis=2,
+        )
+        stacked_preview.append(np.clip(binned, 0, 255).astype(np.uint8))
+
+    if stacked_preview:
+        stacked = np.vstack(stacked_preview)
+        cv2.imwrite(str(g / "preview_stack.jpg"), stacked)
 
 
 def main():
@@ -1028,13 +1258,15 @@ def main():
     # globs = linescans.glob("17-10-01-23-46-50-utc")
     # globs = linescans.glob("*")
     # globs = linescans.glob("18*")
-    # globs = linescans.glob("18-10-06-13-52-16-utc*") # pato
+    # globs = linescans.glob("18-10-06-13-52-16-utc*")  # pato
     # globs = linescans.glob("2025-11*") # pano
     globs = linescans.glob("2025-09-13-09-18-45*") # picadilly
 
     globs = sorted(list(globs))[-1:]
+
     for g in globs:
         if not g.is_dir():
+            print("skipping directory", g)
             continue
 
         print(g)
