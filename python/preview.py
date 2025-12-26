@@ -11,6 +11,7 @@ from scipy.interpolate import UnivariateSpline
 from tqdm import tqdm
 import itertools
 import tifffile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Color calibration components for RGB conversion
 RAW_COLOR_CORRECTION = np.array(
@@ -257,6 +258,7 @@ def windowed_cross_correlation(
     window_size: int = 4096,
     corr_size: int = 15,
     output_dir: Path = None,
+    jitter_models: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     green_1: (h, w) where w >> h and w >> window_size
@@ -276,14 +278,15 @@ def windowed_cross_correlation(
         enumerate(xs[1:-1]), desc="train speed estimation", total=len(xs)
     ):
         window_1 = green_1[:, x : x + window_step]
+        if jitter_models is not None:
+            window_1 = apply_column_models(window_1, jitter_models, x)
 
         corrs = np.zeros((corr_size,))
         for corr_ind in range(corr_size):
             corr_x = corr_ind - corr_half
-            window_2 = green_2[
-                :,
-                x + corr_x : x + window_step + corr_x,
-            ]
+            window_2 = green_2[:, x + corr_x : x + window_step + corr_x]
+            if jitter_models is not None:
+                window_2 = apply_column_models(window_2, jitter_models, x + corr_x)
 
             # corr_value = np.sum(window_1 * window_2)
             error = np.sum(np.abs(window_1 - window_2))
@@ -320,10 +323,12 @@ def windowed_cross_correlation(
                 )
                 plt.legend()
                 plt.savefig(output_dir / f"mean_shift_{xi:04d}.png")
+                plt.close()
 
     if output_dir is not None:
         plt.imshow(heatmap)
         plt.savefig(output_dir / "heatmap.png")
+        plt.close()
 
         plt.figure(figsize=(16, 9), dpi=300)
         plt.plot(good_xs, ys, "b.", label="Raw peaks")
@@ -331,6 +336,7 @@ def windowed_cross_correlation(
         plt.plot(xs, np.zeros_like(xs), "k--")
         plt.legend()
         plt.savefig(output_dir / "subpixel_peaks.png")
+        plt.close()
 
     weights = np.array(weights)
     weights /= np.max(weights)
@@ -398,6 +404,7 @@ def robust_bspline_fit(
     plt.ylabel("y")
     plt.legend()
     plt.savefig(g / "spline.png")
+    plt.close()
     if visualize:
         plt.show()
 
@@ -537,12 +544,26 @@ def bin2to1(data):
     if h == 0 or w == 0:
         return np.empty((0, 0), dtype=data.dtype)
     data = data[:h, :w]
-    return (
-        data[::2, ::2]
-        + data[1::2, ::2]
-        + data[::2, 1::2]
-        + data[1::2, 1::2]
-    ) / 4
+    return (data[::2, ::2] + data[1::2, ::2] + data[::2, 1::2] + data[1::2, 1::2]) / 4
+
+
+def compute_structure_mask(
+    bin_path: Path, max_green: float, threshold: float = 0.2, dilate_px: int = 32
+) -> np.ndarray:
+    dat1 = np.fromfile(bin_path, dtype=np.uint16).astype(np.float32)
+    dat1_reshaped = np.reshape(dat1, (-1, 4096)).T
+    raw_green = dat1_reshaped[1::2, 1::2]
+
+    grad_y, grad_x = np.gradient(raw_green)
+    magnitude = np.sqrt(grad_x**2 + grad_y**2) + 0.1 * max_green
+    energy = np.abs(grad_x) / magnitude
+
+    mask = energy > threshold
+    if dilate_px > 0:
+        k = 2 * dilate_px + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        mask = cv2.dilate(mask.astype(np.uint8), kernel) > 0
+    return mask
 
 
 def estimate_white_balance(bin_paths, max_samples: int = 8) -> np.ndarray:
@@ -660,6 +681,29 @@ def apply_column_correction(x, beta):
     return beta[0] + x * beta[1] + ind * beta[2]
 
 
+def apply_column_models(
+    window: np.ndarray, models: np.ndarray, start_col: int
+) -> np.ndarray:
+    if models is None:
+        return window
+    if start_col < 0:
+        start_col = 0
+    end_col = start_col + window.shape[1]
+    if end_col > models.shape[0]:
+        end_col = models.shape[0]
+        window = window[:, : end_col - start_col]
+    if window.size == 0:
+        return window
+    cols = np.arange(window.shape[1])
+    betas = models[start_col + cols]
+    rows = np.arange(window.shape[0])[:, None]
+    return (
+        betas[:, 0][None, :]
+        + window * betas[:, 1][None, :]
+        + rows * betas[:, 2][None, :]
+    )
+
+
 def compose_model(beta1, beta2):
     return np.array(
         [
@@ -675,7 +719,13 @@ def invert_model(beta):
 
 
 def column_exposure_jitter_correction(
-    red_view, green1, green2, blue_view, g: Path, sigma=500
+    red_view,
+    green1,
+    green2,
+    blue_view,
+    g: Path,
+    sigma=500,
+    mask_bins=None,
 ):
     n_cols = red_view.width
 
@@ -694,6 +744,11 @@ def column_exposure_jitter_correction(
     red_prev = red_view[:, 0]
     green_prev = 0.5 * (green1[:, 0] + green2[:, 0])
     blue_prev = blue_view[:, 0]
+    cache = red_view.cache
+    cum_cols = cache.cum_cols
+    file_idx = 0
+    next_boundary = cum_cols[file_idx + 1]
+
     for col in tqdm(range(1, n_cols), desc="column exposure jitter"):
         red_curr = red_view[:, col]
         green_curr = 0.5 * (green1[:, col] + green2[:, col])
@@ -718,6 +773,15 @@ def column_exposure_jitter_correction(
             weight[400:1600] = 0  # exclude middle region likely to include subject
 
             weight = weight * weight
+            if mask_bins is not None:
+                full_col = green1.col_offset + col * green1.col_step
+                while full_col >= next_boundary and file_idx + 1 < len(cum_cols) - 1:
+                    file_idx += 1
+                    next_boundary = cum_cols[file_idx + 1]
+                local_full = full_col - cum_cols[file_idx]
+                local_green = local_full // green1.col_step
+                if 0 <= local_green < mask_bins[file_idx].shape[1]:
+                    weight[mask_bins[file_idx][:, local_green]] = 0
 
             gray_curr = np.column_stack((red_curr, green_curr, blue_curr)).mean(axis=1)
             gray_prev = np.column_stack((red_prev, green_prev, blue_prev)).mean(axis=1)
@@ -807,6 +871,7 @@ def column_exposure_jitter_correction(
     ax3.set_title("squared error")
     ax3.legend()
     plt.savefig(g / "jitter_debug.png")
+    plt.close(fig)
 
     plt.figure(figsize=(32, 18), dpi=300)
     plt.plot(green_prev, green_curr, "k.")
@@ -814,6 +879,7 @@ def column_exposure_jitter_correction(
     plt.xlabel("prev")
     plt.ylabel("curr")
     plt.savefig(g / "jitter_debug_2.png")
+    plt.close()
 
     plt.figure(figsize=(32, 18), dpi=300)
     for label, val in green_currs_to_plot:
@@ -822,6 +888,7 @@ def column_exposure_jitter_correction(
     plt.ylabel("y")
     plt.legend()
     plt.savefig(g / "green_currs.png")
+    plt.close()
     return off_r, off_g, off_b
 
 
@@ -853,6 +920,7 @@ def interpolate_upsample(arr, off):
 def generate_sample_positions(spline, sample_xs, width):
     sample_positions = []
     widths = []
+    steps = []
     x = 0
     if spline(sample_xs[0]) < 0:
         x = width - 1
@@ -869,10 +937,11 @@ def generate_sample_positions(spline, sample_xs, width):
 
         sample_positions.append(x)
         widths.append(abs(sx))
+        steps.append(sx)
         x += sx
 
     widths = np.clip(widths, 1, width)
-    return sample_positions, widths
+    return sample_positions, widths, steps
 
 
 def truncate_sample_positions_for_skew(
@@ -880,6 +949,7 @@ def truncate_sample_positions_for_skew(
     widths,
     *,
     skew: float,
+    step_scales=None,
     row_offsets: np.ndarray,
     width: int,
 ):
@@ -887,9 +957,12 @@ def truncate_sample_positions_for_skew(
         return sample_positions, widths
     positions = np.asarray(sample_positions, dtype=np.float32)
     widths_arr = np.asarray(widths, dtype=np.float32)
-    skew_offsets = skew * row_offsets
-    min_offset = float(np.min(skew_offsets))
-    max_offset = float(np.max(skew_offsets))
+    if step_scales is None:
+        step_scales = np.ones_like(positions)
+    step_scales = np.asarray(step_scales, dtype=np.float32)
+    skew_offsets = row_offsets[None, :] * (skew * step_scales[:, None])
+    min_offset = np.min(skew_offsets, axis=1)
+    max_offset = np.max(skew_offsets, axis=1)
 
     min_center = positions + min_offset - widths_arr
     max_center = positions + max_offset + widths_arr
@@ -914,10 +987,14 @@ def sample_motion_corrected_chunks(
     stride_y: int = 1,
     skew: float = 0.0,
     max_pix: int = 16384,
+    jitter_models=None,
+    step_scales=None,
 ):
     indices = list(range(0, len(sample_positions), stride_x))
     if not indices:
         return
+    if step_scales is None:
+        step_scales = np.ones(len(sample_positions), dtype=np.float32)
 
     out_height = green1.height * 2
     center_y = (out_height - 1) / 2.0
@@ -942,8 +1019,9 @@ def sample_motion_corrected_chunks(
         ):
             xi = sample_positions[sample_idx]
             wi = widths[sample_idx]
+            skew_scaled = skew * step_scales[sample_idx]
 
-            centers = xi + skew * row_offsets
+            centers = xi + skew_scaled * row_offsets
             window_half = int(math.ceil(wi))
             offsets = np.arange(-window_half, window_half + 1, dtype=np.int32)
             base = np.floor(centers).astype(np.int32)
@@ -969,6 +1047,16 @@ def sample_motion_corrected_chunks(
             g1_vals = g1_win[row_idx, indices_local]
             g2_vals = g2_win[row_idx, indices_local]
             b_vals = b_win[row_idx, indices_local]
+
+            if jitter_models is not None:
+                betas = jitter_models[indices_clipped]
+                beta0 = betas[:, :, 0]
+                beta1 = betas[:, :, 1]
+                beta2 = betas[:, :, 2]
+                r_vals = beta0 + r_vals * beta1 + row_idx * beta2
+                g1_vals = beta0 + g1_vals * beta1 + row_idx * beta2
+                g2_vals = beta0 + g2_vals * beta1 + row_idx * beta2
+                b_vals = beta0 + b_vals * beta1 + row_idx * beta2
 
             dist = window_indices.astype(np.float32) - centers[:, None].astype(
                 np.float32
@@ -1015,8 +1103,8 @@ def estimate_skew_hough(
     stride_y: int,
     skew_min: float = -0.03,
     skew_max: float = 0.03,
-    bins: int = 32,
-    energy_percentile: float = 98.0,
+    bins: int = 35,
+    energy_percentile: float = 99.0,
 ):
     skews = np.linspace(skew_min, skew_max, bins, dtype=np.float32)
     scores = np.zeros_like(skews, dtype=np.float64)
@@ -1034,10 +1122,6 @@ def estimate_skew_hough(
         if not np.any(mask):
             continue
 
-        if _chunk_i == 0:
-            cv2.imwrite(str(g / "skew_energy.png"), energy * 255)
-            cv2.imwrite(str(g / "skew_mask.png"), mask * 255)
-
         weights = energy * mask
         width = chunk.shape[1]
         xs = np.arange(width, dtype=np.int32)
@@ -1045,6 +1129,8 @@ def estimate_skew_hough(
         scale = stride_y / stride_x
 
         chunk_scores = np.zeros_like(skews, dtype=np.float64)
+        best_hist = None
+        best_score = -np.inf
         for i, skew in enumerate(skews):
             skew_ds = skew * scale
             hist = np.zeros(width, dtype=np.float64)
@@ -1060,13 +1146,62 @@ def estimate_skew_hough(
                     minlength=width,
                 )
             if hist.size:
-                chunk_scores[i] += float(np.max(hist))
+                peak_thresh = 0.7 * np.max(hist)
+                peaks = np.zeros_like(hist, dtype=bool)
+                if hist.size >= 3 and peak_thresh > 0:
+                    peaks[1:-1] = (hist[1:-1] > hist[:-2]) & (hist[1:-1] >= hist[2:])
+                    peaks &= hist >= peak_thresh
+                if np.any(peaks):
+                    score = float(np.sum(hist[peaks]))
+                else:
+                    score = float(np.max(hist))
+                chunk_scores[i] += score
+                if score > best_score:
+                    best_score = score
+                    best_hist = hist.copy()
         print("chunk", _chunk_i, ":", chunk_scores)
+
+        best_idx = int(np.argmax(chunk_scores))
+        best_skew = skews[best_idx]
+        skew_ds = best_skew * scale
+        if best_hist is None:
+            best_hist = np.zeros(width, dtype=np.float64)
+
+        energy_norm = energy / max(np.max(energy), 1e-6)
+        mask_u8 = mask.astype(np.uint8) * 255
+        energy_u8 = (np.clip(energy_norm, 0, 1) * 255).astype(np.uint8)
+
+        energy_vis = cv2.cvtColor(energy_u8, cv2.COLOR_GRAY2BGR)
+        energy_vis = np.ascontiguousarray(energy_vis[::-1, :, :])
+        mask_vis = np.ascontiguousarray(mask_u8[::-1, :])
+
+        peak_thresh = 0.7 * np.max(best_hist) if best_hist.size else 0
+        if peak_thresh > 0:
+            peaks = np.zeros_like(best_hist, dtype=bool)
+            peaks[1:-1] = (best_hist[1:-1] > best_hist[:-2]) & (
+                best_hist[1:-1] >= best_hist[2:]
+            )
+            peaks &= best_hist >= peak_thresh
+            peak_idxs = np.where(peaks)[0]
+        else:
+            peak_idxs = []
+
+        h = energy_vis.shape[0]
+        for b in peak_idxs:
+            x0 = int(round(b + skew_ds * (h - 1)))
+            x1 = int(round(b))
+            y0 = 0
+            y1 = h - 1
+            cv2.line(energy_vis, (x0, y0), (x1, y1), (0, 0, 255), 1)
+
+        cv2.imwrite(str(g / f"skew_energy_{_chunk_i:02d}.png"), energy_vis)
+        cv2.imwrite(str(g / f"skew_mask_{_chunk_i:02d}.png"), mask_vis)
 
         plt.figure(figsize=(16, 9), dpi=300)
         plt.plot(chunk_scores, "b.", label="Skew response")
         plt.legend()
         plt.savefig(g / f"skew_response_{_chunk_i:04d}.png")
+        plt.close()
         scores += chunk_scores
 
     if np.all(scores == 0):
@@ -1130,13 +1265,23 @@ def process_preview(
     green1 = ChannelView(data, row_offset=1, col_offset=1)
     green2 = ChannelView(data, row_offset=0, col_offset=0)
 
-    """
-    jitter_models = column_exposure_jitter_correction(
-        red_view, green1, green2, blue_view, g=g
-    )
-    """
+    mask_bins = [
+        compute_structure_mask(bin_path, max_green)
+        for bin_path in tqdm(selected_bins, desc="stripe mask")
+    ]
 
-    sample_xs, sample_ys, _weights = windowed_cross_correlation(green1, green2)
+    jitter_models = column_exposure_jitter_correction(
+        red_view,
+        green1,
+        green2,
+        blue_view,
+        g=g,
+        mask_bins=mask_bins,
+    )
+
+    sample_xs, sample_ys, _weights = windowed_cross_correlation(
+        green1, green2, jitter_models=jitter_models
+    )
 
     spline = robust_bspline_fit(
         x=sample_xs,
@@ -1149,11 +1294,12 @@ def process_preview(
 
     print(g, len(bins), data.shape)
 
-    sample_positions, widths = generate_sample_positions(
+    sample_positions, widths, step_scales = generate_sample_positions(
         spline, sample_xs, green1.width
     )
+    step_scales = np.asarray(step_scales, dtype=np.float32)
     # chunk size for sampling
-    max_pix = 16384
+    skew_chunk_size = 4096
 
     skew = estimate_skew_hough(
         sample_motion_corrected_chunks(
@@ -1166,12 +1312,15 @@ def process_preview(
             stride_x=preview_stride,
             stride_y=preview_stride,
             skew=0.0,
-            max_pix=max_pix,
+            max_pix=skew_chunk_size,
+            jitter_models=jitter_models,
+            step_scales=step_scales,
         ),
         g=g,
         stride_x=preview_stride,
         stride_y=preview_stride,
     )
+
     print("estimated skew", skew)
 
     out_height = green1.height * 2
@@ -1181,9 +1330,11 @@ def process_preview(
         sample_positions,
         widths,
         skew=skew,
+        step_scales=step_scales,
         row_offsets=row_offsets,
         width=green1.width,
     )
+    step_scales = step_scales[: len(sample_positions)]
 
     n = len(sample_positions)
     target = 32768
@@ -1193,6 +1344,7 @@ def process_preview(
     if n_use < n:
         sample_positions = sample_positions[:n_use]
         widths = widths[:n_use]
+        step_scales = step_scales[:n_use]
 
     stacked_preview = []
     for chunk_i, raw_sampled in sample_motion_corrected_chunks(
@@ -1206,6 +1358,8 @@ def process_preview(
         stride_y=1,
         skew=skew,
         max_pix=chunk_size,
+        jitter_models=jitter_models,
+        step_scales=step_scales,
     ):
         out_name = f"rgb_{chunk_i:02d}_prod_no_denoise_deskewed"
         # denoised_sampled = patch_denoise(raw_sampled)
@@ -1231,10 +1385,7 @@ def process_preview(
 
         rgb_float = rgb_u8.astype(np.float32)
         binned = np.stack(
-            [
-                bin2to1(bin2to1(rgb_float[:, :, ch]))
-                for ch in range(rgb_float.shape[2])
-            ],
+            [bin2to1(bin2to1(rgb_float[:, :, ch])) for ch in range(rgb_float.shape[2])],
             axis=2,
         )
         stacked_preview.append(np.clip(binned, 0, 255).astype(np.uint8))
@@ -1253,33 +1404,40 @@ def main():
     # globs = linescans.glob("2024-09-12-01-31-01*")  # hk bus
     # globs = linescans.glob("nyc4")
     # globs = linescans.glob("18*")
-    # globs = linescans.glob("18-08-04*")  # amtrak
+    # globs = linescans.glob("18-08-0*")  # amtrak
     # globs = linescans.glob("2023*")
     # globs = linescans.glob("17-10-01-23-46-50-utc")
-    # globs = linescans.glob("*")
     # globs = linescans.glob("18*")
     # globs = linescans.glob("18-10-06-13-52-16-utc*")  # pato
     # globs = linescans.glob("2025-11*") # pano
-    globs = linescans.glob("2025-09-13-09-18-45*") # picadilly
+    # globs = linescans.glob("2025-09-13-09-27-13*")  # picadilly
+    # globs = linescans.glob("2025-09*")
 
-    globs = sorted(list(globs))[-1:]
+    globs = linescans.glob("*")
+    globs = sorted(list(globs))
 
+    max_workers = 6
+    dirs = [g for g in globs if g.is_dir()]
     for g in globs:
         if not g.is_dir():
             print("skipping directory", g)
-            continue
 
-        print(g)
-        if len(globs) == 1:
-            process_preview(g)
-        else:
-            try:
-                process_preview(g)
-            except KeyboardInterrupt:
-                break
-            except Exception as e:
-                print(f"oh no! {g} {e}")
-                continue  # anyway
+    if len(dirs) == 1:
+        process_preview(dirs[0])
+        return
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {executor.submit(process_preview, g): g for g in dirs}
+        try:
+            for future in as_completed(future_map):
+                g = future_map[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"oh no! {g} {e}")
+        except KeyboardInterrupt:
+            for future in future_map:
+                future.cancel()
 
 
 if __name__ == "__main__":
