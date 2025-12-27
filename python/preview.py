@@ -25,6 +25,10 @@ RAW_COLOR_CORRECTION = np.array(
 )
 
 CAMERA_MODEL_NAME = "Alkeria Necta N4K2-7C"
+ENABLE_COLUMN_JITTER_CORRECTION = True
+STRUCTURE_MASK_DOWNSAMPLE = 8
+STRUCTURE_MASK_THRESHOLD = 0.05
+STRUCTURE_MASK_DILATE_PX = 64
 
 
 def _normalize_rows(matrix: np.ndarray) -> np.ndarray:
@@ -622,23 +626,19 @@ def bin2to1(data):
     return (data[::2, ::2] + data[1::2, ::2] + data[::2, 1::2] + data[1::2, 1::2]) / 4
 
 
-def compute_structure_mask(
-    bin_path: Path, max_green: float, threshold: float = 0.2, dilate_px: int = 64
+def compute_structure_energy_downsampled(
+    bin_path: Path, max_green: float, downsample: int
 ) -> np.ndarray:
     dat1 = np.fromfile(bin_path, dtype=np.uint16).astype(np.float32)
     dat1_reshaped = np.reshape(dat1, (-1, 4096)).T
     raw_green = dat1_reshaped[1::2, 1::2]
+    for _ in range(int(math.log2(downsample))):
+        raw_green = bin2to1(raw_green)
 
     grad_y, grad_x = np.gradient(raw_green)
     magnitude = np.sqrt(grad_x**2 + grad_y**2) + 0.1 * max_green
     energy = np.abs(grad_x) / magnitude
-
-    mask = energy > threshold
-    if dilate_px > 0:
-        k = 2 * dilate_px + 1
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-        mask = cv2.dilate(mask.astype(np.uint8), kernel) > 0
-    return mask
+    return energy
 
 
 def estimate_white_balance(bin_paths, max_samples: int = 8) -> np.ndarray:
@@ -754,6 +754,7 @@ def weighted_linear_regression(y, x, w, prior_beta=None, prior_weight=0.0):
         XtWX += prior_weight_scaled * np.eye(X.shape[1])
         XtWy += prior_weight_scaled * prior_beta
 
+        # print("prior weight:", prior_weight_scaled, scale)
     # Solve XtWX @ beta = XtWy for beta
     try:
         beta = np.linalg.solve(XtWX, XtWy)
@@ -814,6 +815,7 @@ def column_exposure_jitter_correction(
     g: Path,
     sigma=500,
     mask_bins=None,
+    mask_scale: int = 1,
 ):
     n_cols = red_view.width
 
@@ -866,8 +868,13 @@ def column_exposure_jitter_correction(
                     next_boundary = cum_cols[file_idx + 1]
                 local_full = full_col - cum_cols[file_idx]
                 local_green = local_full // green1.col_step
-                if 0 <= local_green < mask_bins[file_idx].shape[1]:
-                    weight[mask_bins[file_idx][:, local_green]] = 0
+                if mask_scale > 1:
+                    local_green = local_green // mask_scale
+                mask_bin = mask_bins[file_idx]
+                if mask_bin.size > 0 and 0 <= local_green < mask_bin.shape[1]:
+                    row_idx = np.arange(weight.size) // mask_scale
+                    row_idx = np.minimum(row_idx, mask_bin.shape[0] - 1)
+                    weight[mask_bin[row_idx, local_green]] = 0
 
             if np.sum(weight) == 0:
                 beta = np.array([0, 1, 0], dtype=np.float64)
@@ -880,7 +887,7 @@ def column_exposure_jitter_correction(
                 gray_prev,
                 weight,
                 prior_beta=np.array([0, 1, 0]),
-                prior_weight=0.01,
+                prior_weight=1e-9,
             )
 
         betas[col - 1, :] = beta
@@ -894,7 +901,7 @@ def column_exposure_jitter_correction(
     for col in range(n_cols):
         global_models[col] = beta
         if col < n_cols - 1:
-            lamb = 0.02
+            lamb = 0.01
             beta = (1 - lamb) * compose_model(
                 invert_model(betas[col]), beta
             ) + lamb * np.array([0, 1, 0])
@@ -1370,12 +1377,21 @@ def process_preview(
 ):
     bins = sorted(list(g.glob("*.bin")))
 
+    downsample_steps = int(math.log2(STRUCTURE_MASK_DOWNSAMPLE))
+    if 2**downsample_steps != STRUCTURE_MASK_DOWNSAMPLE:
+        raise ValueError("STRUCTURE_MASK_DOWNSAMPLE must be a power of two")
+
     max_green = 0
+    max_green_down = 0
     for i, bin in tqdm(enumerate(bins), total=len(bins)):
         dat1 = np.fromfile(bin, dtype=np.uint16).astype(np.float32)
         dat1_reshaped = np.reshape(dat1, (-1, 4096)).T
         raw_green = dat1_reshaped[1::2, 1::2]
         max_green = max(max_green, np.max(raw_green))
+        raw_green_down = raw_green
+        for _ in range(downsample_steps):
+            raw_green_down = bin2to1(raw_green_down)
+        max_green_down = max(max_green_down, np.max(raw_green_down))
 
     scores = []
     for i, bin in tqdm(enumerate(bins), total=len(bins), desc="finding moving region"):
@@ -1418,35 +1434,47 @@ def process_preview(
     green1 = ChannelView(data, row_offset=1, col_offset=1)
     green2 = ChannelView(data, row_offset=0, col_offset=0)
 
-    mask_bins = [
-        compute_structure_mask(bin_path, max_green)
-        for bin_path in tqdm(selected_bins, desc="stripe mask")
-    ]
-    mask_preview = []
-    for mask in mask_bins:
-        mask_float = mask.astype(np.float32)
-        binned = bin2to1(bin2to1(mask_float))
-        mask_preview.append(np.clip(binned * 255, 0, 255).astype(np.uint8))
-    if mask_preview:
-        group_size = 32
-        rows = []
-        for i in range(0, len(mask_preview), group_size):
-            row = mask_preview[i : i + group_size]
-            if len(row) < group_size:
-                pad = [np.zeros_like(row[0]) for _ in range(group_size - len(row))]
-                row = row + pad
-            rows.append(np.hstack(row))
-        stacked_mask = np.vstack(rows)
-        cv2.imwrite(str(g / "structure_mask_preview.png"), stacked_mask)
+    energy_bins = []
+    mask_widths = []
+    for bin_path in tqdm(selected_bins, desc="stripe mask"):
+        energy_down = compute_structure_energy_downsampled(
+            bin_path, max_green_down, STRUCTURE_MASK_DOWNSAMPLE
+        )
+        energy_bins.append(energy_down)
+        mask_widths.append(energy_down.shape[1])
 
-    jitter_models = column_exposure_jitter_correction(
-        red_view,
-        green1,
-        green2,
-        blue_view,
-        g=g,
-        mask_bins=mask_bins,
-    )
+    if energy_bins:
+        energy_full = np.hstack(energy_bins)
+    else:
+        energy_full = np.empty((0, 0), dtype=np.float32)
+
+    mask_full = energy_full > STRUCTURE_MASK_THRESHOLD
+    if STRUCTURE_MASK_DILATE_PX > 0 and mask_full.size > 0:
+        dilate_px = max(1, STRUCTURE_MASK_DILATE_PX // STRUCTURE_MASK_DOWNSAMPLE)
+        k = 2 * dilate_px + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        mask_full = cv2.dilate(mask_full.astype(np.uint8), kernel) > 0
+
+    mask_bins = []
+    start = 0
+    for width in mask_widths:
+        mask_bins.append(mask_full[:, start : start + width])
+        start += width
+    if mask_full.size > 0:
+        preview_mask = mask_full.astype(np.uint8) * 255
+        cv2.imwrite(str(g / "structure_mask_preview.png"), preview_mask)
+
+    jitter_models = None
+    if ENABLE_COLUMN_JITTER_CORRECTION:
+        jitter_models = column_exposure_jitter_correction(
+            red_view,
+            green1,
+            green2,
+            blue_view,
+            g=g,
+            mask_bins=mask_bins,
+            mask_scale=STRUCTURE_MASK_DOWNSAMPLE,
+        )
 
     sample_xs, sample_ys, _weights = windowed_cross_correlation(
         green1, green2, jitter_models=jitter_models
@@ -1531,7 +1559,7 @@ def process_preview(
         jitter_models=jitter_models,
         step_scales=step_scales,
     ):
-        out_name = f"rgb_{chunk_i:02d}_cfpeak_deskewed"
+        out_name = f"rgb_{chunk_i:02d}_cfpeak_deskewed_jitter"
         # denoised_sampled = patch_denoise(raw_sampled)
         denoised_sampled = raw_sampled
         write_linear_dng(
@@ -1578,9 +1606,9 @@ def main():
     # globs = linescans.glob("18*")
     # globs = linescans.glob("17-10-01-23-46-50-utc")
     # globs = linescans.glob("18-10-18-02-31-29-utc")  # maglev
-    globs = linescans.glob("18-10-06-13-52-16-utc*")  # pato
+    # globs = linescans.glob("18-10-06-13-52-16-utc*")  # pato
     # globs = linescans.glob("2025-11*") # pano
-    # globs = linescans.glob("2025-09-13-09-27-13*")  # picadilly
+    globs = linescans.glob("2025-09-13-09-27-13*")  # picadilly
     # globs = linescans.glob("2025-09*")
     # globs = linescans.glob("*")
 
