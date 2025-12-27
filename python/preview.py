@@ -7,6 +7,7 @@ import cv2
 import matplotlib.pyplot as plt
 from numpy.lib.stride_tricks import sliding_window_view
 import numpy as np
+from scipy.optimize import curve_fit
 from scipy.interpolate import UnivariateSpline
 from tqdm import tqdm
 import itertools
@@ -243,12 +244,42 @@ class ChannelView:
 
 def subpixel_peak(y, sigma, initial):
     peak = initial
-    x = np.arange(len(y))
+    x = np.arange(len(y), dtype=np.float32)
+
+    def split_gaussian(x_vals, mu, amp, sigma_l, sigma_r):
+        sigma_vals = np.where(x_vals <= mu, sigma_l, sigma_r)
+        return amp * np.exp(-0.5 * ((x_vals - mu) / sigma_vals) ** 2)
+
+    window = int(max(3, round(3 * sigma)))
+    left = max(0, initial - window)
+    right = min(len(y) - 1, initial + window)
+    x_local = x[left : right + 1]
+    y_local = y[left : right + 1]
+
+    fit_peak = None
+    if y_local.size >= 5 and np.any(y_local > 0):
+        amp0 = float(np.max(y_local))
+        mu0 = float(initial)
+        p0 = [mu0, amp0, max(0.5, sigma * 0.8), max(0.5, sigma * 1.2)]
+        bounds = ([left, 0.0, 0.1, 0.1], [right, amp0 * 2.0, 20.0, 20.0])
+        try:
+            popt, _ = curve_fit(split_gaussian, x_local, y_local, p0=p0, bounds=bounds)
+            fit_peak = float(popt[0])
+        except Exception:
+            fit_peak = None
+
     sigma2 = sigma**2
-    for iter in range(10):
+    for _ in range(10):
         weights = np.exp(-((x - peak) ** 2) / sigma2) * y
-        peak = np.sum(weights * x) / np.sum(weights)
-    return peak
+        denom = np.sum(weights)
+        if denom == 0:
+            break
+        peak = np.sum(weights * x) / denom
+    mean_shift_peak = float(peak)
+
+    if fit_peak is not None:
+        return fit_peak, mean_shift_peak
+    return mean_shift_peak, mean_shift_peak
 
 
 def windowed_cross_correlation(
@@ -274,19 +305,30 @@ def windowed_cross_correlation(
 
     heatmap = np.zeros((len(xs), corr_size))
 
+    def vertical_energy(block: np.ndarray) -> np.ndarray:
+        grad_y, grad_x = np.gradient(block)
+        magnitude = np.sqrt(grad_x**2 + grad_y**2) + 0.1 * np.max(block)
+        return grad_x / magnitude
+
     for xi, x in tqdm(
         enumerate(xs[1:-1]), desc="train speed estimation", total=len(xs)
     ):
         window_1 = green_1[:, x : x + window_step]
         if jitter_models is not None:
             window_1 = apply_column_models(window_1, jitter_models, x)
+        window_1 = vertical_energy(window_1)
 
         corrs = np.zeros((corr_size,))
+        pad = corr_half
+        window_2_base = green_2[:, x - pad : x + window_step + pad]
+        if jitter_models is not None:
+            window_2_base = apply_column_models(window_2_base, jitter_models, x - pad)
+        window_2_base = vertical_energy(window_2_base)
+
         for corr_ind in range(corr_size):
             corr_x = corr_ind - corr_half
-            window_2 = green_2[:, x + corr_x : x + window_step + corr_x]
-            if jitter_models is not None:
-                window_2 = apply_column_models(window_2, jitter_models, x + corr_x)
+            start = corr_x + pad
+            window_2 = window_2_base[:, start : start + window_step]
 
             # corr_value = np.sum(window_1 * window_2)
             error = np.sum(np.abs(window_1 - window_2))
@@ -304,22 +346,41 @@ def windowed_cross_correlation(
             weights.append(np.max(ncorrs) - np.min(ncorrs))
             ncorrs = ncorrs - np.min(ncorrs)
             ncorrs = ncorrs / np.max(ncorrs)
-            # peak_idx = np.argmax(ncorrs)
-            refined_peak_idx = subpixel_peak(ncorrs, 2.0, peak_idx)
+            peak_idx = np.argmax(ncorrs)
+            refined_peak_idx, mean_shift_peak_idx = subpixel_peak(ncorrs, 2.0, peak_idx)
 
             ys.append(peak_idx - corr_half)
-            refined_ys.append(refined_peak_idx - corr_half)
+            refined_ys.append(mean_shift_peak_idx - corr_half)
             good_xs.append(xi * window_step + window_size // 2)
 
-            if output_dir is not None and x > 20000 and x < 25000:
+            if output_dir is not None:
                 plt.figure(figsize=(16, 9), dpi=300)
-                plt.plot(ncorrs, "b.", label="Raw peaks")
-                plt.plot([peak_idx], [ncorrs[peak_idx]], "r.", label="Naive peak")
                 plt.plot(
-                    [refined_peak_idx, refined_peak_idx],
+                    np.arange(-corr_half, corr_half + 1),
+                    ncorrs,
+                    "b.",
+                    label="Raw peaks",
+                )
+                plt.plot(
+                    [peak_idx - corr_half], [ncorrs[peak_idx]], "r.", label="Naive peak"
+                )
+                plt.plot(
+                    [0, 0],
+                    [0, np.max(ncorrs)],
+                    "k--",
+                    label="Zero shift",
+                )
+                plt.plot(
+                    [refined_peak_idx - corr_half, refined_peak_idx - corr_half],
                     [0, np.max(ncorrs)],
                     "g--",
-                    label="Subpixel refined peaks",
+                    label="Curve-fit peak",
+                )
+                plt.plot(
+                    [mean_shift_peak_idx - corr_half, mean_shift_peak_idx - corr_half],
+                    [0, np.max(ncorrs)],
+                    "c--",
+                    label="Mean-shift peak",
                 )
                 plt.legend()
                 plt.savefig(output_dir / f"mean_shift_{xi:04d}.png")
@@ -365,6 +426,7 @@ def robust_bspline_fit(
     Also plots the data and the final spline fit.
     """
     current_weights = np.copy(weights)
+    initial_weights = np.copy(weights)
     spline = None
 
     for i in range(num_iter):
@@ -392,19 +454,32 @@ def robust_bspline_fit(
             break
         current_weights = new_weights
 
-    # Plot the original data and the fitted spline on a dense grid.
-    plt.figure(figsize=(16, 9), dpi=300)
-    plt.plot(x, y, "bo", label="Data")
+    # Plot the original data and the fitted spline with weights below.
+    fig, (ax1, ax2) = plt.subplots(
+        2,
+        1,
+        figsize=(16, 9),
+        dpi=300,
+        sharex=True,
+        gridspec_kw={"height_ratios": [3, 1]},
+    )
+    ax1.plot(x, y, "bo", label="Data")
     x_dense = np.linspace(np.min(x), np.max(x), 500)
     y_dense = spline(x_dense)
-    plt.plot(x_dense, y_dense, "r-", lw=2, label="Robust Cubic B-spline")
-    plt.plot(x, np.zeros_like(x), "k--")
-    plt.title("Robust Cubic B-spline Fit")
-    plt.xlabel("x")
-    plt.ylabel("y")
-    plt.legend()
+    ax1.plot(x_dense, y_dense, "r-", lw=2, label="Robust Cubic B-spline")
+    ax1.plot(x, np.zeros_like(x), "k--")
+    ax1.set_title("Robust Cubic B-spline Fit")
+    ax1.set_ylabel("y")
+    ax1.legend()
+
+    ax2.plot(x, initial_weights, "k.", label="Initial weights")
+    ax2.plot(x, current_weights, "r.", label="Final weights")
+    ax2.set_xlabel("x")
+    ax2.set_ylabel("weight")
+    ax2.legend()
+
     plt.savefig(g / "spline.png")
-    plt.close()
+    plt.close(fig)
     if visualize:
         plt.show()
 
@@ -548,7 +623,7 @@ def bin2to1(data):
 
 
 def compute_structure_mask(
-    bin_path: Path, max_green: float, threshold: float = 0.2, dilate_px: int = 32
+    bin_path: Path, max_green: float, threshold: float = 0.2, dilate_px: int = 64
 ) -> np.ndarray:
     dat1 = np.fromfile(bin_path, dtype=np.uint16).astype(np.float32)
     dat1_reshaped = np.reshape(dat1, (-1, 4096)).T
@@ -646,7 +721,7 @@ def autoexposure(selected_bins, white_balance):
     return p2, p98
 
 
-def weighted_linear_regression(y, x, w):
+def weighted_linear_regression(y, x, w, prior_beta=None, prior_weight=0.0):
     """
     Perform weighted linear regression: y = a + b*x + c*ind
     where ind = np.arange(len(x))
@@ -670,9 +745,22 @@ def weighted_linear_regression(y, x, w):
     # Compute X^T W y: X.T @ (w * y)
     XtWy = X.T @ (w * y)  # 3 x 1
 
+    if prior_beta is not None and prior_weight > 0:
+        prior_beta = np.asarray(prior_beta, dtype=np.float64)
+        scale = np.mean(np.diag(XtWX))
+        if not np.isfinite(scale) or scale <= 0:
+            scale = 1.0
+        prior_weight_scaled = prior_weight * scale
+        XtWX += prior_weight_scaled * np.eye(X.shape[1])
+        XtWy += prior_weight_scaled * prior_beta
+
     # Solve XtWX @ beta = XtWy for beta
-    damping = 0
-    beta = np.linalg.solve(XtWX + damping * np.eye(X.shape[1]), XtWy)
+    try:
+        beta = np.linalg.solve(XtWX, XtWy)
+    except np.linalg.LinAlgError:
+        if prior_beta is not None:
+            return prior_beta
+        raise
     return beta
 
 
@@ -770,8 +858,6 @@ def column_exposure_jitter_correction(
                 * iter_sigma2
             )
 
-            weight[400:1600] = 0  # exclude middle region likely to include subject
-
             weight = weight * weight
             if mask_bins is not None:
                 full_col = green1.col_offset + col * green1.col_step
@@ -783,9 +869,19 @@ def column_exposure_jitter_correction(
                 if 0 <= local_green < mask_bins[file_idx].shape[1]:
                     weight[mask_bins[file_idx][:, local_green]] = 0
 
+            if np.sum(weight) == 0:
+                beta = np.array([0, 1, 0], dtype=np.float64)
+                break
+
             gray_curr = np.column_stack((red_curr, green_curr, blue_curr)).mean(axis=1)
             gray_prev = np.column_stack((red_prev, green_prev, blue_prev)).mean(axis=1)
-            beta = weighted_linear_regression(gray_curr, gray_prev, weight)
+            beta = weighted_linear_regression(
+                gray_curr,
+                gray_prev,
+                weight,
+                prior_beta=np.array([0, 1, 0]),
+                prior_weight=0.01,
+            )
 
         betas[col - 1, :] = beta
 
@@ -889,7 +985,8 @@ def column_exposure_jitter_correction(
     plt.legend()
     plt.savefig(g / "green_currs.png")
     plt.close()
-    return off_r, off_g, off_b
+
+    return global_models
 
 
 def interpolate_upsample(arr, off):
@@ -1101,13 +1198,29 @@ def estimate_skew_hough(
     g: Path,
     stride_x: int,
     stride_y: int,
-    skew_min: float = -0.03,
-    skew_max: float = 0.03,
-    bins: int = 35,
-    energy_percentile: float = 99.0,
+    skew_min: float = -0.05,
+    skew_max: float = 0.05,
+    bins: int = 69,
+    energy_percentile: float = 98,
 ):
     skews = np.linspace(skew_min, skew_max, bins, dtype=np.float32)
     scores = np.zeros_like(skews, dtype=np.float64)
+
+    def find_peaks_nms(values: np.ndarray, min_distance: int) -> np.ndarray:
+        if values.size < 3:
+            return np.empty((0,), dtype=np.int32)
+        peaks = np.zeros_like(values, dtype=bool)
+        peaks[1:-1] = (values[1:-1] > values[:-2]) & (values[1:-1] >= values[2:])
+        peak_idxs = np.where(peaks)[0]
+        if peak_idxs.size == 0:
+            return peak_idxs
+        peak_vals = values[peak_idxs]
+        order = np.argsort(peak_vals)[::-1]
+        selected = []
+        for idx in peak_idxs[order]:
+            if all(abs(idx - s) >= min_distance for s in selected):
+                selected.append(int(idx))
+        return np.array(selected, dtype=np.int32)
 
     for _chunk_i, chunk in tqdm(chunk_iter, desc="estimating skew"):
         if chunk.size == 0:
@@ -1122,50 +1235,74 @@ def estimate_skew_hough(
         if not np.any(mask):
             continue
 
+        energy = np.sqrt(energy)
+
         weights = energy * mask
         width = chunk.shape[1]
+        hist_len = width * 3
+        hist_offset = width
         xs = np.arange(width, dtype=np.int32)
         ys = np.arange(chunk.shape[0], dtype=np.int32)
         scale = stride_y / stride_x
+        total_weight = float(np.sum(weights)) + 1e-6
 
         chunk_scores = np.zeros_like(skews, dtype=np.float64)
-        best_hist = None
-        best_score = -np.inf
+        histograms = np.zeros((len(skews), hist_len), dtype=np.float64)
+        peak_values = [[] for _ in range(len(skews))]
         for i, skew in enumerate(skews):
             skew_ds = skew * scale
-            hist = np.zeros(width, dtype=np.float64)
+            hist = np.zeros(hist_len, dtype=np.float64)
             for row_idx, y in enumerate(ys):
                 shift = int(round(skew_ds * y))
-                b_idx = xs - shift
-                valid = (b_idx >= 0) & (b_idx < width)
+                b_idx = xs - shift + hist_offset
+                valid = (b_idx >= 0) & (b_idx < hist_len)
                 if not np.any(valid):
                     continue
                 hist += np.bincount(
                     b_idx[valid],
                     weights=weights[row_idx, valid],
-                    minlength=width,
+                    minlength=hist_len,
                 )
             if hist.size:
-                peak_thresh = 0.7 * np.max(hist)
-                peaks = np.zeros_like(hist, dtype=bool)
-                if hist.size >= 3 and peak_thresh > 0:
-                    peaks[1:-1] = (hist[1:-1] > hist[:-2]) & (hist[1:-1] >= hist[2:])
-                    peaks &= hist >= peak_thresh
-                if np.any(peaks):
-                    score = float(np.sum(hist[peaks]))
+                hist_norm = hist / total_weight
+                histograms[i, :] = hist_norm
+                peak_idxs = find_peaks_nms(hist_norm, min_distance=12)
+                if peak_idxs.size:
+                    peak_values[i] = sorted(
+                        (float(hist_norm[p]) for p in peak_idxs), reverse=True
+                    )
                 else:
-                    score = float(np.max(hist))
-                chunk_scores[i] += score
-                if score > best_score:
-                    best_score = score
-                    best_hist = hist.copy()
-        print("chunk", _chunk_i, ":", chunk_scores)
+                    peak_values[i] = [float(np.max(hist_norm))]
+
+        peak_max = np.array(
+            [vals[0] if vals else 0.0 for vals in peak_values], dtype=np.float64
+        )
+        top_s = min(5, len(skews))
+        top_indices = np.argsort(peak_max)[-top_s:]
+        k = None
+        for idx in top_indices:
+            n_peaks = len(peak_values[idx])
+            if n_peaks == 0:
+                continue
+            k = n_peaks if k is None else min(k, n_peaks)
+        if k is None or k == 0:
+            k = 1
+
+        for i in range(len(skews)):
+            vals = peak_values[i]
+            if not vals:
+                continue
+            chunk_scores[i] = float(np.sum(vals[:k]))
 
         best_idx = int(np.argmax(chunk_scores))
         best_skew = skews[best_idx]
         skew_ds = best_skew * scale
-        if best_hist is None:
-            best_hist = np.zeros(width, dtype=np.float64)
+        best_hist = (
+            histograms[best_idx]
+            if histograms.size
+            else np.zeros(hist_len, dtype=np.float64)
+        )
+        best_offset = hist_offset
 
         energy_norm = energy / max(np.max(energy), 1e-6)
         mask_u8 = mask.astype(np.uint8) * 255
@@ -1188,14 +1325,31 @@ def estimate_skew_hough(
 
         h = energy_vis.shape[0]
         for b in peak_idxs:
-            x0 = int(round(b + skew_ds * (h - 1)))
-            x1 = int(round(b))
+            intercept = b - best_offset
+            x0 = int(round(intercept + skew_ds * (h - 1)))
+            x1 = int(round(intercept))
             y0 = 0
             y1 = h - 1
-            cv2.line(energy_vis, (x0, y0), (x1, y1), (0, 0, 255), 1)
+            if (0 <= x0 < energy_vis.shape[1]) or (0 <= x1 < energy_vis.shape[1]):
+                cv2.line(energy_vis, (x0, y0), (x1, y1), (0, 0, 255), 1)
 
         cv2.imwrite(str(g / f"skew_energy_{_chunk_i:02d}.png"), energy_vis)
         cv2.imwrite(str(g / f"skew_mask_{_chunk_i:02d}.png"), mask_vis)
+
+        if histograms.size:
+            fig, ax = plt.subplots(figsize=(16, 9), dpi=300)
+            ax.imshow(
+                histograms,
+                cmap="gray",
+                aspect="auto",
+                origin="lower",
+                extent=[-hist_offset, hist_len - hist_offset, skews[0], skews[-1]],
+            )
+            ax.axhline(best_skew, color="red", linewidth=1)
+            ax.set_ylabel("skew slope")
+            ax.set_xlabel("intercept")
+            fig.savefig(g / f"skew_histogram{_chunk_i:02d}.png")
+            plt.close(fig)
 
         plt.figure(figsize=(16, 9), dpi=300)
         plt.plot(chunk_scores, "b.", label="Skew response")
@@ -1213,7 +1367,6 @@ def process_preview(
     g: Path,
     padding: int = 3,
     max_chunks: int = 512,
-    preview_stride: int = 4,
 ):
     bins = sorted(list(g.glob("*.bin")))
 
@@ -1269,6 +1422,22 @@ def process_preview(
         compute_structure_mask(bin_path, max_green)
         for bin_path in tqdm(selected_bins, desc="stripe mask")
     ]
+    mask_preview = []
+    for mask in mask_bins:
+        mask_float = mask.astype(np.float32)
+        binned = bin2to1(bin2to1(mask_float))
+        mask_preview.append(np.clip(binned * 255, 0, 255).astype(np.uint8))
+    if mask_preview:
+        group_size = 32
+        rows = []
+        for i in range(0, len(mask_preview), group_size):
+            row = mask_preview[i : i + group_size]
+            if len(row) < group_size:
+                pad = [np.zeros_like(row[0]) for _ in range(group_size - len(row))]
+                row = row + pad
+            rows.append(np.hstack(row))
+        stacked_mask = np.vstack(rows)
+        cv2.imwrite(str(g / "structure_mask_preview.png"), stacked_mask)
 
     jitter_models = column_exposure_jitter_correction(
         red_view,
@@ -1286,8 +1455,8 @@ def process_preview(
     spline = robust_bspline_fit(
         x=sample_xs,
         y=sample_ys,
-        weights=np.ones_like(sample_xs),
-        smoothness=20000,
+        weights=_weights,
+        smoothness=40000,
         visualize=False,
         g=g,
     )
@@ -1300,6 +1469,7 @@ def process_preview(
     step_scales = np.asarray(step_scales, dtype=np.float32)
     # chunk size for sampling
     skew_chunk_size = 4096
+    hough_stride = 3
 
     skew = estimate_skew_hough(
         sample_motion_corrected_chunks(
@@ -1309,16 +1479,16 @@ def process_preview(
             blue_view,
             sample_positions,
             widths,
-            stride_x=preview_stride,
-            stride_y=preview_stride,
+            stride_x=hough_stride,
+            stride_y=hough_stride,
             skew=0.0,
             max_pix=skew_chunk_size,
             jitter_models=jitter_models,
             step_scales=step_scales,
         ),
         g=g,
-        stride_x=preview_stride,
-        stride_y=preview_stride,
+        stride_x=hough_stride,
+        stride_y=hough_stride,
     )
 
     print("estimated skew", skew)
@@ -1361,7 +1531,7 @@ def process_preview(
         jitter_models=jitter_models,
         step_scales=step_scales,
     ):
-        out_name = f"rgb_{chunk_i:02d}_prod_no_denoise_deskewed"
+        out_name = f"rgb_{chunk_i:02d}_cfpeak_deskewed"
         # denoised_sampled = patch_denoise(raw_sampled)
         denoised_sampled = raw_sampled
         write_linear_dng(
@@ -1400,23 +1570,23 @@ def main():
     # globs = linescans.glob("2024-09-10-06-00-05*")  # yamanote
     # globs = linescans.glob("2024-09-19*") # fuxing
     # globs = linescans.glob("2024-09-14-02-13-13*")  # hktram
+    # globs = linescans.glob("2024-09-14-*")  # hktrams
     # globs = linescans.glob("2024-09*")  # hktram
     # globs = linescans.glob("2024-09-12-01-31-01*")  # hk bus
-    # globs = linescans.glob("nyc4")
-    # globs = linescans.glob("18*")
+    # globs = linescans.glob("nyc5")
     # globs = linescans.glob("18-08-0*")  # amtrak
-    # globs = linescans.glob("2023*")
-    # globs = linescans.glob("17-10-01-23-46-50-utc")
     # globs = linescans.glob("18*")
-    # globs = linescans.glob("18-10-06-13-52-16-utc*")  # pato
+    # globs = linescans.glob("17-10-01-23-46-50-utc")
+    # globs = linescans.glob("18-10-18-02-31-29-utc")  # maglev
+    globs = linescans.glob("18-10-06-13-52-16-utc*")  # pato
     # globs = linescans.glob("2025-11*") # pano
     # globs = linescans.glob("2025-09-13-09-27-13*")  # picadilly
     # globs = linescans.glob("2025-09*")
+    # globs = linescans.glob("*")
 
-    globs = linescans.glob("*")
-    globs = sorted(list(globs))
+    globs = sorted(list(globs))[::-1]
 
-    max_workers = 6
+    max_workers = 3
     dirs = [g for g in globs if g.is_dir()]
     for g in globs:
         if not g.is_dir():
