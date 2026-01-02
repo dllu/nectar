@@ -6,6 +6,7 @@ find_package(OpenGL REQUIRED)
 find_package(SDL2 REQUIRED)
 set(NECTA_INCLUDE_DIRS
 	${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/third-party
     ${OPENGL_INCLUDE_DIR}
     ${SDL2_INCLUDE_DIRS}
     /usr/include/libalkusb3/
@@ -37,4 +38,9 @@ add_executable(necta
     imgui/imgui_widgets.cpp
     src/main.cpp
 )
+find_library(DW_LIB dw)
+if(DW_LIB)
+    target_compile_definitions(necta PRIVATE BACKWARD_HAS_DW=1)
+    target_link_libraries(necta ${DW_LIB})
+endif()
 target_link_libraries(necta ${NECTA_LIBRARIES})
