@@ -1,4 +1,7 @@
 #include <INectaCamera.h>
+#include <shared/GlobalOptions.h>
+
+#include "backward.hpp"
 #include <SDL.h>
 #include <SDL_opengl.h>
 #include <imgui.h>
@@ -6,9 +9,11 @@
 #include <imgui_impl_sdl2.h>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstring>
 #include <deque>
 #include <filesystem>
 #include <future>
@@ -20,6 +25,11 @@
 #include <vector>
 
 using namespace CAlkUSB3;
+namespace backward {
+backward::SignalHandling signal_handler;
+}
+
+static std::atomic<uint32_t>* g_frame_lost_counter = nullptr;
 
 class WorkQueue {
     std::mutex mtx_;
@@ -34,7 +44,7 @@ class WorkQueue {
         return tasks_.size();
     }
 
-    void enqueue(std::packaged_task<void()> &&t) {
+    void enqueue(std::packaged_task<void()>&& t) {
         {
             std::unique_lock<std::mutex> lock(mtx_);
             tasks_.push_back(std::move(t));
@@ -69,22 +79,23 @@ class WorkQueue {
             stop_ = true;
         }
         cv_.notify_all();
-        for (auto &t : work_threads_) t.join();
+        for (auto& t : work_threads_) t.join();
         work_threads_.clear();
     }
 };
 
 class NectarCapturer {
    public:
-    bool save = false;
-    int analog_gain = 10;
-    int cds_gain = 1;
-    int shutterspeed = 2000;
-    int frame_id = 0;
+    std::atomic<bool> save{false};
+    std::atomic<int> analog_gain{10};
+    std::atomic<int> cds_gain{1};
+    std::atomic<int> shutterspeed{2000};
+    std::atomic<int> frame_id{0};
 
     NectarCapturer()
         : rgb_image((buffer_rows / 2) * (cols / 2) * 3, 0),
-          rgb_image_cropped((buffer_rows / 2) * (cols / 8) * 3, 0) {
+          rgb_image_cropped((buffer_rows / 2) * (cols / 8) * 3, 0),
+          latest_preview(buffer_rows * cols * 2, 0) {
         glGenTextures(1, &rgb_texture);
         glGenTextures(1, &rgb_crop_texture);
         glGenTextures(1, &hist_texture);
@@ -95,6 +106,14 @@ class NectarCapturer {
     int capture_rows = 192;
     static constexpr int buffer_rows = 512;
     static constexpr int cols = 4096;
+
+    std::mutex cam_mtx;
+    std::mutex preview_mtx;
+    std::vector<uint8_t> latest_preview;
+    bool preview_ready = false;
+    std::atomic<bool> request_preview{false};
+    std::atomic<bool> capture_running{false};
+    std::thread capture_thread;
 
     std::vector<Array<uint8_t>> raw_buffers;
 
@@ -112,9 +131,20 @@ class NectarCapturer {
 
     std::chrono::steady_clock::time_point last_capture_ts;
     int dropped_frames = 0;
+    std::atomic<int64_t> last_capture_interval_ns{0};
+    std::atomic<int64_t> expected_capture_interval_ns{0};
+    std::atomic<uint32_t> acquired_counter{0};
+    std::atomic<uint32_t> cam_acquired_total{0};
+    std::atomic<unsigned int> cam_line_period{0};
+    std::atomic<float> cam_frame_rate{0.0f};
+    std::atomic<unsigned int> cam_packet_size{0};
+    std::atomic<unsigned int> cam_max_packet_size{0};
+    int last_analog_gain = -1;
+    int last_cds_gain = -1;
+    int last_shutterspeed = -1;
 
     std::array<uint8_t, histogram_size> histogram;
-    void viz(const uint8_t *const raw_buf) {
+    void viz(const uint8_t* const raw_buf) {
         std::array<int, 256> reds;
         std::array<int, 256> greens;
         std::array<int, 256> blues;
@@ -174,7 +204,7 @@ class NectarCapturer {
         }
     }
 
-    void draw_image(const GLuint image_texture, const uint8_t *const image_data,
+    void draw_image(const GLuint image_texture, const uint8_t* const image_data,
                     const int w, const int h, const int w_disp,
                     const int h_disp) {
         glBindTexture(GL_TEXTURE_2D, image_texture);
@@ -195,68 +225,113 @@ class NectarCapturer {
         ImGui::Image((intptr_t)image_texture, ImVec2(w_disp, h_disp));
     }
 
-   public:
-    void capture(INectaCamera &cam) {
-        if (!save) {
-            cam.SetGain(analog_gain);
-            cam.SetCDSGain(cds_gain);
-            cam.SetShutter(shutterspeed);
-        }
+    void capture_loop(INectaCamera& cam) {
+        last_capture_ts = std::chrono::steady_clock::now();
+        auto last_cam_acq_check = std::chrono::steady_clock::now();
+        while (capture_running.load()) {
+            int current_shutter = shutterspeed.load();
+            if (!save.load()) {
+                const int current_gain = analog_gain.load();
+                const int current_cds = cds_gain.load();
+                if (current_gain != last_analog_gain ||
+                    current_cds != last_cds_gain ||
+                    current_shutter != last_shutterspeed) {
+                    std::lock_guard<std::mutex> lock(cam_mtx);
+                    if (current_gain != last_analog_gain) {
+                        cam.SetGain(current_gain);
+                        last_analog_gain = current_gain;
+                    }
+                    if (current_cds != last_cds_gain) {
+                        cam.SetCDSGain(current_cds);
+                        last_cds_gain = current_cds;
+                    }
+                    if (current_shutter != last_shutterspeed) {
+                        cam.SetShutter(current_shutter);
+                        last_shutterspeed = current_shutter;
+                    }
+                }
+            }
+            const double line_period_s =
+                current_shutter * 1e-7 + 2.1e-6;
+            expected_capture_interval_ns.store(static_cast<int64_t>(
+                line_period_s * (capture_rows / 2) * 1e9));
+            const int new_rows_desired =
+                2 * std::ceil(1.0 / 30.0 / line_period_s);
 
-        // shutter is in 100 ns, i.e. 1e-7 seconds, and line period is equal to
-        // shutter period + 2.1 us from the manual
-        const double line_period_s = shutterspeed * 1e-7 + 2.1e-6;
+                int new_rows = 1;
+                while (new_rows <= new_rows_desired) {
+                    new_rows *= 2;
+                }
+                const int new_capture_rows =
+                    std::max(static_cast<int>(cam.GetMinImageSizeY()),
+                             std::min(static_cast<int>(cam.GetMaxImageSizeY()),
+                                      std::min(buffer_rows, new_rows)));
+            if (capture_rows != new_capture_rows) {
+                std::lock_guard<std::mutex> lock(cam_mtx);
+                cam.SetAcquire(false);
+                cam.SetImageSizeX(cols);
+                cam.SetImageSizeY(new_capture_rows);
+                cam.SetAcquire(true);
+                capture_rows = new_capture_rows;
+                raw_buffers.clear();
+                const size_t needed =
+                    static_cast<size_t>(capture_rows) * cols * 2;
+                std::lock_guard<std::mutex> preview_lock(preview_mtx);
+                if (latest_preview.size() < needed) {
+                    latest_preview.resize(needed);
+                }
+            }
 
-        // number of rows that we can scan at 30 Hz, we want to get at least as
-        // many rows as the UI refreshing at 30 Hz
-        //
-        // also, note that each capture gets two rows
-        const int new_rows_desired = 2 * std::ceil(1.0 / 30.0 / line_period_s);
-
-        int new_rows = 1;
-        while (new_rows <= new_rows_desired) {
-            new_rows *= 2;
-        }
-        // whyy
-        const int new_capture_rows =
-            std::max(static_cast<int>(cam.GetMinImageSizeY()),
-                     std::min(static_cast<int>(cam.GetMaxImageSizeY()),
-                              std::min(buffer_rows, new_rows)));
-
-        if (capture_rows != new_capture_rows) {
-            cam.SetAcquire(false);
-            cam.SetImageSizeX(cols);
-            cam.SetImageSizeY(new_capture_rows);
-            cam.SetAcquire(true);
-            capture_rows = new_capture_rows;
-            raw_buffers.clear();
-        }
-        const auto t0 = std::chrono::steady_clock::now();
-        const int capture_frames = std::max(1, new_rows / buffer_rows);
-        std::chrono::steady_clock::duration capture_time{0};
-        std::chrono::steady_clock::duration capture_time_2{0};
-        std::chrono::steady_clock::duration viz_time{0};
-
-        for (int capture_ind = 0; capture_ind < capture_frames; capture_ind++) {
-            const auto t_capture_0 = std::chrono::steady_clock::now();
-            const auto raw_image = cam.GetRawData();
+            BufferPtr raw_image;
+            {
+                std::lock_guard<std::mutex> lock(cam_mtx);
+                raw_image = cam.GetRawDataPtr(true);
+            }
             const auto t_capture_1 = std::chrono::steady_clock::now();
-
-            capture_time_2 += t_capture_1 - last_capture_ts;
+            last_capture_interval_ns.store(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    t_capture_1 - last_capture_ts)
+                    .count());
             last_capture_ts = t_capture_1;
 
-            capture_time += t_capture_1 - t_capture_0;
+            if (raw_image == BufferPtr::Null) {
+                continue;
+            }
+            acquired_counter.fetch_add(1);
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_cam_acq_check >= std::chrono::seconds(1)) {
+                std::lock_guard<std::mutex> lock(cam_mtx);
+                try {
+                    cam_acquired_total.store(cam.GetNumOfAcquiredFrames());
+                    if (cam.GetLinePeriodAvailable()) {
+                        cam_line_period.store(cam.GetLinePeriod());
+                    }
+                    if (cam.GetFrameRateAvailable()) {
+                        cam_frame_rate.store(cam.GetFrameRate());
+                    }
+                    if (cam.GetPacketSizeAvailable()) {
+                        cam_packet_size.store(cam.GetPacketSize());
+                        cam_max_packet_size.store(cam.GetMaxPacketSize());
+                    }
+                } catch (...) {
+                }
+                last_cam_acq_check = now;
+            }
 
-            if (save) {
-                raw_buffers.push_back(std::move(raw_image));
+            if (save.load()) {
+                const size_t needed =
+                    static_cast<size_t>(capture_rows) * cols * 2;
+                Array<uint8_t> raw_copy(needed);
+                std::memcpy(raw_copy.Data(), raw_image.Body(), needed);
+                raw_buffers.push_back(std::move(raw_copy));
                 if (raw_buffers.size() * capture_rows == buffer_rows) {
                     wq.enqueue(std::packaged_task<void()>(
-                        [frame_id = frame_id, buffer_rows = buffer_rows,
+                        [frame_id = frame_id.load(), buffer_rows = buffer_rows,
                          capture_rows = capture_rows, cols = cols,
-                         raw_buffers = std::move(raw_buffers)]() {
+                         raw_buffers = std::move(raw_buffers)]() mutable {
                             std::vector<uint8_t> buf(buffer_rows * cols * 2);
                             int buffer_row_id = 0;
-                            for (const auto &raw_image : raw_buffers) {
+                            for (const auto& raw_image : raw_buffers) {
                                 for (int i = 0; i < capture_rows; i++) {
                                     for (int j = 0; j < cols; j++) {
                                         for (int k = 0; k < 2; k++) {
@@ -278,75 +353,97 @@ class NectarCapturer {
                                << frame_id << ".bin";
                             fout.open(ss.str(),
                                       std::ios::out | std::ios::binary);
-                            fout.write(reinterpret_cast<char *>(buf.data()),
+                            fout.write(reinterpret_cast<char*>(buf.data()),
                                        buf.size());
                             fout.close();
                         }));
-                    frame_id++;
+                    frame_id.store(frame_id.load() + 1);
                     raw_buffers.clear();
                 }
-            } else {
-                if (capture_ind == 0) {
-                    const auto t_viz_0 = std::chrono::steady_clock::now();
-                    viz(raw_image.Data());
-                    const auto t_viz_1 = std::chrono::steady_clock::now();
-                    viz_time += t_viz_1 - t_viz_0;
+            } else if (request_preview.exchange(false)) {
+                const size_t needed =
+                    static_cast<size_t>(capture_rows) * cols * 2;
+                if (raw_image.BodySize() >= needed) {
+                    std::lock_guard<std::mutex> lock(preview_mtx);
+                    std::memcpy(latest_preview.data(), raw_image.Body(),
+                                needed);
+                    preview_ready = true;
                 }
+            }
+        }
+    }
+
+   public:
+    void start_capture_thread(INectaCamera& cam) {
+        if (capture_running.load()) return;
+        capture_running.store(true);
+        capture_thread = std::thread([this, &cam]() { capture_loop(cam); });
+    }
+
+    void stop_capture_thread() {
+        if (!capture_running.load()) return;
+        capture_running.store(false);
+        if (capture_thread.joinable()) {
+            capture_thread.join();
+        }
+    }
+
+    bool is_capture_running() const { return capture_running.load(); }
+
+    int64_t get_expected_interval_ns() const {
+        return expected_capture_interval_ns.load();
+    }
+
+    uint32_t get_acquired_count() const { return acquired_counter.load(); }
+
+    uint32_t get_cam_acquired_total() const {
+        return cam_acquired_total.load();
+    }
+
+    unsigned int get_cam_line_period() const {
+        return cam_line_period.load();
+    }
+
+    float get_cam_frame_rate() const { return cam_frame_rate.load(); }
+
+    unsigned int get_cam_packet_size() const {
+        return cam_packet_size.load();
+    }
+
+    unsigned int get_cam_max_packet_size() const {
+        return cam_max_packet_size.load();
+    }
+
+    void capture(INectaCamera& cam) {
+        const auto t0 = std::chrono::steady_clock::now();
+        request_preview.store(true);
+        bool have_preview = false;
+        {
+            std::lock_guard<std::mutex> lock(preview_mtx);
+            if (preview_ready) {
+                viz(latest_preview.data());
+                have_preview = true;
             }
         }
 
         const auto t1 = std::chrono::steady_clock::now();
         ImGui::Text("rows = %d", capture_rows);
-        if (!save) {
-            draw_image(rgb_texture, rgb_image.data(), cols / 2, capture_rows / 2,
-                       cols / 2, capture_rows / 2);
+        if (have_preview) {
+            draw_image(rgb_texture, rgb_image.data(), cols / 2,
+                       capture_rows / 2, cols / 2, capture_rows / 2);
             draw_image(rgb_crop_texture, rgb_image_cropped.data(), cols / 8,
                        capture_rows / 2, cols / 2, capture_rows / 2);
             draw_image(hist_texture, histogram.data(), hist_w, hist_h, hist_w,
                        hist_h);
         }
         const auto t2 = std::chrono::steady_clock::now();
-        ImGui::Text("capture frames: %d", capture_frames);
-        ImGui::Text("main loop takes: %ld ns", (t1 - t0).count());
-        ImGui::Text("capture takes:   %ld ns", capture_time.count());
-        // removed transpose step timing
-        ImGui::Text("viz takes:       %ld ns", viz_time.count());
-        ImGui::Text("drawing takes:   %ld ns", (t2 - t1).count());
+        ImGui::Text("capture interval: %ld ns",
+                    last_capture_interval_ns.load());
+        ImGui::Text("main loop takes:  %ld ns", (t1 - t0).count());
+        ImGui::Text("drawing takes:    %ld ns", (t2 - t1).count());
         ImGui::Text("fps = %lf", 1e9 / (t2 - last_frame_time).count());
-
-        const double theoretical_bitrate = (1.0 / line_period_s) * 2 * 4096 * 2;
-        const double actual_bitrate = (1e9 / capture_time_2.count()) *
-                                      capture_rows * 4096 * 2 * capture_frames;
-
-        if (actual_bitrate < theoretical_bitrate * 0.9 ||
-            actual_bitrate > theoretical_bitrate * 1.1) {
-            std::cerr << "capture frames:" << capture_frames << "\n";
-            std::cerr << "main loop takes:" << (t1 - t0).count() << "\n";
-            std::cerr << "capture takes:  " << capture_time.count() << "\n";
-            std::cerr << "viz takes:      " << viz_time.count() << "\n";
-            std::cerr << "drawing takes:  " << (t2 - t1).count() << "\n";
-            std::cerr << "Capture time: " << capture_time_2.count()
-                      << " vs expected: "
-                      << static_cast<int64_t>(line_period_s *
-                                              (capture_rows / 2) *
-                                              capture_frames * 1e9)
-                      << " ns" << std::endl;
-            std::cerr << "theoretical bitrate: " << theoretical_bitrate
-                      << " bytes per second" << std::endl;
-            std::cerr << "actual bitrate: " << actual_bitrate
-                      << " bytes per second" << std::endl;
-            std::cerr << "theoretical / actual: "
-                      << theoretical_bitrate / actual_bitrate << std::endl;
-            std::cerr << "----" << std::endl;
-            if (actual_bitrate < theoretical_bitrate) {
-                const int amount =
-                    std::round(theoretical_bitrate / actual_bitrate) - 1;
-                if (amount < 100) {
-                    // hack: the first frame has a huge amount since
-                    // last_capture_ts is 0
-                    dropped_frames += amount;
-                }
-            }
+        if (g_frame_lost_counter) {
+            dropped_frames = static_cast<int>(g_frame_lost_counter->load());
         }
         ImGui::Text("dropped frames %d", dropped_frames);
         last_frame_time = t2;
@@ -354,19 +451,23 @@ class NectarCapturer {
 
     void start_saving() {
         dropped_frames = 0;
-        save = true;
-        frame_id = 0;
+        save.store(true);
+        frame_id.store(0);
+        last_capture_ts = std::chrono::steady_clock::now();
+        if (g_frame_lost_counter) {
+            g_frame_lost_counter->store(0);
+        }
         wq.run_tasks(4);
     }
 
     void stop_saving() {
         dropped_frames = 0;
-        save = false;
+        save.store(false);
         wq.stop();
     }
 };
 
-void print_video_modes(INectaCamera &cam) {
+void print_video_modes(INectaCamera& cam) {
     auto acc = cam.GetAvailableVideoModes();
     for (size_t cc = 0; cc < acc.Size(); cc++) {
         std::cerr << (int)(acc[cc].GetVideoMode()) << std::endl;
@@ -374,35 +475,88 @@ void print_video_modes(INectaCamera &cam) {
     std::cerr << "selected: " << (int)cam.GetVideoMode() << std::endl;
 }
 
-INectaCamera &get_camera() {
-    INectaCamera &cam = INectaCamera::Create();
-    // Get list of connected cameras
-    Array<String> camList = cam.GetCameraList();
-    if (camList.Size() == 0) {
-        std::cerr << "No AlkUSB3 camera found" << std::endl;
-        std::exit(1);
+struct CameraStatus {
+    bool connected = false;
+    std::string last_error;
+    std::string usb_speed;
+    std::string name;
+    std::string serial;
+    std::chrono::steady_clock::time_point last_poll;
+};
+
+void __stdcall on_frame_lost(IVideoSource& source) {
+    (void)source;
+    if (g_frame_lost_counter) {
+        g_frame_lost_counter->fetch_add(1);
     }
+}
 
-    cam.SetCamera(0);
-    cam.Init();
+bool connect_camera(INectaCamera& cam, CameraStatus& status) {
+    try {
+        Array<String> cam_list = cam.GetCameraList();
+        if (cam_list.Size() == 0) {
+            status.connected = false;
+            status.last_error = "No AlkUSB3 camera detected";
+            return false;
+        }
 
-    std::cerr << "bulk: " << cam.GetUseBulkEndPoint() << std::endl;
-    cam.SetUseBulkEndPoint(false);
-    std::cerr << "bulk: " << cam.GetUseBulkEndPoint() << std::endl;
+        if (cam.IsOwnedByAnotherProcess(0)) {
+            status.connected = false;
+            status.last_error = "Camera is owned by another process";
+            return false;
+        }
 
-    cam.SetADCResolution(12);
-    cam.SetVideoMode(1);
-    cam.SetColorCoding(ColorCoding::Raw16);
+        cam.SetCamera(0);
+        cam.Init();
 
-    cam.SetPacketSize(cam.GetMaxPacketSize());
-    cam.SetAcquire(true);
-    return cam;
+        cam.SetUseBulkEndPoint(false);
+        cam.SetADCResolution(12);
+        cam.SetVideoMode(1);
+        cam.SetColorCoding(ColorCoding::Raw16);
+        cam.SetEnableImageThread(false);
+        cam.AllocRawFrames(64);
+        cam.SetPacketSize(cam.GetMaxPacketSize());
+        cam.SetAcquire(true);
+        cam.FrameLost().SetVideoSourceCallback(on_frame_lost);
+        if (g_frame_lost_counter) {
+            g_frame_lost_counter->store(0);
+        }
+
+        status.connected = true;
+        status.last_error.clear();
+        status.usb_speed =
+            cam.GetSuperSpeed() ? "5000 Mb/s (USB 3.x)" : "480 Mb/s (USB 2.0)";
+        status.name = cam.GetName();
+        status.serial = cam.GetSerialNumber();
+        return true;
+    } catch (const Exception& ex) {
+        status.connected = false;
+        status.last_error =
+            std::string("Connect failed: ") + ex.Name() + " " + ex.Message();
+    } catch (...) {
+        status.connected = false;
+        status.last_error = "Connect failed: unknown error";
+    }
+    return false;
+}
+
+void disconnect_camera(INectaCamera& cam, CameraStatus& status) {
+    if (!status.connected) return;
+    try {
+        cam.SetAcquire(false);
+        cam.Close();
+    } catch (...) {
+    }
+    status.connected = false;
+    status.usb_speed.clear();
+    status.name.clear();
+    status.serial.clear();
 }
 
 struct SdlGlGui {
     std::string glsl_version;
     SDL_GLContext gl_context;
-    SDL_Window *window;
+    SDL_Window* window;
     SdlGlGui() {
         // Setup SDL
         if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER |
@@ -462,12 +616,13 @@ struct SdlGlGui {
     }
 };
 
-int main(int argc, char *argv[]) {
+int main(int argc, char* argv[]) {
     SdlGlGui sdl_gl_gui;
+    GlobalOptions::DisableFrequencyMeters = true;
     // Setup Dear ImGui context
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
-    ImGuiIO &io = ImGui::GetIO();
+    ImGuiIO& io = ImGui::GetIO();
 
     ImGui::StyleColorsDark();
 
@@ -476,12 +631,17 @@ int main(int argc, char *argv[]) {
     ImGui_ImplOpenGL3_Init(sdl_gl_gui.glsl_version.c_str());
 
     // Build atlas
-    unsigned char *tex_pixels = NULL;
+    unsigned char* tex_pixels = NULL;
     int tex_w, tex_h;
     io.Fonts->GetTexDataAsRGBA32(&tex_pixels, &tex_w, &tex_h);
     ImVec4 clear_color = ImVec4(0.00f, 0.00f, 0.00f, 1.00f);
-    INectaCamera &cam = get_camera();
+    INectaCamera& cam = INectaCamera::Create();
+    CameraStatus cam_status;
+    const auto poll_interval = std::chrono::milliseconds(250);
+    cam_status.last_poll = std::chrono::steady_clock::now() - poll_interval;
     bool done = false;
+    std::atomic<uint32_t> frame_lost{0};
+    g_frame_lost_counter = &frame_lost;
 
     NectarCapturer nc;
     std::string output_dir;
@@ -509,12 +669,23 @@ int main(int argc, char *argv[]) {
         if (ImGui::Button("Quit")) {
             done = true;
         }
-        if (nc.save) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - cam_status.last_poll >= poll_interval) {
+            cam_status.last_poll = now;
+            if (!cam_status.connected) {
+                if (connect_camera(cam, cam_status)) {
+                    if (!nc.is_capture_running()) {
+                        nc.start_capture_thread(cam);
+                    }
+                }
+            }
+        }
+        if (nc.save.load()) {
             if (ImGui::Button("Stop saving")) {
                 nc.stop_saving();
             }
         } else {
-            if (ImGui::Button("Start saving")) {
+            if (ImGui::Button("Start saving") && cam_status.connected) {
                 nc.start_saving();
                 std::stringstream ss;
                 const auto now = std::chrono::system_clock::now();
@@ -526,23 +697,130 @@ int main(int argc, char *argv[]) {
                 std::filesystem::create_directory(output_dir);
                 std::filesystem::current_path(output_dir);
             }
+            if (!cam_status.connected) {
+                ImGui::Text("Connect a camera to start saving.");
+            }
         }
-        if (!nc.save) {
-            ImGui::SliderInt("analog_gain", &nc.analog_gain, 0, 20);
-            ImGui::SliderInt("cds_gain", &nc.cds_gain, 0, 1);
-            ImGui::SliderInt("shutterspeed (* 100 ns)", &nc.shutterspeed, 0,
-                             10000);
+        if (!nc.save.load()) {
+            int analog_gain = nc.analog_gain.load();
+            int cds_gain = nc.cds_gain.load();
+            int shutter = nc.shutterspeed.load();
+            if (ImGui::SliderInt("analog_gain", &analog_gain, 0, 20)) {
+                nc.analog_gain.store(analog_gain);
+            }
+            if (ImGui::SliderInt("cds_gain", &cds_gain, 0, 1)) {
+                nc.cds_gain.store(cds_gain);
+            }
+            if (ImGui::SliderInt("shutterspeed (* 100 ns)", &shutter, 0,
+                                 10000)) {
+                nc.shutterspeed.store(shutter);
+            }
         } else {
             ImGui::Text("Saving to: %s", output_dir.c_str());
         }
+        static auto last_diag = std::chrono::steady_clock::now();
+        static uint32_t last_acq_count = 0;
+        static double last_acq_fps = 0.0;
+        static uint32_t last_acq_total = 0;
+        static uint32_t last_cam_acq_total = 0;
+        static uint32_t last_cam_acq_delta = 0;
+        static uint32_t last_lost_count = 0;
+        static double last_lost_fps = 0.0;
+        static uint32_t last_lost_total = 0;
+        if (cam_status.connected && nc.is_capture_running()) {
+            const auto dt =
+                std::chrono::duration<double>(now - last_diag).count();
+            if (dt >= 1.0) {
+                const uint32_t acq_total = nc.get_acquired_count();
+                const uint32_t acq_delta =
+                    acq_total >= last_acq_total ? (acq_total - last_acq_total)
+                                                : acq_total;
+                last_acq_total = acq_total;
+                last_acq_count = acq_delta;
+                last_acq_fps = acq_delta / dt;
+                const uint32_t cam_acq_total = nc.get_cam_acquired_total();
+                const uint32_t cam_delta =
+                    cam_acq_total >= last_cam_acq_total
+                        ? (cam_acq_total - last_cam_acq_total)
+                        : cam_acq_total;
+                last_cam_acq_total = cam_acq_total;
+                last_cam_acq_delta = cam_delta;
+                if (g_frame_lost_counter) {
+                    const uint32_t lost_total =
+                        static_cast<uint32_t>(g_frame_lost_counter->load());
+                    const uint32_t lost_delta =
+                        lost_total >= last_lost_total
+                            ? (lost_total - last_lost_total)
+                            : lost_total;
+                    last_lost_total = lost_total;
+                    last_lost_count = lost_delta;
+                    last_lost_fps = lost_delta / dt;
+                }
+                const int64_t expected_interval = nc.get_expected_interval_ns();
+                const double expected_fps =
+                    expected_interval > 0 ? 1e9 / expected_interval : 0.0;
+                const unsigned int cam_line_period = nc.get_cam_line_period();
+                const float cam_frame_rate = nc.get_cam_frame_rate();
+                const unsigned int cam_packet = nc.get_cam_packet_size();
+                const unsigned int cam_packet_max =
+                    nc.get_cam_max_packet_size();
+                std::cerr << "diag: acquired_fps=" << std::fixed
+                          << std::setprecision(2) << last_acq_fps
+                          << " acquired_frames=" << last_acq_count
+                          << " cam_acquired_frames=" << last_cam_acq_delta
+                          << " app_vs_cam_delta="
+                          << (static_cast<int64_t>(last_cam_acq_delta) -
+                              static_cast<int64_t>(last_acq_count))
+                          << " lost_fps=" << last_lost_fps
+                          << " lost_frames=" << last_lost_count
+                          << " expected_fps=" << expected_fps
+                          << " expected_interval_ns=" << expected_interval
+                          << " cam_line_period=" << cam_line_period
+                          << " cam_frame_rate=" << cam_frame_rate
+                          << " cam_packet=" << cam_packet
+                          << " cam_packet_max=" << cam_packet_max
+                          << std::endl;
+                last_diag = now;
+            }
+        }
+
+        if (cam_status.connected) {
+            ImGui::Text("Camera: %s", cam_status.name.c_str());
+            ImGui::Text("Serial: %s", cam_status.serial.c_str());
+            ImGui::Text("USB link: %s", cam_status.usb_speed.c_str());
+            ImGui::Text("acquired fps: %.2f", last_acq_fps);
+            ImGui::Text("acquired frames (1s): %u", last_acq_count);
+            ImGui::Text("lost fps: %.2f", last_lost_fps);
+            ImGui::Text("lost frames (1s): %u", last_lost_count);
+            ImGui::Text("expected interval: %ld ns",
+                        nc.get_expected_interval_ns());
+            const int64_t expected_interval = nc.get_expected_interval_ns();
+            if (expected_interval > 0) {
+                const double expected_fps = 1e9 / expected_interval;
+                ImGui::Text("expected fps: %.2f", expected_fps);
+            }
+        } else {
+            ImGui::Text("Camera: not connected");
+            if (!cam_status.last_error.empty()) {
+                ImGui::Text("Status: %s", cam_status.last_error.c_str());
+            } else {
+                ImGui::Text("Status: polling for camera...");
+            }
+        }
         try {
-            nc.capture(cam);
-        } catch (const Exception &ex) {
+            if (cam_status.connected) {
+                nc.capture(cam);
+            }
+        } catch (const Exception& ex) {
             std::cerr << "Exception " << ex.Name() << " occurred" << std::endl
                       << ex.Message() << std::endl;
             ImGui::Text("Exception %s %s", ex.Name(), ex.Message());
+            disconnect_camera(cam, cam_status);
+            nc.stop_saving();
         } catch (...) {
             std::cerr << "Unhandled exception" << std::endl;
+            disconnect_camera(cam, cam_status);
+            nc.stop_saving();
         }
         ImGui::End();
         ImGui::PopStyleVar(1);
@@ -555,8 +833,11 @@ int main(int argc, char *argv[]) {
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         SDL_GL_SwapWindow(sdl_gl_gui.window);
     }
+    nc.stop_capture_thread();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplSDL2_Shutdown();
     ImGui::DestroyContext();
+    disconnect_camera(cam, cam_status);
+    INectaCamera::Destroy(cam);
     return 0;
 }
