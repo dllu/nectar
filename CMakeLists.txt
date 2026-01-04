@@ -29,18 +29,33 @@ include_directories(${NECTA_INCLUDE_DIRS})
 link_directories(${NECTA_LIBRARY_DIRS})
 
 include_directories(imgui)
-add_executable(necta
+set(IMGUI_SOURCES
     imgui/imgui.cpp
     imgui/imgui_draw.cpp
     imgui/imgui_impl_opengl3.cpp
     imgui/imgui_impl_sdl2.cpp
     imgui/imgui_tables.cpp
     imgui/imgui_widgets.cpp
+)
+
+add_executable(necta
+    ${IMGUI_SOURCES}
     src/main.cpp
+    src/utils.cpp
 )
 find_library(DW_LIB dw)
+target_link_libraries(necta ${NECTA_LIBRARIES})
+
+add_executable(review
+    ${IMGUI_SOURCES}
+    src/review.cpp
+    src/utils.cpp
+)
+target_link_libraries(review ${NECTA_LIBRARIES})
+
 if(DW_LIB)
     target_compile_definitions(necta PRIVATE BACKWARD_HAS_DW=1)
+    target_compile_definitions(review PRIVATE BACKWARD_HAS_DW=1)
     target_link_libraries(necta ${DW_LIB})
+    target_link_libraries(review ${DW_LIB})
 endif()
-target_link_libraries(necta ${NECTA_LIBRARIES})

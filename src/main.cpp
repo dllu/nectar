@@ -2,6 +2,7 @@
 #include <shared/GlobalOptions.h>
 
 #include "backward.hpp"
+#include "utils.hpp"
 #include <SDL.h>
 #include <SDL_opengl.h>
 #include <imgui.h>
@@ -33,8 +34,6 @@ backward::SignalHandling signal_handler;
 }
 
 static std::atomic<uint32_t>* g_frame_lost_counter = nullptr;
-static constexpr float slider_track_height = 50.0f;
-static constexpr float slider_corner_radius = 20.0f;
 
 class WorkQueue {
     std::mutex mtx_;
@@ -529,98 +528,6 @@ void __stdcall on_frame_lost(IVideoSource& source) {
     }
 }
 
-bool draw_thick_slider_int(const char* label, int* value, int min_value,
-                           int max_value) {
-    const int range = max_value - min_value;
-    if (range <= 0) {
-        return false;
-    }
-    ImGui::Text("%s: %d", label, *value);
-    ImGui::PushID(label);
-    const float slider_height = slider_track_height;
-    float slider_width = ImGui::GetContentRegionAvail().x;
-    slider_width = std::max(slider_width, 100.0f);
-    const float handle_width = std::max(50.0f, slider_width * 0.12f);
-    const float slider_travel = std::max(slider_width - handle_width, 0.0f);
-    const float normalized =
-        std::clamp(static_cast<float>(*value - min_value) / range, 0.0f, 1.0f);
-    ImVec2 slider_pos = ImGui::GetCursorScreenPos();
-    const float handle_x =
-        slider_pos.x + (slider_travel > 0 ? normalized * slider_travel : 0.0f);
-    ImGui::InvisibleButton("##thick_slider",
-                           ImVec2(slider_width, slider_height));
-    ImDrawList* draw_list = ImGui::GetWindowDrawList();
-    const ImU32 track_color = ImGui::GetColorU32(ImGuiCol_FrameBg);
-    const ImU32 border_color = ImGui::GetColorU32(ImGuiCol_Border);
-    const ImU32 handle_color = ImGui::GetColorU32(ImGuiCol_SliderGrab);
-    ImVec2 slider_end(slider_pos.x + slider_width,
-                      slider_pos.y + slider_height);
-    const float rounding = std::min(slider_corner_radius, slider_height * 0.5f);
-    draw_list->AddRectFilled(slider_pos, slider_end, track_color, rounding);
-    ImVec2 handle_min(handle_x, slider_pos.y);
-    ImVec2 handle_max(handle_x + handle_width, slider_pos.y + slider_height);
-    draw_list->AddRectFilled(handle_min, handle_max, handle_color, rounding);
-    draw_list->AddRect(handle_min, handle_max, border_color, rounding);
-    bool changed = false;
-    const bool interacting =
-        (ImGui::IsItemActive() && ImGui::GetIO().MouseDown[0]) ||
-        (ImGui::IsItemHovered() && ImGui::IsMouseClicked(0));
-    if (interacting) {
-        const float mouse_x = ImGui::GetIO().MousePos.x;
-        float new_pos = mouse_x - slider_pos.x - handle_width * 0.5f;
-        new_pos = std::clamp(new_pos, 0.0f, slider_travel);
-        const float denom = slider_travel > 0 ? slider_travel : 1.0f;
-        const float new_norm = new_pos / denom;
-        const int new_value =
-            min_value + static_cast<int>(std::round(new_norm * range));
-        if (new_value != *value) {
-            *value = new_value;
-            changed = true;
-        }
-    }
-    ImGui::Dummy(ImVec2(0.0f, 10.0f));
-    ImGui::PopID();
-    return changed;
-}
-
-bool draw_large_checkbox(const char* label, bool* value) {
-    ImGui::Text("%s: %s", label, *value ? "on" : "off");
-    ImGui::PushID(label);
-    const ImVec2 box_size(slider_track_height, slider_track_height);
-    const ImVec2 pos = ImGui::GetCursorScreenPos();
-    ImGui::InvisibleButton("##large_checkbox", box_size);
-    const bool clicked = ImGui::IsItemClicked();
-    ImDrawList* draw_list = ImGui::GetWindowDrawList();
-    const float rounding =
-        std::min(slider_corner_radius, slider_track_height * 0.5f);
-    const ImU32 bg_color = ImGui::GetColorU32(ImGuiCol_FrameBg);
-    const ImU32 active_color = ImGui::GetColorU32(ImGuiCol_SliderGrabActive);
-    const ImU32 border_color = ImGui::GetColorU32(ImGuiCol_Border);
-    const ImU32 check_color = ImGui::GetColorU32(ImGuiCol_CheckMark);
-    const ImVec2 box_end(pos.x + box_size.x, pos.y + box_size.y);
-    draw_list->AddRectFilled(pos, box_end, *value ? active_color : bg_color,
-                             rounding);
-    draw_list->AddRect(pos, box_end, border_color, rounding);
-    if (*value) {
-        const ImVec2 start(pos.x + box_size.x * 0.25f,
-                           pos.y + box_size.y * 0.55f);
-        const ImVec2 mid(pos.x + box_size.x * 0.45f,
-                         pos.y + box_size.y * 0.75f);
-        const ImVec2 end(pos.x + box_size.x * 0.75f,
-                         pos.y + box_size.y * 0.3f);
-        draw_list->AddLine(start, mid, check_color, 5.0f);
-        draw_list->AddLine(mid, end, check_color, 5.0f);
-    }
-    bool changed = false;
-    if (clicked) {
-        *value = !*value;
-        changed = true;
-    }
-    ImGui::Dummy(ImVec2(0.0f, 10.0f));
-    ImGui::PopID();
-    return changed;
-}
-
 bool connect_camera(INectaCamera& cam, CameraStatus& status) {
     try {
         Array<String> cam_list = cam.GetCameraList();
@@ -792,7 +699,7 @@ int main(int argc, char* argv[]) {
         const auto now = std::chrono::system_clock::now();
         const time_t itt = std::chrono::system_clock::to_time_t(now);
         const auto gt = std::gmtime(&itt);
-        ss << "/home/dllu/pictures/linescan/" << std::put_time(gt, "%F-%H-%M-%S");
+        ss << nectar::k_capture_root << "/" << std::put_time(gt, "%F-%H-%M-%S");
         output_dir = ss.str();
         std::filesystem::create_directory(output_dir);
         std::filesystem::current_path(output_dir);
@@ -850,7 +757,7 @@ int main(int argc, char* argv[]) {
                 }
             }
         }
-        const ImVec2 save_button_size(220.0f, slider_track_height);
+        const ImVec2 save_button_size(220.0f, nectar::k_slider_track_height);
         if (nc.save.load()) {
             if (ImGui::Button("Stop saving", save_button_size)) {
                 stop_capture_session();
@@ -866,16 +773,17 @@ int main(int argc, char* argv[]) {
         }
         if (!nc.save.load()) {
             bool cds_gain_enabled = nc.cds_gain.load() != 0;
-            if (draw_large_checkbox("cds_gain", &cds_gain_enabled)) {
+            if (nectar::draw_large_checkbox("cds_gain", &cds_gain_enabled)) {
                 nc.cds_gain.store(cds_gain_enabled ? 1 : 0);
             }
             int analog_gain = nc.analog_gain.load();
             int shutter = nc.shutterspeed.load();
-            if (draw_thick_slider_int("analog_gain", &analog_gain, 0, 20)) {
+            if (nectar::draw_thick_slider_int("analog_gain", &analog_gain, 0,
+                                              20)) {
                 nc.analog_gain.store(analog_gain);
             }
-            if (draw_thick_slider_int("shutterspeed (* 100 ns)", &shutter, 0,
-                                      10000)) {
+            if (nectar::draw_thick_slider_int("shutterspeed (* 100 ns)",
+                                              &shutter, 0, 10000)) {
                 nc.shutterspeed.store(shutter);
             }
         } else {
@@ -883,7 +791,7 @@ int main(int argc, char* argv[]) {
         }
         ImGui::Separator();
         ImGui::Text("Zoom preview position");
-        const float slider_height = slider_track_height;
+        const float slider_height = nectar::k_slider_track_height;
         const float slider_width = ImGui::GetContentRegionAvail().x;
         const float handle_ratio =
             static_cast<float>(nc.get_crop_width()) /
@@ -903,8 +811,8 @@ int main(int argc, char* argv[]) {
         ImDrawList* draw_list = ImGui::GetWindowDrawList();
         const ImU32 track_color = ImGui::GetColorU32(ImGuiCol_FrameBg);
         const ImU32 border_color = ImGui::GetColorU32(ImGuiCol_Border);
-        const float rounding =
-            std::min(slider_corner_radius, slider_height * 0.5f);
+        const float rounding = std::min(nectar::k_slider_corner_radius,
+                                        slider_height * 0.5f);
         ImVec2 slider_end(slider_pos.x + slider_width,
                           slider_pos.y + slider_height);
         draw_list->AddRectFilled(slider_pos, slider_end, track_color, rounding);
@@ -1015,7 +923,7 @@ int main(int argc, char* argv[]) {
                 ImGui::Text("Status: polling for camera...");
             }
         }
-        const ImVec2 quit_button_size(220.0f, slider_track_height);
+        const ImVec2 quit_button_size(220.0f, nectar::k_slider_track_height);
         const ImVec2 content_max = ImGui::GetWindowContentRegionMax();
         const float current_x = ImGui::GetCursorPosX();
         const float current_y = ImGui::GetCursorPosY();
@@ -1034,7 +942,8 @@ int main(int argc, char* argv[]) {
         }
         if (ImGui::BeginPopupModal("Confirm Quit", nullptr,
                                    ImGuiWindowFlags_AlwaysAutoResize)) {
-            const ImVec2 confirm_button_size(180.0f, slider_track_height);
+            const ImVec2 confirm_button_size(180.0f,
+                                             nectar::k_slider_track_height);
             ImGui::Text("Are you sure you want to exit?");
             if (ImGui::Button("Cancel", confirm_button_size)) {
                 ImGui::CloseCurrentPopup();
