@@ -715,8 +715,10 @@ int main(int argc, char* argv[]) {
     while (!done) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
-            ImGui_ImplSDL2_ProcessEvent(&event);
             touch_handler.handle_event(event, sdl_gl_gui.window);
+            if (!touch_handler.should_ignore_event(event)) {
+                ImGui_ImplSDL2_ProcessEvent(&event);
+            }
             if (event.type == SDL_QUIT) request_quit_popup = true;
             if (event.type == SDL_WINDOWEVENT &&
                 event.window.event == SDL_WINDOWEVENT_CLOSE &&

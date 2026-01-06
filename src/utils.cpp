@@ -59,6 +59,19 @@ void TouchHandler::reset() {
     finger_id_ = 0;
 }
 
+bool TouchHandler::should_ignore_event(const SDL_Event& event) const {
+    if (event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_MOUSEBUTTONUP) {
+        return event.button.which == SDL_TOUCH_MOUSEID;
+    }
+    if (event.type == SDL_MOUSEMOTION) {
+        return event.motion.which == SDL_TOUCH_MOUSEID;
+    }
+    if (event.type == SDL_MOUSEWHEEL) {
+        return event.wheel.which == SDL_TOUCH_MOUSEID;
+    }
+    return false;
+}
+
 bool draw_thick_slider_int(const char* label, int* value, int min_value,
                            int max_value) {
     const int range = max_value - min_value;

@@ -20,6 +20,7 @@ void configure_sdl_touch();
 class TouchHandler {
    public:
     bool handle_event(const SDL_Event& event, SDL_Window* window);
+    bool should_ignore_event(const SDL_Event& event) const;
     void reset();
 
    private:
