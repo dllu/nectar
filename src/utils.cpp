@@ -11,9 +11,6 @@ void configure_sdl_touch() {
 }
 
 bool TouchHandler::handle_event(const SDL_Event& event, SDL_Window* window) {
-    if (window == nullptr) {
-        return false;
-    }
     if (event.type != SDL_FINGERDOWN && event.type != SDL_FINGERMOTION &&
         event.type != SDL_FINGERUP) {
         return false;
@@ -25,38 +22,68 @@ bool TouchHandler::handle_event(const SDL_Event& event, SDL_Window* window) {
         }
         active_ = true;
         finger_id_ = finger_id;
+        pending_down_ = true;
     } else if (!active_ || finger_id != finger_id_) {
         return false;
     }
 
+    norm_x_ = event.tfinger.x;
+    norm_y_ = event.tfinger.y;
+    have_pos_ = true;
+
+    if (event.type == SDL_FINGERUP) {
+        pending_up_ = true;
+        active_ = false;
+    }
+    return true;
+}
+
+void TouchHandler::apply_to_imgui(SDL_Window* window) {
+    if (window == nullptr) {
+        return;
+    }
+    if (!have_pos_ && !pending_down_ && !pending_up_ && !active_ &&
+        !button_down_) {
+        return;
+    }
     int window_w = 0;
     int window_h = 0;
     SDL_GetWindowSize(window, &window_w, &window_h);
     if (window_w <= 0 || window_h <= 0) {
-        return false;
+        return;
     }
 
     ImGuiIO& io = ImGui::GetIO();
     io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);
-    const float pos_x = event.tfinger.x * window_w;
-    const float pos_y = event.tfinger.y * window_h;
-    io.AddMousePosEvent(pos_x, pos_y);
-
-    if (event.type == SDL_FINGERDOWN) {
+    if (have_pos_ && (active_ || button_down_ || pending_down_ || pending_up_)) {
+        const float pos_x = norm_x_ * window_w;
+        const float pos_y = norm_y_ * window_h;
+        io.AddMousePosEvent(pos_x, pos_y);
+    }
+    if (pending_down_) {
         io.AddMouseButtonEvent(0, true);
-        return true;
+        button_down_ = true;
+        pending_down_ = false;
     }
-    if (event.type == SDL_FINGERUP) {
+    if (pending_up_) {
         io.AddMouseButtonEvent(0, false);
-        active_ = false;
-        return true;
+        button_down_ = false;
+        pending_up_ = false;
     }
-    return true;
+    if (!active_ && !button_down_) {
+        have_pos_ = false;
+    }
 }
 
 void TouchHandler::reset() {
     active_ = false;
     finger_id_ = 0;
+    norm_x_ = 0.0f;
+    norm_y_ = 0.0f;
+    have_pos_ = false;
+    pending_down_ = false;
+    pending_up_ = false;
+    button_down_ = false;
 }
 
 bool TouchHandler::should_ignore_event(const SDL_Event& event) const {

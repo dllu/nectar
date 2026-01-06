@@ -20,12 +20,19 @@ void configure_sdl_touch();
 class TouchHandler {
    public:
     bool handle_event(const SDL_Event& event, SDL_Window* window);
+    void apply_to_imgui(SDL_Window* window);
     bool should_ignore_event(const SDL_Event& event) const;
     void reset();
 
    private:
     bool active_ = false;
     SDL_FingerID finger_id_ = 0;
+    float norm_x_ = 0.0f;
+    float norm_y_ = 0.0f;
+    bool have_pos_ = false;
+    bool pending_down_ = false;
+    bool pending_up_ = false;
+    bool button_down_ = false;
 };
 
 }  // namespace nectar

@@ -470,6 +470,7 @@ int main(int argc, char** argv) {
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL2_NewFrame();
+        touch_handler.apply_to_imgui(sdl_gl_gui.window);
         ImGui::NewFrame();
         ImGui::SetNextWindowPos(ImVec2(0, 0));
         ImGui::SetNextWindowSize(io.DisplaySize);
