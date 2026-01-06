@@ -28,7 +28,12 @@ CAMERA_MODEL_NAME = "Alkeria Necta N4K2-7C"
 ENABLE_COLUMN_JITTER_CORRECTION = True
 STRUCTURE_MASK_DOWNSAMPLE = 8
 STRUCTURE_MASK_THRESHOLD = 0.05
-STRUCTURE_MASK_DILATE_PX = 64
+STRUCTURE_MASK_DILATE_PX = 128
+ENABLE_JITTER_DEBUG_PLOT = True
+JITTER_DEBUG_ROW = 2000
+JITTER_DOWNSAMPLE_Y = 4
+JITTER_BLUR_ITER = 2
+JITTER_X_SCALE = 32768.0
 
 
 def _normalize_rows(matrix: np.ndarray) -> np.ndarray:
@@ -626,19 +631,38 @@ def bin2to1(data):
     return (data[::2, ::2] + data[1::2, ::2] + data[::2, 1::2] + data[1::2, 1::2]) / 4
 
 
-def compute_structure_energy_downsampled(
-    bin_path: Path, max_green: float, downsample: int
-) -> np.ndarray:
-    dat1 = np.fromfile(bin_path, dtype=np.uint16).astype(np.float32)
-    dat1_reshaped = np.reshape(dat1, (-1, 4096)).T
-    raw_green = dat1_reshaped[1::2, 1::2]
-    for _ in range(int(math.log2(downsample))):
-        raw_green = bin2to1(raw_green)
+def bin_vertical(data: np.ndarray, factor: int) -> np.ndarray:
+    if factor <= 1:
+        return data
+    h = (data.shape[0] // factor) * factor
+    if h == 0:
+        return np.empty((0,) + data.shape[1:], dtype=data.dtype)
+    trimmed = data[:h, ...]
+    reshaped = trimmed.reshape(h // factor, factor, *data.shape[1:])
+    return reshaped.mean(axis=1)
 
-    grad_y, grad_x = np.gradient(raw_green)
-    magnitude = np.sqrt(grad_x**2 + grad_y**2) + 0.1 * max_green
-    energy = np.abs(grad_x) / magnitude
-    return energy
+
+def box_blur_1d(vec: np.ndarray, radius: int) -> np.ndarray:
+    if radius <= 0 or vec.size == 0:
+        return vec
+    window = 2 * radius + 1
+    pad = np.pad(vec, (radius, radius), mode="edge")
+    csum = np.cumsum(pad, dtype=np.float64)
+    csum = np.concatenate(([0.0], csum))
+    blurred = (csum[window:] - csum[:-window]) / window
+    return blurred.astype(vec.dtype, copy=False)
+
+
+def box_blur_vertical(data: np.ndarray, radius: int, iterations: int) -> np.ndarray:
+    if iterations <= 0 or radius <= 0 or data.size == 0:
+        return data
+    blurred = data.astype(np.float32, copy=False)
+    for _ in range(iterations):
+        out = np.empty_like(blurred)
+        for col in range(blurred.shape[1]):
+            out[:, col] = box_blur_1d(blurred[:, col], radius)
+        blurred = out
+    return blurred
 
 
 def estimate_white_balance(bin_paths, max_samples: int = 8) -> np.ndarray:
@@ -736,9 +760,21 @@ def weighted_linear_regression(y, x, w, prior_beta=None, prior_weight=0.0):
     """
     n = len(x)
     ind = np.arange(n)
+    wsum = np.sum(w)
+    if wsum <= 0:
+        raise ValueError("Weights must sum to a positive value.")
 
-    # Design matrix: columns [1, x, ind]
-    X = np.column_stack((np.ones_like(x), x, ind))
+    x_mean = np.sum(w * x) / wsum
+    x_scale = float(JITTER_X_SCALE)
+    ind_mean = (n - 1) / 2.0
+    ind_var = (n**2 - 1) / 12.0
+    ind_scale = math.sqrt(ind_var) if ind_var > 1e-6 else 1.0
+
+    x_norm = (x - x_mean) / x_scale
+    ind_norm = (ind - ind_mean) / ind_scale
+
+    # Design matrix: columns [1, x_norm, ind_norm]
+    X = np.column_stack((np.ones_like(x_norm), x_norm, ind_norm))
     wX = w[:, None] * X  # n x 3
     XtWX = X.T @ wX  # 3 x 3
 
@@ -747,21 +783,35 @@ def weighted_linear_regression(y, x, w, prior_beta=None, prior_weight=0.0):
 
     if prior_beta is not None and prior_weight > 0:
         prior_beta = np.asarray(prior_beta, dtype=np.float64)
-        scale = np.mean(np.diag(XtWX))
-        if not np.isfinite(scale) or scale <= 0:
-            scale = 1.0
-        prior_weight_scaled = prior_weight * scale
+        prior_beta_norm = np.array(
+            [
+                prior_beta[0] + prior_beta[1] * x_mean + prior_beta[2] * ind_mean,
+                prior_beta[1] * x_scale,
+                prior_beta[2] * ind_scale,
+            ],
+            dtype=np.float64,
+        )
+        prior_weight_scaled = prior_weight
         XtWX += prior_weight_scaled * np.eye(X.shape[1])
-        XtWy += prior_weight_scaled * prior_beta
+        XtWy += prior_weight_scaled * prior_beta_norm
 
         # print("prior weight:", prior_weight_scaled, scale)
     # Solve XtWX @ beta = XtWy for beta
     try:
-        beta = np.linalg.solve(XtWX, XtWy)
+        beta_norm = np.linalg.solve(XtWX, XtWy)
     except np.linalg.LinAlgError:
         if prior_beta is not None:
             return prior_beta
         raise
+    a_norm, b_norm, c_norm = beta_norm
+    beta = np.array(
+        [
+            a_norm - b_norm * x_mean / x_scale - c_norm * ind_mean / ind_scale,
+            b_norm / x_scale,
+            c_norm / ind_scale,
+        ],
+        dtype=np.float64,
+    )
     return beta
 
 
@@ -816,7 +866,17 @@ def column_exposure_jitter_correction(
     sigma=500,
     mask_bins=None,
     mask_scale: int = 1,
+    debug_preview: dict | None = None,
 ):
+    downsample_factor = max(1, JITTER_DOWNSAMPLE_Y)
+    blur_radius = max(1, STRUCTURE_MASK_DILATE_PX // (4 * JITTER_DOWNSAMPLE_Y))
+
+    def preprocess_column(vec: np.ndarray) -> np.ndarray:
+        out = bin_vertical(vec, downsample_factor)
+        for _ in range(JITTER_BLUR_ITER):
+            out = box_blur_1d(out, blur_radius)
+        return out
+
     n_cols = red_view.width
 
     off_r = np.zeros(n_cols)
@@ -831,18 +891,34 @@ def column_exposure_jitter_correction(
         [np.zeros(n_cols - 1), np.ones(n_cols - 1), np.zeros(n_cols - 1)]
     )
 
-    red_prev = red_view[:, 0]
-    green_prev = 0.5 * (green1[:, 0] + green2[:, 0])
-    blue_prev = blue_view[:, 0]
+    red_prev = preprocess_column(red_view[:, 0])
+    green_prev = preprocess_column(0.5 * (green1[:, 0] + green2[:, 0]))
+    blue_prev = preprocess_column(blue_view[:, 0])
     cache = red_view.cache
     cum_cols = cache.cum_cols
     file_idx = 0
     next_boundary = cum_cols[file_idx + 1]
+    preview_sum = None
+    preview_count = None
+    preview_group = None
+    preview_height = None
+    preview_width = None
+    if debug_preview is not None and mask_scale > 0:
+        preview_height = green1.height // mask_scale
+        preview_width = n_cols // mask_scale
+        if preview_height > 0 and preview_width > 0:
+            preview_sum = np.zeros((preview_height, preview_width), dtype=np.float64)
+            preview_count = np.zeros((preview_width,), dtype=np.int64)
+            if mask_scale % downsample_factor == 0:
+                preview_group = mask_scale // downsample_factor
+    residual_image = None
+    if ENABLE_JITTER_DEBUG_PLOT and red_prev.size > 0:
+        residual_image = np.zeros((red_prev.size, n_cols - 1), dtype=np.float32)
 
     for col in tqdm(range(1, n_cols), desc="column exposure jitter"):
-        red_curr = red_view[:, col]
-        green_curr = 0.5 * (green1[:, col] + green2[:, col])
-        blue_curr = blue_view[:, col]
+        red_curr = preprocess_column(red_view[:, col])
+        green_curr = preprocess_column(0.5 * (green1[:, col] + green2[:, col]))
+        blue_curr = preprocess_column(blue_view[:, col])
 
         red_delta = red_curr - red_prev
         green_delta = green_curr - green_prev
@@ -872,7 +948,8 @@ def column_exposure_jitter_correction(
                     local_green = local_green // mask_scale
                 mask_bin = mask_bins[file_idx]
                 if mask_bin.size > 0 and 0 <= local_green < mask_bin.shape[1]:
-                    row_idx = np.arange(weight.size) // mask_scale
+                    row_idx = np.arange(weight.size) * downsample_factor
+                    row_idx = row_idx // mask_scale
                     row_idx = np.minimum(row_idx, mask_bin.shape[0] - 1)
                     weight[mask_bin[row_idx, local_green]] = 0
 
@@ -887,10 +964,42 @@ def column_exposure_jitter_correction(
                 gray_prev,
                 weight,
                 prior_beta=np.array([0, 1, 0]),
-                prior_weight=1e-9,
+                prior_weight=1e2,
             )
 
         betas[col - 1, :] = beta
+
+        if preview_sum is not None:
+            mask_col = col // mask_scale
+            if mask_col < preview_width:
+                if preview_group is not None and preview_height > 0:
+                    h = preview_height * preview_group
+                    if h > 0:
+                        downs = (
+                            green_curr[:h]
+                            .reshape(preview_height, preview_group)
+                            .mean(axis=1)
+                        )
+                    else:
+                        downs = np.zeros((preview_height,), dtype=np.float32)
+                else:
+                    row_idx_full = np.arange(green_curr.size) * downsample_factor
+                    mask_row = row_idx_full // mask_scale
+                    mask_row = np.clip(mask_row, 0, preview_height - 1)
+                    downs = np.zeros((preview_height,), dtype=np.float32)
+                    np.add.at(downs, mask_row, green_curr)
+                    counts = np.zeros((preview_height,), dtype=np.int64)
+                    np.add.at(counts, mask_row, 1)
+                    downs = downs / np.maximum(counts, 1)
+                preview_sum[:, mask_col] += downs
+                preview_count[mask_col] += 1
+        if residual_image is not None:
+            gray_curr = np.column_stack((red_curr, green_curr, blue_curr)).mean(axis=1)
+            gray_prev = np.column_stack((red_prev, green_prev, blue_prev)).mean(axis=1)
+            residual = gray_curr - apply_column_correction(gray_prev, beta)
+            residual_image[:, col - 1] = (residual * weight).astype(
+                np.float32, copy=False
+            )
 
         red_prev = red_curr
         green_prev = green_curr
@@ -905,6 +1014,34 @@ def column_exposure_jitter_correction(
             beta = (1 - lamb) * compose_model(
                 invert_model(betas[col]), beta
             ) + lamb * np.array([0, 1, 0])
+    if residual_image is not None:
+        max_abs = float(np.max(np.abs(residual_image))) if residual_image.size else 0.0
+        if max_abs <= 0:
+            max_abs = 1.0
+        cmap_name = "berlin"
+        try:
+            cmap = plt.get_cmap(cmap_name)
+        except ValueError:
+            cmap = plt.get_cmap("seismic")
+        plt.figure(figsize=(12, 6), dpi=300)
+        plt.imshow(
+            residual_image,
+            cmap=cmap,
+            vmin=-max_abs,
+            vmax=max_abs,
+            aspect="auto",
+            origin="lower",
+        )
+        plt.colorbar(label="signed residual")
+        plt.xlabel("column index (pair)")
+        plt.ylabel("row (downsampled)")
+        plt.title("Jitter residuals")
+        plt.tight_layout()
+        plt.savefig(g / "jitter_residuals.png")
+        plt.close()
+    if preview_sum is not None:
+        counts = np.maximum(preview_count, 1)[None, :]
+        debug_preview["green"] = (preview_sum / counts).astype(np.float32, copy=False)
     return global_models
 
     # DEBUG!!!
@@ -1435,20 +1572,36 @@ def process_preview(
     green2 = ChannelView(data, row_offset=0, col_offset=0)
 
     energy_bins = []
+    green_bins = []
     mask_widths = []
-    for bin_path in tqdm(selected_bins, desc="stripe mask"):
-        energy_down = compute_structure_energy_downsampled(
-            bin_path, max_green_down, STRUCTURE_MASK_DOWNSAMPLE
-        )
+    for i, _bin_path in tqdm(
+        enumerate(selected_bins), total=len(selected_bins), desc="stripe mask"
+    ):
+        start = cache.cum_cols[i] // green1.col_step
+        stop = cache.cum_cols[i + 1] // green1.col_step
+        raw_green = green1[:, slice(start, stop)]
+        for _ in range(downsample_steps):
+            raw_green = bin2to1(raw_green)
+        green_bins.append(raw_green)
+
+        grad_y, grad_x = np.gradient(raw_green)
+        magnitude = np.sqrt(grad_x**2 + grad_y**2) + 0.1 * max_green_down
+        energy_down = np.abs(grad_x) / magnitude
         energy_bins.append(energy_down)
-        mask_widths.append(energy_down.shape[1])
+        mask_widths.append(raw_green.shape[1])
 
     if energy_bins:
         energy_full = np.hstack(energy_bins)
+        green_full = np.hstack(green_bins)
     else:
         energy_full = np.empty((0, 0), dtype=np.float32)
+        green_full = np.empty((0, 0), dtype=np.float32)
 
     mask_full = energy_full > STRUCTURE_MASK_THRESHOLD
+    if mask_full.size > 0:
+        preview_mask = mask_full.astype(np.uint8) * 255
+        cv2.imwrite(str(g / "structure_mask_undilated.png"), preview_mask)
+
     if STRUCTURE_MASK_DILATE_PX > 0 and mask_full.size > 0:
         dilate_px = max(1, STRUCTURE_MASK_DILATE_PX // STRUCTURE_MASK_DOWNSAMPLE)
         k = 2 * dilate_px + 1
@@ -1461,10 +1614,16 @@ def process_preview(
         mask_bins.append(mask_full[:, start : start + width])
         start += width
     if mask_full.size > 0:
-        preview_mask = mask_full.astype(np.uint8) * 255
-        cv2.imwrite(str(g / "structure_mask_preview.png"), preview_mask)
+        green_norm = green_full / max(max_green_down, 1.0)
+        green_u8 = np.clip(green_norm * 255.0, 0, 255).astype(np.uint8)
+        base = cv2.cvtColor(green_u8, cv2.COLOR_GRAY2BGR)
+        mask_overlay = np.zeros_like(base)
+        mask_overlay[:, :, 2] = mask_full.astype(np.uint8) * 255
+        preview = cv2.addWeighted(base, 0.9, mask_overlay, 0.1, 0.0)
+        cv2.imwrite(str(g / "structure_mask_preview.png"), preview)
 
     jitter_models = None
+    jitter_debug_preview = {} if ENABLE_JITTER_DEBUG_PLOT else None
     if ENABLE_COLUMN_JITTER_CORRECTION:
         jitter_models = column_exposure_jitter_correction(
             red_view,
@@ -1474,7 +1633,95 @@ def process_preview(
             g=g,
             mask_bins=mask_bins,
             mask_scale=STRUCTURE_MASK_DOWNSAMPLE,
+            debug_preview=jitter_debug_preview,
         )
+    if jitter_debug_preview and "green" in jitter_debug_preview and mask_full.size > 0:
+        green_jitter = jitter_debug_preview["green"]
+        green_jitter_norm = green_jitter / max(np.max(green_jitter), 1.0)
+        green_jitter_u8 = np.clip(green_jitter_norm * 255.0, 0, 255).astype(np.uint8)
+        base_jitter = cv2.cvtColor(green_jitter_u8, cv2.COLOR_GRAY2BGR)
+        mask_overlay = np.zeros_like(base_jitter)
+        mask_overlay[:, :, 2] = mask_full.astype(np.uint8) * 255
+        preview_jitter = cv2.addWeighted(base_jitter, 0.9, mask_overlay, 0.1, 0.0)
+        cv2.imwrite(str(g / "structure_mask_preview_blurred.png"), preview_jitter)
+    if ENABLE_JITTER_DEBUG_PLOT and jitter_models is not None:
+        row_idx = min(JITTER_DEBUG_ROW, green1.height - 1)
+        cols = np.arange(green1.width)
+        red_pre = red_view[row_idx, :]
+        green1_pre = green1[row_idx, :]
+        green2_pre = green2[row_idx, :]
+        blue_pre = blue_view[row_idx, :]
+        beta0 = jitter_models[:, 0]
+        beta1 = jitter_models[:, 1]
+        beta2 = jitter_models[:, 2]
+        row_term = row_idx * beta2
+        red_post = beta0 + red_pre * beta1 + row_term
+        green1_post = beta0 + green1_pre * beta1 + row_term
+        green2_post = beta0 + green2_pre * beta1 + row_term
+        blue_post = beta0 + blue_pre * beta1 + row_term
+
+        fig, (ax_pre, ax_post, ax_img, ax_beta, ax_rel) = plt.subplots(
+            5, 1, figsize=(16, 17), dpi=300, sharex=True
+        )
+        ax_pre.plot(cols, red_pre, "r.", markersize=1, label="red pre")
+        ax_pre.plot(cols, green1_pre, "g.", markersize=1, label="green1 pre")
+        ax_pre.plot(cols, green2_pre, "k.", markersize=1, label="green2 pre")
+        ax_pre.plot(cols, blue_pre, "b.", markersize=1, label="blue pre")
+        ax_pre.set_ylabel("value")
+        ax_pre.set_title(f"Jitter correction row {row_idx} (pre)")
+        ax_pre.legend()
+
+        ax_post.plot(cols, red_post, "r.", markersize=1, label="red post")
+        ax_post.plot(cols, green1_post, "g.", markersize=1, label="green1 post")
+        ax_post.plot(cols, green2_post, "k.", markersize=1, label="green2 post")
+        ax_post.plot(cols, blue_post, "b.", markersize=1, label="blue post")
+        ax_post.set_xlabel("column")
+        ax_post.set_ylabel("value")
+        ax_post.set_title("post")
+        ax_post.legend()
+
+        if green_full.size > 0:
+            green_norm = green_full / max(max_green_down, 1.0)
+            ax_img.imshow(
+                green_norm,
+                cmap="gray",
+                aspect="auto",
+                extent=[0, green1.width - 1, green1.height - 1, 0],
+            )
+            ax_img.axhline(row_idx, color="r", linewidth=1)
+        ax_img.set_title("downsampled green with debug row")
+        ax_img.set_ylabel("row")
+        ax_img.set_xlabel("column")
+
+        ax_beta.plot(cols, beta1, "g-", label="beta1")
+        ax_beta.plot(cols, beta2, "b-", label="beta2")
+        ax_beta.set_title("jitter model parameters")
+        ax_beta.set_ylabel("value")
+        ax_beta.set_xlabel("column")
+        ax_beta.legend()
+        ax_beta0 = ax_beta.twinx()
+        ax_beta0.plot(cols, beta0, "r-", label="beta0")
+        ax_beta0.set_ylabel("beta0")
+        ax_beta0.legend(loc="upper right")
+
+        rel_models = np.zeros((len(cols) - 1, 3), dtype=np.float32)
+        if len(cols) > 1:
+            for i in range(len(cols) - 1):
+                rel_models[i] = compose_model(
+                    invert_model(jitter_models[i]), jitter_models[i + 1]
+                )
+        rel_cols = cols[:-1]
+        ax_rel.plot(rel_cols, rel_models[:, 0], "r-", label="rel beta0")
+        ax_rel.plot(rel_cols, rel_models[:, 1], "g-", label="rel beta1")
+        ax_rel.plot(rel_cols, rel_models[:, 2], "b-", label="rel beta2")
+        ax_rel.set_title("relative model (col -> col+1)")
+        ax_rel.set_ylabel("value")
+        ax_rel.set_xlabel("column")
+        ax_rel.legend()
+
+        fig.tight_layout()
+        fig.savefig(g / "jitter_row_debug.png")
+        plt.close(fig)
 
     sample_xs, sample_ys, _weights = windowed_cross_correlation(
         green1, green2, jitter_models=jitter_models
@@ -1562,9 +1809,7 @@ def process_preview(
         out_name = f"rgb_{chunk_i:02d}_cfpeak_deskewed_jitter"
         # denoised_sampled = patch_denoise(raw_sampled)
         denoised_sampled = raw_sampled
-        write_linear_dng(
-            g / f"{out_name}_linear_deskewed.dng", denoised_sampled, white_balance
-        )
+        write_linear_dng(g / f"{out_name}_linear.dng", denoised_sampled, white_balance)
         # calibrate, clip, sharpen, tone-map
         rgb = apply_color_transform(denoised_sampled, white_balance)
         rgb = np.clip(rgb, 0, 65536)
@@ -1583,7 +1828,7 @@ def process_preview(
 
         rgb_float = rgb_u8.astype(np.float32)
         binned = np.stack(
-            [bin2to1(bin2to1(rgb_float[:, :, ch])) for ch in range(rgb_float.shape[2])],
+            [bin2to1(rgb_float[:, :, ch]) for ch in range(rgb_float.shape[2])],
             axis=2,
         )
         stacked_preview.append(np.clip(binned, 0, 255).astype(np.uint8))
@@ -1598,17 +1843,20 @@ def main():
     # globs = linescans.glob("2024-09-10-06-00-05*")  # yamanote
     # globs = linescans.glob("2024-09-19*") # fuxing
     # globs = linescans.glob("2024-09-14-02-13-13*")  # hktram
+    # globs = linescans.glob("2024-09-14-02-12-36*")  # hktram
     # globs = linescans.glob("2024-09-14-*")  # hktrams
     # globs = linescans.glob("2024-09*")  # hktram
     # globs = linescans.glob("2024-09-12-01-31-01*")  # hk bus
+    # globs = linescans.glob("2024-09-12-01-49-42") # hk buses
     # globs = linescans.glob("nyc5")
     # globs = linescans.glob("18-08-0*")  # amtrak
     # globs = linescans.glob("18*")
     # globs = linescans.glob("17-10-01-23-46-50-utc")
     # globs = linescans.glob("18-10-18-02-31-29-utc")  # maglev
-    # globs = linescans.glob("18-10-06-13-52-16-utc*")  # pato
+    globs = linescans.glob("18-10-06-13-52-16-utc*")  # pato
     # globs = linescans.glob("2025-11*") # pano
-    globs = linescans.glob("2025-09-13-09-27-13*")  # picadilly
+    # globs = linescans.glob("2025-09-13-09-27-13*")  # picadilly
+    # globs = linescans.glob("2025-09-13-09-37-17*")  # picadilly
     # globs = linescans.glob("2025-09*")
     # globs = linescans.glob("*")
 

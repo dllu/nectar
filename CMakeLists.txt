@@ -41,21 +41,13 @@ set(IMGUI_SOURCES
 add_executable(necta
     ${IMGUI_SOURCES}
     src/main.cpp
+    src/review.cpp
     src/utils.cpp
 )
 find_library(DW_LIB dw)
 target_link_libraries(necta ${NECTA_LIBRARIES})
 
-add_executable(review
-    ${IMGUI_SOURCES}
-    src/review.cpp
-    src/utils.cpp
-)
-target_link_libraries(review ${NECTA_LIBRARIES})
-
 if(DW_LIB)
     target_compile_definitions(necta PRIVATE BACKWARD_HAS_DW=1)
-    target_compile_definitions(review PRIVATE BACKWARD_HAS_DW=1)
     target_link_libraries(necta ${DW_LIB})
-    target_link_libraries(review ${DW_LIB})
 endif()
