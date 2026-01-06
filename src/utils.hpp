@@ -14,7 +14,10 @@ inline constexpr float k_button_height = 30.0f;
 
 bool draw_thick_slider_int(const char* label, int* value, int min_value,
                            int max_value);
+bool draw_thick_slider_int_width(const char* label, int* value, int min_value,
+                                 int max_value, float max_width);
 bool draw_large_checkbox(const char* label, bool* value);
+bool draw_large_checkbox_inline(const char* label, bool* value);
 void configure_sdl_touch();
 
 class TouchHandler {

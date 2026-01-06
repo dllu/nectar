@@ -100,8 +100,9 @@ bool TouchHandler::should_ignore_event(const SDL_Event& event) const {
     return false;
 }
 
-bool draw_thick_slider_int(const char* label, int* value, int min_value,
-                           int max_value) {
+static bool draw_thick_slider_int_impl(const char* label, int* value,
+                                       int min_value, int max_value,
+                                       float max_width) {
     const int range = max_value - min_value;
     if (range <= 0) {
         return false;
@@ -110,6 +111,9 @@ bool draw_thick_slider_int(const char* label, int* value, int min_value,
     ImGui::PushID(label);
     const float slider_height = k_slider_track_height;
     float slider_width = ImGui::GetContentRegionAvail().x;
+    if (max_width > 0.0f) {
+        slider_width = std::min(slider_width, max_width);
+    }
     slider_width = std::max(slider_width, 100.0f);
     const float handle_width = std::max(50.0f, slider_width * 0.12f);
     const float slider_travel = std::max(slider_width - handle_width, 0.0f);
@@ -155,7 +159,19 @@ bool draw_thick_slider_int(const char* label, int* value, int min_value,
     return changed;
 }
 
-bool draw_large_checkbox(const char* label, bool* value) {
+bool draw_thick_slider_int(const char* label, int* value, int min_value,
+                           int max_value) {
+    return draw_thick_slider_int_impl(label, value, min_value, max_value, -1.0f);
+}
+
+bool draw_thick_slider_int_width(const char* label, int* value, int min_value,
+                                 int max_value, float max_width) {
+    return draw_thick_slider_int_impl(label, value, min_value, max_value,
+                                      max_width);
+}
+
+static bool draw_large_checkbox_impl(const char* label, bool* value,
+                                     bool add_spacing) {
     ImGui::Text("%s: %s", label, *value ? "on" : "off");
     ImGui::PushID(label);
     const ImVec2 box_size(k_slider_track_height, k_slider_track_height);
@@ -187,9 +203,19 @@ bool draw_large_checkbox(const char* label, bool* value) {
         *value = !*value;
         changed = true;
     }
-    ImGui::Dummy(ImVec2(0.0f, 10.0f));
+    if (add_spacing) {
+        ImGui::Dummy(ImVec2(0.0f, 10.0f));
+    }
     ImGui::PopID();
     return changed;
+}
+
+bool draw_large_checkbox(const char* label, bool* value) {
+    return draw_large_checkbox_impl(label, value, true);
+}
+
+bool draw_large_checkbox_inline(const char* label, bool* value) {
+    return draw_large_checkbox_impl(label, value, false);
 }
 
 }  // namespace nectar

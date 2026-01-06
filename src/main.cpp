@@ -376,7 +376,7 @@ class NectarCapturer {
                 if (request_preview.load() || preview_due) {
                     const size_t needed =
                         static_cast<size_t>(capture_rows) * cols * 2;
-                    if (raw_image.BodySize() >= needed) {
+                    if (raw_image.Body() != nullptr) {
                         std::lock_guard<std::mutex> lock(preview_mtx);
                         std::memcpy(latest_preview.data(), raw_image.Body(),
                                     needed);
@@ -774,6 +774,9 @@ int main(int argc, char* argv[]) {
             }
             const ImVec2 save_button_size(220.0f,
                                           nectar::k_slider_track_height);
+            const ImVec2 quit_button_size(220.0f,
+                                          nectar::k_slider_track_height);
+            const float row_start_y = ImGui::GetCursorPosY();
             if (nc.save.load()) {
                 if (ImGui::Button("Stop saving", save_button_size)) {
                     stop_capture_session();
@@ -783,27 +786,46 @@ int main(int argc, char* argv[]) {
                     cam_status.connected) {
                     start_capture_session();
                 }
-                if (!cam_status.connected) {
-                    ImGui::Text("Connect a camera to start saving.");
-                }
             }
+            const ImVec2 content_max = ImGui::GetWindowContentRegionMax();
+            const float right_group_width =
+                quit_button_size.x + save_button_size.x + 8.0f;
+            const float right_group_x =
+                std::max(ImGui::GetCursorPosX(),
+                         content_max.x - right_group_width);
+            ImGui::SetCursorPos(ImVec2(right_group_x, row_start_y));
             ImGui::BeginDisabled(nc.save.load());
             if (ImGui::Button("Review captures", save_button_size)) {
                 ui_mode = UiMode::Review;
             }
             ImGui::EndDisabled();
+            ImGui::SameLine(0.0f, 8.0f);
+            if (ImGui::Button("Quit", quit_button_size)) {
+                request_quit_popup = true;
+            }
+            ImGui::SetCursorPosY(row_start_y + save_button_size.y + 6.0f);
+            if (!cam_status.connected) {
+                ImGui::Text("Connect a camera to start saving.");
+            }
             if (!nc.save.load()) {
                 bool cds_gain_enabled = nc.cds_gain.load() != 0;
-                if (nectar::draw_large_checkbox("cds_gain",
-                                                &cds_gain_enabled)) {
+                const float slider_width =
+                    ImGui::GetContentRegionAvail().x * 0.7f;
+                ImGui::BeginGroup();
+                if (nectar::draw_large_checkbox_inline(
+                        "cds_gain", &cds_gain_enabled)) {
                     nc.cds_gain.store(cds_gain_enabled ? 1 : 0);
                 }
+                ImGui::EndGroup();
+                ImGui::SameLine(0.0f, 24.0f);
+                ImGui::BeginGroup();
                 int analog_gain = nc.analog_gain.load();
                 int shutter = nc.shutterspeed.load();
-                if (nectar::draw_thick_slider_int("analog_gain", &analog_gain,
-                                                  0, 20)) {
+                if (nectar::draw_thick_slider_int_width(
+                        "analog_gain", &analog_gain, 0, 20, slider_width)) {
                     nc.analog_gain.store(analog_gain);
                 }
+                ImGui::EndGroup();
                 if (nectar::draw_thick_slider_int("shutterspeed (* 100 ns)",
                                                   &shutter, 0, 10000)) {
                     nc.shutterspeed.store(shutter);
@@ -811,7 +833,6 @@ int main(int argc, char* argv[]) {
             } else {
                 ImGui::Text("Saving to: %s", output_dir.c_str());
             }
-            ImGui::Separator();
             ImGui::Text("Zoom preview position");
             const float slider_height = nectar::k_slider_track_height;
             const float slider_width = ImGui::GetContentRegionAvail().x;
@@ -861,12 +882,41 @@ int main(int argc, char* argv[]) {
                 nc.set_crop_offset(new_offset);
             }
             ImGui::Dummy(ImVec2(0.0f, 10.0f));
+
+            try {
+                if (cam_status.connected) {
+                    nc.capture(cam);
+                }
+            } catch (const Exception& ex) {
+                std::cerr << "Exception " << ex.Name() << " occurred"
+                          << std::endl
+                          << ex.Message() << std::endl;
+                ImGui::Text("Exception %s %s", ex.Name(), ex.Message());
+                disconnect_camera(cam, cam_status);
+                nc.stop_saving();
+            } catch (...) {
+                std::cerr << "Unhandled exception" << std::endl;
+                disconnect_camera(cam, cam_status);
+                nc.stop_saving();
+            }
         } else {
             const ImVec2 review_button_size(220.0f,
                                             nectar::k_slider_track_height);
+            const ImVec2 quit_button_size(220.0f,
+                                          nectar::k_slider_track_height);
+            const float row_start_y = ImGui::GetCursorPosY();
             if (ImGui::Button("Back to Capture", review_button_size)) {
                 ui_mode = UiMode::Capture;
             }
+            const ImVec2 content_max = ImGui::GetWindowContentRegionMax();
+            const float right_x =
+                std::max(ImGui::GetCursorPosX(),
+                         content_max.x - quit_button_size.x);
+            ImGui::SetCursorPos(ImVec2(right_x, row_start_y));
+            if (ImGui::Button("Quit", quit_button_size)) {
+                request_quit_popup = true;
+            }
+            ImGui::SetCursorPosY(row_start_y + review_button_size.y + 6.0f);
             ImGui::Separator();
             review_controller.update(now);
             if (review_controller.mode_is_listing()) {
@@ -967,19 +1017,6 @@ int main(int argc, char* argv[]) {
                 ImGui::Text("Status: polling for camera...");
             }
         }
-        const ImVec2 quit_button_size(220.0f, nectar::k_slider_track_height);
-        const ImVec2 content_max = ImGui::GetWindowContentRegionMax();
-        const float current_x = ImGui::GetCursorPosX();
-        const float current_y = ImGui::GetCursorPosY();
-        const float target_x =
-            std::max(current_x, content_max.x - quit_button_size.x);
-        const float target_y =
-            std::max(current_y, content_max.y - quit_button_size.y);
-        ImGui::SetCursorPos(ImVec2(target_x, target_y));
-        if (ImGui::Button("Quit", quit_button_size)) {
-            request_quit_popup = true;
-        }
-
         if (request_quit_popup) {
             ImGui::OpenPopup("Confirm Quit");
             request_quit_popup = false;
@@ -1009,24 +1046,6 @@ int main(int argc, char* argv[]) {
             ImGui::EndPopup();
         }
 
-        if (ui_mode == UiMode::Capture) {
-            try {
-                if (cam_status.connected) {
-                    nc.capture(cam);
-                }
-            } catch (const Exception& ex) {
-                std::cerr << "Exception " << ex.Name() << " occurred"
-                          << std::endl
-                          << ex.Message() << std::endl;
-                ImGui::Text("Exception %s %s", ex.Name(), ex.Message());
-                disconnect_camera(cam, cam_status);
-                nc.stop_saving();
-            } catch (...) {
-                std::cerr << "Unhandled exception" << std::endl;
-                disconnect_camera(cam, cam_status);
-                nc.stop_saving();
-            }
-        }
         ImGui::End();
         ImGui::PopStyleVar(1);
         ImGui::Render();
