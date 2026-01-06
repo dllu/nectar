@@ -1,7 +1,5 @@
 #include "review.hpp"
 
-#include "utils.hpp"
-
 #include <SDL.h>
 #include <SDL_opengl.h>
 #include <imgui.h>
@@ -10,6 +8,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -17,7 +16,8 @@
 #include <sstream>
 #include <string>
 #include <vector>
-#include <ctime>
+
+#include "utils.hpp"
 
 namespace fs = std::filesystem;
 
@@ -91,14 +91,18 @@ struct ReviewController::Impl {
             }
             float preview_scale = desired_width / preview_data_width;
             if (preview_scale <= 0.0f) preview_scale = 1.0f;
-            const int preview_disp_width = std::max(
-                1, static_cast<int>(std::round(preview_data_width * preview_scale)));
-            const int preview_disp_height = std::max(
-                1, static_cast<int>(std::round(preview_data_height * preview_scale)));
-            draw_image(rgb_texture, rgb_image.data(), preview_cols, buffer_rows / 2,
-                       preview_disp_width, preview_disp_height);
+            const int preview_disp_width =
+                std::max(1, static_cast<int>(std::round(preview_data_width *
+                                                        preview_scale)));
+            const int preview_disp_height =
+                std::max(1, static_cast<int>(std::round(preview_data_height *
+                                                        preview_scale)));
+            draw_image(rgb_texture, rgb_image.data(), preview_cols,
+                       buffer_rows / 2, preview_disp_width,
+                       preview_disp_height);
             draw_image(rgb_crop_texture, rgb_image_cropped.data(), crop_cols,
-                       buffer_rows / 2, preview_disp_width, preview_disp_height);
+                       buffer_rows / 2, preview_disp_width,
+                       preview_disp_height);
             draw_image(hist_texture, histogram.data(), hist_w, hist_h, hist_w,
                        hist_h);
         }
@@ -161,9 +165,8 @@ struct ReviewController::Impl {
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGB,
                          GL_UNSIGNED_BYTE, data);
-            ImGui::Image((intptr_t)texture,
-                         ImVec2(static_cast<float>(w_disp),
-                                static_cast<float>(h_disp)));
+            ImGui::Image((intptr_t)texture, ImVec2(static_cast<float>(w_disp),
+                                                   static_cast<float>(h_disp)));
         }
 
         std::vector<uint8_t> rgb_image;
@@ -203,8 +206,8 @@ struct ReviewController::Impl {
                     ImGui::SameLine(250.0f);
                     ImGui::TextUnformatted(ts.c_str());
                     ImGui::SameLine();
-                    if (ImGui::Button("View",
-                                      ImVec2(120.0f, nectar::k_button_height))) {
+                    if (ImGui::Button(
+                            "View", ImVec2(120.0f, nectar::k_button_height))) {
                         open_capture(entry);
                     }
                     ImGui::Separator();

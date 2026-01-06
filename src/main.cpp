@@ -108,6 +108,7 @@ class NectarCapturer {
 
    private:
     std::chrono::time_point<std::chrono::steady_clock> last_frame_time;
+    std::chrono::steady_clock::time_point last_preview_ts;
     int capture_rows = 192;
     static constexpr int buffer_rows = 512;
     static constexpr int cols = 4096;
@@ -235,6 +236,8 @@ class NectarCapturer {
 
     void capture_loop(INectaCamera& cam) {
         last_capture_ts = std::chrono::steady_clock::now();
+        last_preview_ts =
+            std::chrono::steady_clock::now() - std::chrono::milliseconds(33);
         auto last_cam_acq_check = std::chrono::steady_clock::now();
         while (capture_running.load()) {
             int current_shutter = shutterspeed.load();
@@ -367,14 +370,20 @@ class NectarCapturer {
                     frame_id.store(frame_id.load() + 1);
                     raw_buffers.clear();
                 }
-            } else if (request_preview.exchange(false)) {
-                const size_t needed =
-                    static_cast<size_t>(capture_rows) * cols * 2;
-                if (raw_image.BodySize() >= needed) {
-                    std::lock_guard<std::mutex> lock(preview_mtx);
-                    std::memcpy(latest_preview.data(), raw_image.Body(),
-                                needed);
-                    preview_ready = true;
+            } else {
+                const bool preview_due =
+                    now - last_preview_ts >= std::chrono::milliseconds(33);
+                if (request_preview.load() || preview_due) {
+                    const size_t needed =
+                        static_cast<size_t>(capture_rows) * cols * 2;
+                    if (raw_image.BodySize() >= needed) {
+                        std::lock_guard<std::mutex> lock(preview_mtx);
+                        std::memcpy(latest_preview.data(), raw_image.Body(),
+                                    needed);
+                        preview_ready = true;
+                        last_preview_ts = now;
+                        request_preview.store(false);
+                    }
                 }
             }
         }
@@ -791,8 +800,8 @@ int main(int argc, char* argv[]) {
                 }
                 int analog_gain = nc.analog_gain.load();
                 int shutter = nc.shutterspeed.load();
-                if (nectar::draw_thick_slider_int("analog_gain",
-                                                  &analog_gain, 0, 20)) {
+                if (nectar::draw_thick_slider_int("analog_gain", &analog_gain,
+                                                  0, 20)) {
                     nc.analog_gain.store(analog_gain);
                 }
                 if (nectar::draw_thick_slider_int("shutterspeed (* 100 ns)",
@@ -814,10 +823,10 @@ int main(int argc, char* argv[]) {
             const int crop_offset = nc.get_crop_offset();
             const float slider_travel =
                 std::max(slider_width - handle_width, 0.0f);
-            const float normalized = max_crop_offset > 0
-                                         ? static_cast<float>(crop_offset) /
-                                               max_crop_offset
-                                         : 0.0f;
+            const float normalized =
+                max_crop_offset > 0
+                    ? static_cast<float>(crop_offset) / max_crop_offset
+                    : 0.0f;
             ImVec2 slider_pos = ImGui::GetCursorScreenPos();
             const float handle_x =
                 slider_pos.x +
@@ -828,8 +837,7 @@ int main(int argc, char* argv[]) {
             const ImU32 track_color = ImGui::GetColorU32(ImGuiCol_FrameBg);
             const ImU32 border_color = ImGui::GetColorU32(ImGuiCol_Border);
             const float rounding =
-                std::min(nectar::k_slider_corner_radius,
-                         slider_height * 0.5f);
+                std::min(nectar::k_slider_corner_radius, slider_height * 0.5f);
             ImVec2 slider_end(slider_pos.x + slider_width,
                               slider_pos.y + slider_height);
             draw_list->AddRectFilled(slider_pos, slider_end, track_color,
@@ -876,8 +884,8 @@ int main(int argc, char* argv[]) {
         static uint32_t last_lost_count = 0;
         static double last_lost_fps = 0.0;
         static uint32_t last_lost_total = 0;
-        if (ui_mode == UiMode::Capture && enable_diag_logging &&
-            cam_status.connected && nc.is_capture_running()) {
+        if (ui_mode == UiMode::Capture && cam_status.connected &&
+            nc.is_capture_running()) {
             const auto dt =
                 std::chrono::duration<double>(now - last_diag).count();
             if (dt >= 1.0) {
@@ -914,21 +922,24 @@ int main(int argc, char* argv[]) {
                 const unsigned int cam_packet = nc.get_cam_packet_size();
                 const unsigned int cam_packet_max =
                     nc.get_cam_max_packet_size();
-                std::cerr << "diag: acquired_fps=" << std::fixed
-                          << std::setprecision(2) << last_acq_fps
-                          << " acquired_frames=" << last_acq_count
-                          << " cam_acquired_frames=" << last_cam_acq_delta
-                          << " app_vs_cam_delta="
-                          << (static_cast<int64_t>(last_cam_acq_delta) -
-                              static_cast<int64_t>(last_acq_count))
-                          << " lost_fps=" << last_lost_fps
-                          << " lost_frames=" << last_lost_count
-                          << " expected_fps=" << expected_fps
-                          << " expected_interval_ns=" << expected_interval
-                          << " cam_line_period=" << cam_line_period
-                          << " cam_frame_rate=" << cam_frame_rate
-                          << " cam_packet=" << cam_packet
-                          << " cam_packet_max=" << cam_packet_max << std::endl;
+                if (enable_diag_logging) {
+                    std::cerr << "diag: acquired_fps=" << std::fixed
+                              << std::setprecision(2) << last_acq_fps
+                              << " acquired_frames=" << last_acq_count
+                              << " cam_acquired_frames=" << last_cam_acq_delta
+                              << " app_vs_cam_delta="
+                              << (static_cast<int64_t>(last_cam_acq_delta) -
+                                  static_cast<int64_t>(last_acq_count))
+                              << " lost_fps=" << last_lost_fps
+                              << " lost_frames=" << last_lost_count
+                              << " expected_fps=" << expected_fps
+                              << " expected_interval_ns=" << expected_interval
+                              << " cam_line_period=" << cam_line_period
+                              << " cam_frame_rate=" << cam_frame_rate
+                              << " cam_packet=" << cam_packet
+                              << " cam_packet_max=" << cam_packet_max
+                              << std::endl;
+                }
                 last_diag = now;
             }
         }

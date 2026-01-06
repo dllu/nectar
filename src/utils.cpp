@@ -55,7 +55,8 @@ void TouchHandler::apply_to_imgui(SDL_Window* window) {
 
     ImGuiIO& io = ImGui::GetIO();
     io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);
-    if (have_pos_ && (active_ || button_down_ || pending_down_ || pending_up_)) {
+    if (have_pos_ &&
+        (active_ || button_down_ || pending_down_ || pending_up_)) {
         const float pos_x = norm_x_ * window_w;
         const float pos_y = norm_y_ * window_h;
         io.AddMousePosEvent(pos_x, pos_y);
