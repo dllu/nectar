@@ -8,6 +8,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -15,7 +16,6 @@
 #include <sstream>
 #include <string>
 #include <vector>
-#include <ctime>
 
 #include "backward.hpp"
 #include "utils.hpp"
@@ -32,8 +32,9 @@ struct SdlGlGui {
     std::string glsl_version;
 
     SdlGlGui() {
-        if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_GAMECONTROLLER) !=
-            0) {
+        nectar::configure_sdl_touch();
+        if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER |
+                     SDL_INIT_GAMECONTROLLER) != 0) {
             std::cerr << "SDL init failed: " << SDL_GetError() << std::endl;
             std::exit(1);
         }
@@ -68,8 +69,9 @@ struct SdlGlGui {
         SDL_WindowFlags window_flags =
             (SDL_WindowFlags)(SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE |
                               SDL_WINDOW_ALLOW_HIGHDPI);
-        window = SDL_CreateWindow("Nectar Review", SDL_WINDOWPOS_CENTERED,
-                                  SDL_WINDOWPOS_CENTERED, 1280, 720, window_flags);
+        window =
+            SDL_CreateWindow("Nectar Review", SDL_WINDOWPOS_CENTERED,
+                             SDL_WINDOWPOS_CENTERED, 1280, 720, window_flags);
         gl_context = SDL_GL_CreateContext(window);
         SDL_GL_MakeCurrent(window, gl_context);
         SDL_GL_SetSwapInterval(1);
@@ -114,7 +116,8 @@ class CapturePreviewer {
 
     bool load_file(const fs::path& file_path, std::string& error) {
         error.clear();
-        const size_t expected_bytes = static_cast<size_t>(buffer_rows) * cols * 2;
+        const size_t expected_bytes =
+            static_cast<size_t>(buffer_rows) * cols * 2;
         std::error_code ec;
         const auto file_size = fs::file_size(file_path, ec);
         if (ec || file_size != expected_bytes) {
@@ -148,15 +151,18 @@ class CapturePreviewer {
         }
         float preview_scale = desired_width / preview_data_width;
         if (preview_scale <= 0.0f) preview_scale = 1.0f;
-        const int preview_disp_width =
-            std::max(1, static_cast<int>(std::round(preview_data_width * preview_scale)));
-        const int preview_disp_height =
-            std::max(1, static_cast<int>(std::round(preview_data_height * preview_scale)));
+        const int preview_disp_width = std::max(
+            1,
+            static_cast<int>(std::round(preview_data_width * preview_scale)));
+        const int preview_disp_height = std::max(
+            1,
+            static_cast<int>(std::round(preview_data_height * preview_scale)));
         draw_image(rgb_texture, rgb_image.data(), preview_cols, buffer_rows / 2,
                    preview_disp_width, preview_disp_height);
         draw_image(rgb_crop_texture, rgb_image_cropped.data(), crop_cols,
                    buffer_rows / 2, preview_disp_width, preview_disp_height);
-        draw_image(hist_texture, histogram.data(), hist_w, hist_h, hist_w, hist_h);
+        draw_image(hist_texture, histogram.data(), hist_w, hist_h, hist_w,
+                   hist_h);
     }
 
    private:
@@ -214,8 +220,8 @@ class CapturePreviewer {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE,
-                     data);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGB,
+                     GL_UNSIGNED_BYTE, data);
         ImGui::Image((intptr_t)texture, ImVec2(static_cast<float>(w_disp),
                                                static_cast<float>(h_disp)));
     }
@@ -257,8 +263,8 @@ class ReviewController {
                     ImGui::SameLine(250.0f);
                     ImGui::TextUnformatted(ts.c_str());
                     ImGui::SameLine();
-                    if (ImGui::Button("View",
-                                      ImVec2(120.0f, nectar::k_button_height))) {
+                    if (ImGui::Button(
+                            "View", ImVec2(120.0f, nectar::k_button_height))) {
                         open_capture(entry);
                     }
                     ImGui::Separator();
@@ -270,8 +276,7 @@ class ReviewController {
     }
 
     void render_review() {
-        if (ImGui::Button("Back",
-                          ImVec2(150.0f, nectar::k_button_height))) {
+        if (ImGui::Button("Back", ImVec2(150.0f, nectar::k_button_height))) {
             mode = Mode::Listing;
             return;
         }
@@ -284,11 +289,13 @@ class ReviewController {
             return;
         }
         ImGui::Text("File %d / %zu: %s", selected_bin_index + 1,
-                    bin_files.size(), bin_files[selected_bin_index].filename().c_str());
+                    bin_files.size(),
+                    bin_files[selected_bin_index].filename().c_str());
         if (bin_files.size() > 1) {
             int slider_value = selected_bin_index;
-            if (nectar::draw_thick_slider_int("frame_index", &slider_value, 0,
-                                              static_cast<int>(bin_files.size() - 1))) {
+            if (nectar::draw_thick_slider_int(
+                    "frame_index", &slider_value, 0,
+                    static_cast<int>(bin_files.size() - 1))) {
                 select_bin(slider_value);
             }
         }
@@ -342,8 +349,8 @@ class ReviewController {
 
     static std::string format_time(fs::file_time_type tp) {
         using namespace std::chrono;
-        const auto sctp = system_clock::now() +
-                          (tp - fs::file_time_type::clock::now());
+        const auto sctp =
+            system_clock::now() + (tp - fs::file_time_type::clock::now());
         const std::time_t tt = system_clock::to_time_t(sctp);
         std::tm tm_buf;
 #ifdef _WIN32
@@ -441,12 +448,14 @@ int main(int argc, char** argv) {
 
     ReviewController controller;
     bool done = false;
+    nectar::TouchHandler touch_handler;
     const ImVec4 clear_color = ImVec4(0.0f, 0.0f, 0.0f, 1.0f);
 
     while (!done) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             ImGui_ImplSDL2_ProcessEvent(&event);
+            touch_handler.handle_event(event, sdl_gl_gui.window);
             if (event.type == SDL_QUIT) done = true;
             if (event.type == SDL_WINDOWEVENT &&
                 event.window.event == SDL_WINDOWEVENT_CLOSE &&
@@ -476,7 +485,8 @@ int main(int argc, char** argv) {
         ImGui::PopStyleVar(1);
         ImGui::Render();
         glViewport(0, 0, (int)io.DisplaySize.x, (int)io.DisplaySize.y);
-        glClearColor(clear_color.x * clear_color.w, clear_color.y * clear_color.w,
+        glClearColor(clear_color.x * clear_color.w,
+                     clear_color.y * clear_color.w,
                      clear_color.z * clear_color.w, clear_color.w);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());

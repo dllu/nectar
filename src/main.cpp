@@ -1,13 +1,10 @@
 #include <INectaCamera.h>
-#include <shared/GlobalOptions.h>
-
-#include "backward.hpp"
-#include "utils.hpp"
 #include <SDL.h>
 #include <SDL_opengl.h>
 #include <imgui.h>
 #include <imgui_impl_opengl3.h>
 #include <imgui_impl_sdl2.h>
+#include <shared/GlobalOptions.h>
 
 #include <algorithm>
 #include <array>
@@ -27,6 +24,9 @@
 #include <sstream>
 #include <thread>
 #include <vector>
+
+#include "backward.hpp"
+#include "utils.hpp"
 
 using namespace CAlkUSB3;
 namespace backward {
@@ -182,8 +182,7 @@ class NectarCapturer {
         for (int i = 0; i < capture_rows / 2; i++) {
             for (int j = 0; j < crop_cols; j++) {
                 const int ind_cropped = (j + crop_cols * i) * 3;
-                const int ind =
-                    (j + crop_offset + preview_cols * i) * 3;
+                const int ind = (j + crop_offset + preview_cols * i) * 3;
                 for (int k = 0; k < 3; k++) {
                     rgb_image_cropped[ind_cropped + k] = rgb_image[ind + k];
                 }
@@ -259,21 +258,20 @@ class NectarCapturer {
                     }
                 }
             }
-            const double line_period_s =
-                current_shutter * 1e-7 + 2.1e-6;
-            expected_capture_interval_ns.store(static_cast<int64_t>(
-                line_period_s * (capture_rows / 2) * 1e9));
+            const double line_period_s = current_shutter * 1e-7 + 2.1e-6;
+            expected_capture_interval_ns.store(
+                static_cast<int64_t>(line_period_s * (capture_rows / 2) * 1e9));
             const int new_rows_desired =
                 2 * std::ceil(1.0 / 30.0 / line_period_s);
 
-                int new_rows = 1;
-                while (new_rows <= new_rows_desired) {
-                    new_rows *= 2;
-                }
-                const int new_capture_rows =
-                    std::max(static_cast<int>(cam.GetMinImageSizeY()),
-                             std::min(static_cast<int>(cam.GetMaxImageSizeY()),
-                                      std::min(buffer_rows, new_rows)));
+            int new_rows = 1;
+            while (new_rows <= new_rows_desired) {
+                new_rows *= 2;
+            }
+            const int new_capture_rows =
+                std::max(static_cast<int>(cam.GetMinImageSizeY()),
+                         std::min(static_cast<int>(cam.GetMaxImageSizeY()),
+                                  std::min(buffer_rows, new_rows)));
             if (capture_rows != new_capture_rows) {
                 std::lock_guard<std::mutex> lock(cam_mtx);
                 cam.SetAcquire(false);
@@ -408,15 +406,11 @@ class NectarCapturer {
         return cam_acquired_total.load();
     }
 
-    unsigned int get_cam_line_period() const {
-        return cam_line_period.load();
-    }
+    unsigned int get_cam_line_period() const { return cam_line_period.load(); }
 
     float get_cam_frame_rate() const { return cam_frame_rate.load(); }
 
-    unsigned int get_cam_packet_size() const {
-        return cam_packet_size.load();
-    }
+    unsigned int get_cam_packet_size() const { return cam_packet_size.load(); }
 
     unsigned int get_cam_max_packet_size() const {
         return cam_max_packet_size.load();
@@ -429,8 +423,7 @@ class NectarCapturer {
         return std::clamp(preview_crop_offset.load(), 0, get_max_crop_offset());
     }
     void set_crop_offset(int offset) {
-        const int clamped =
-            std::clamp(offset, 0, get_max_crop_offset());
+        const int clamped = std::clamp(offset, 0, get_max_crop_offset());
         preview_crop_offset.store(clamped);
     }
 
@@ -459,11 +452,11 @@ class NectarCapturer {
             float preview_scale = desired_width / preview_data_width;
             if (preview_scale <= 0.0f) preview_scale = 1.0f;
             const int preview_disp_width =
-                std::max(1, static_cast<int>(std::round(
-                              preview_data_width * preview_scale)));
+                std::max(1, static_cast<int>(std::round(preview_data_width *
+                                                        preview_scale)));
             const int preview_disp_height =
-                std::max(1, static_cast<int>(std::round(
-                              preview_data_height * preview_scale)));
+                std::max(1, static_cast<int>(std::round(preview_data_height *
+                                                        preview_scale)));
             draw_image(rgb_texture, rgb_image.data(), preview_cols,
                        capture_rows / 2, preview_disp_width,
                        preview_disp_height);
@@ -595,6 +588,7 @@ struct SdlGlGui {
     SDL_GLContext gl_context;
     SDL_Window* window;
     SdlGlGui() {
+        nectar::configure_sdl_touch();
         // Setup SDL
         if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER |
                      SDL_INIT_GAMECONTROLLER) != 0) {
@@ -685,6 +679,7 @@ int main(int argc, char* argv[]) {
     cam_status.last_poll = std::chrono::steady_clock::now() - poll_interval;
     bool done = false;
     bool request_quit_popup = false;
+    nectar::TouchHandler touch_handler;
     std::atomic<uint32_t> frame_lost{0};
     g_frame_lost_counter = &frame_lost;
 
@@ -707,8 +702,7 @@ int main(int argc, char* argv[]) {
         if (settings_file.is_open()) {
             settings_file << "cds_gain=" << nc.cds_gain.load() << '\n';
             settings_file << "analog_gain=" << nc.analog_gain.load() << '\n';
-            settings_file << "shutterspeed=" << nc.shutterspeed.load()
-                          << '\n';
+            settings_file << "shutterspeed=" << nc.shutterspeed.load() << '\n';
         }
     };
     auto stop_capture_session = [&]() {
@@ -722,6 +716,7 @@ int main(int argc, char* argv[]) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             ImGui_ImplSDL2_ProcessEvent(&event);
+            touch_handler.handle_event(event, sdl_gl_gui.window);
             if (event.type == SDL_QUIT) request_quit_popup = true;
             if (event.type == SDL_WINDOWEVENT &&
                 event.window.event == SDL_WINDOWEVENT_CLOSE &&
@@ -793,33 +788,36 @@ int main(int argc, char* argv[]) {
         ImGui::Text("Zoom preview position");
         const float slider_height = nectar::k_slider_track_height;
         const float slider_width = ImGui::GetContentRegionAvail().x;
-        const float handle_ratio =
-            static_cast<float>(nc.get_crop_width()) /
-            static_cast<float>(nc.get_preview_width());
+        const float handle_ratio = static_cast<float>(nc.get_crop_width()) /
+                                   static_cast<float>(nc.get_preview_width());
         const float handle_width = slider_width * handle_ratio;
         const int max_crop_offset = nc.get_max_crop_offset();
         const int crop_offset = nc.get_crop_offset();
         const float slider_travel = std::max(slider_width - handle_width, 0.0f);
         const float normalized =
-            max_crop_offset > 0 ? static_cast<float>(crop_offset) / max_crop_offset
-                                : 0.0f;
+            max_crop_offset > 0
+                ? static_cast<float>(crop_offset) / max_crop_offset
+                : 0.0f;
         ImVec2 slider_pos = ImGui::GetCursorScreenPos();
         const float handle_x =
-            slider_pos.x + (slider_travel > 0 ? normalized * slider_travel : 0.0f);
+            slider_pos.x +
+            (slider_travel > 0 ? normalized * slider_travel : 0.0f);
         ImGui::InvisibleButton("##crop_slider",
                                ImVec2(slider_width, slider_height));
         ImDrawList* draw_list = ImGui::GetWindowDrawList();
         const ImU32 track_color = ImGui::GetColorU32(ImGuiCol_FrameBg);
         const ImU32 border_color = ImGui::GetColorU32(ImGuiCol_Border);
-        const float rounding = std::min(nectar::k_slider_corner_radius,
-                                        slider_height * 0.5f);
+        const float rounding =
+            std::min(nectar::k_slider_corner_radius, slider_height * 0.5f);
         ImVec2 slider_end(slider_pos.x + slider_width,
                           slider_pos.y + slider_height);
         draw_list->AddRectFilled(slider_pos, slider_end, track_color, rounding);
         ImVec2 handle_min(handle_x, slider_pos.y);
-        ImVec2 handle_max(handle_x + handle_width, slider_pos.y + slider_height);
+        ImVec2 handle_max(handle_x + handle_width,
+                          slider_pos.y + slider_height);
         const ImU32 handle_color = ImGui::GetColorU32(ImGuiCol_SliderGrab);
-        draw_list->AddRectFilled(handle_min, handle_max, handle_color, rounding);
+        draw_list->AddRectFilled(handle_min, handle_max, handle_color,
+                                 rounding);
         draw_list->AddRect(handle_min, handle_max, border_color, rounding);
         if ((ImGui::IsItemActive() && ImGui::GetIO().MouseDown[0]) ||
             (ImGui::IsItemHovered() && ImGui::IsMouseClicked(0))) {
@@ -848,9 +846,9 @@ int main(int argc, char* argv[]) {
                 std::chrono::duration<double>(now - last_diag).count();
             if (dt >= 1.0) {
                 const uint32_t acq_total = nc.get_acquired_count();
-                const uint32_t acq_delta =
-                    acq_total >= last_acq_total ? (acq_total - last_acq_total)
-                                                : acq_total;
+                const uint32_t acq_delta = acq_total >= last_acq_total
+                                               ? (acq_total - last_acq_total)
+                                               : acq_total;
                 last_acq_total = acq_total;
                 last_acq_count = acq_delta;
                 last_acq_fps = acq_delta / dt;
@@ -894,8 +892,7 @@ int main(int argc, char* argv[]) {
                           << " cam_line_period=" << cam_line_period
                           << " cam_frame_rate=" << cam_frame_rate
                           << " cam_packet=" << cam_packet
-                          << " cam_packet_max=" << cam_packet_max
-                          << std::endl;
+                          << " cam_packet_max=" << cam_packet_max << std::endl;
                 last_diag = now;
             }
         }

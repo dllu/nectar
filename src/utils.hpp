@@ -1,8 +1,9 @@
 #pragma once
 
-#include <string>
-
+#include <SDL.h>
 #include <imgui.h>
+
+#include <string>
 
 namespace nectar {
 
@@ -14,5 +15,16 @@ inline constexpr float k_button_height = 30.0f;
 bool draw_thick_slider_int(const char* label, int* value, int min_value,
                            int max_value);
 bool draw_large_checkbox(const char* label, bool* value);
+void configure_sdl_touch();
+
+class TouchHandler {
+   public:
+    bool handle_event(const SDL_Event& event, SDL_Window* window);
+    void reset();
+
+   private:
+    bool active_ = false;
+    SDL_FingerID finger_id_ = 0;
+};
 
 }  // namespace nectar

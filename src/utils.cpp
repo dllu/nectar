@@ -5,6 +5,60 @@
 
 namespace nectar {
 
+void configure_sdl_touch() {
+    SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
+    SDL_SetHint(SDL_HINT_MOUSE_TOUCH_EVENTS, "0");
+}
+
+bool TouchHandler::handle_event(const SDL_Event& event, SDL_Window* window) {
+    if (window == nullptr) {
+        return false;
+    }
+    if (event.type != SDL_FINGERDOWN && event.type != SDL_FINGERMOTION &&
+        event.type != SDL_FINGERUP) {
+        return false;
+    }
+    const SDL_FingerID finger_id = event.tfinger.fingerId;
+    if (event.type == SDL_FINGERDOWN) {
+        if (active_) {
+            return false;
+        }
+        active_ = true;
+        finger_id_ = finger_id;
+    } else if (!active_ || finger_id != finger_id_) {
+        return false;
+    }
+
+    int window_w = 0;
+    int window_h = 0;
+    SDL_GetWindowSize(window, &window_w, &window_h);
+    if (window_w <= 0 || window_h <= 0) {
+        return false;
+    }
+
+    ImGuiIO& io = ImGui::GetIO();
+    io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);
+    const float pos_x = event.tfinger.x * window_w;
+    const float pos_y = event.tfinger.y * window_h;
+    io.AddMousePosEvent(pos_x, pos_y);
+
+    if (event.type == SDL_FINGERDOWN) {
+        io.AddMouseButtonEvent(0, true);
+        return true;
+    }
+    if (event.type == SDL_FINGERUP) {
+        io.AddMouseButtonEvent(0, false);
+        active_ = false;
+        return true;
+    }
+    return true;
+}
+
+void TouchHandler::reset() {
+    active_ = false;
+    finger_id_ = 0;
+}
+
 bool draw_thick_slider_int(const char* label, int* value, int min_value,
                            int max_value) {
     const int range = max_value - min_value;
@@ -83,8 +137,7 @@ bool draw_large_checkbox(const char* label, bool* value) {
                            pos.y + box_size.y * 0.55f);
         const ImVec2 mid(pos.x + box_size.x * 0.45f,
                          pos.y + box_size.y * 0.75f);
-        const ImVec2 end(pos.x + box_size.x * 0.75f,
-                         pos.y + box_size.y * 0.3f);
+        const ImVec2 end(pos.x + box_size.x * 0.75f, pos.y + box_size.y * 0.3f);
         draw_list->AddLine(start, mid, check_color, 5.0f);
         draw_list->AddLine(mid, end, check_color, 5.0f);
     }
