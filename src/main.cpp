@@ -215,7 +215,7 @@ class NectarCapturer {
 
     void draw_image(const GLuint image_texture, const uint8_t* const image_data,
                     const int w, const int h, const int w_disp,
-                    const int h_disp) {
+                    const int h_disp, const bool flip_horizontal = false) {
         glBindTexture(GL_TEXTURE_2D, image_texture);
 
         // Setup filtering parameters for display
@@ -231,7 +231,11 @@ class NectarCapturer {
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGB,
                      GL_UNSIGNED_BYTE, image_data);
 
-        ImGui::Image((intptr_t)image_texture, ImVec2(w_disp, h_disp));
+        const ImVec2 uv0 =
+            flip_horizontal ? ImVec2(1.0f, 0.0f) : ImVec2(0.0f, 0.0f);
+        const ImVec2 uv1 =
+            flip_horizontal ? ImVec2(0.0f, 1.0f) : ImVec2(1.0f, 1.0f);
+        ImGui::Image((intptr_t)image_texture, ImVec2(w_disp, h_disp), uv0, uv1);
     }
 
     void capture_loop(INectaCamera& cam) {
@@ -469,10 +473,10 @@ class NectarCapturer {
                                                         preview_scale)));
             draw_image(rgb_texture, rgb_image.data(), preview_cols,
                        capture_rows / 2, preview_disp_width,
-                       preview_disp_height);
+                       preview_disp_height, true);
             draw_image(rgb_crop_texture, rgb_image_cropped.data(), crop_cols,
                        capture_rows / 2, preview_disp_width,
-                       preview_disp_height);
+                       preview_disp_height, true);
             draw_image(hist_texture, histogram.data(), hist_w, hist_h, hist_w,
                        hist_h);
         }
@@ -790,9 +794,8 @@ int main(int argc, char* argv[]) {
             const ImVec2 content_max = ImGui::GetWindowContentRegionMax();
             const float right_group_width =
                 quit_button_size.x + save_button_size.x + 8.0f;
-            const float right_group_x =
-                std::max(ImGui::GetCursorPosX(),
-                         content_max.x - right_group_width);
+            const float right_group_x = std::max(
+                ImGui::GetCursorPosX(), content_max.x - right_group_width);
             ImGui::SetCursorPos(ImVec2(right_group_x, row_start_y));
             ImGui::BeginDisabled(nc.save.load());
             if (ImGui::Button("Review captures", save_button_size)) {
@@ -812,8 +815,8 @@ int main(int argc, char* argv[]) {
                 const float slider_width =
                     ImGui::GetContentRegionAvail().x * 0.7f;
                 ImGui::BeginGroup();
-                if (nectar::draw_large_checkbox_inline(
-                        "cds_gain", &cds_gain_enabled)) {
+                if (nectar::draw_large_checkbox_inline("cds_gain",
+                                                       &cds_gain_enabled)) {
                     nc.cds_gain.store(cds_gain_enabled ? 1 : 0);
                 }
                 ImGui::EndGroup();
@@ -909,9 +912,8 @@ int main(int argc, char* argv[]) {
                 ui_mode = UiMode::Capture;
             }
             const ImVec2 content_max = ImGui::GetWindowContentRegionMax();
-            const float right_x =
-                std::max(ImGui::GetCursorPosX(),
-                         content_max.x - quit_button_size.x);
+            const float right_x = std::max(ImGui::GetCursorPosX(),
+                                           content_max.x - quit_button_size.x);
             ImGui::SetCursorPos(ImVec2(right_x, row_start_y));
             if (ImGui::Button("Quit", quit_button_size)) {
                 request_quit_popup = true;

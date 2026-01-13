@@ -161,7 +161,8 @@ static bool draw_thick_slider_int_impl(const char* label, int* value,
 
 bool draw_thick_slider_int(const char* label, int* value, int min_value,
                            int max_value) {
-    return draw_thick_slider_int_impl(label, value, min_value, max_value, -1.0f);
+    return draw_thick_slider_int_impl(label, value, min_value, max_value,
+                                      -1.0f);
 }
 
 bool draw_thick_slider_int_width(const char* label, int* value, int min_value,
