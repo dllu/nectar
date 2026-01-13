@@ -701,6 +701,16 @@ int main(int argc, char* argv[]) {
 
     NectarCapturer nc;
     std::string output_dir;
+    auto last_save_toggle = std::chrono::steady_clock::time_point::min();
+    const auto save_toggle_debounce = std::chrono::milliseconds(500);
+    auto allow_save_toggle = [&]() {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_save_toggle < save_toggle_debounce) {
+            return false;
+        }
+        last_save_toggle = now;
+        return true;
+    };
     auto start_capture_session = [&]() {
         if (nc.save.load() || !cam_status.connected) {
             return;
@@ -746,9 +756,13 @@ int main(int argc, char* argv[]) {
                 event.key.keysym.sym == SDLK_SPACE) {
                 if (ui_mode == UiMode::Capture) {
                     if (nc.save.load()) {
-                        stop_capture_session();
+                        if (allow_save_toggle()) {
+                            stop_capture_session();
+                        }
                     } else {
-                        start_capture_session();
+                        if (allow_save_toggle()) {
+                            start_capture_session();
+                        }
                     }
                 }
             }
@@ -783,12 +797,16 @@ int main(int argc, char* argv[]) {
             const float row_start_y = ImGui::GetCursorPosY();
             if (nc.save.load()) {
                 if (ImGui::Button("Stop saving", save_button_size)) {
-                    stop_capture_session();
+                    if (allow_save_toggle()) {
+                        stop_capture_session();
+                    }
                 }
             } else {
                 if (ImGui::Button("Start saving", save_button_size) &&
                     cam_status.connected) {
-                    start_capture_session();
+                    if (allow_save_toggle()) {
+                        start_capture_session();
+                    }
                 }
             }
             const ImVec2 content_max = ImGui::GetWindowContentRegionMax();
