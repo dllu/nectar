@@ -701,8 +701,9 @@ int main(int argc, char* argv[]) {
 
     NectarCapturer nc;
     std::string output_dir;
-    auto last_save_toggle = std::chrono::steady_clock::time_point::min();
     const auto save_toggle_debounce = std::chrono::milliseconds(500);
+    auto last_save_toggle = std::chrono::steady_clock::now() -
+                            save_toggle_debounce;
     auto allow_save_toggle = [&]() {
         const auto now = std::chrono::steady_clock::now();
         if (now - last_save_toggle < save_toggle_debounce) {
