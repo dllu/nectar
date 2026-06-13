@@ -14,7 +14,7 @@ set(NECTA_INCLUDE_DIRS
 set(NECTA_LIBRARIES
     ${OPENGL_LIBRARIES}
     ${SDL2_LIBRARIES}
-    /usr/lib/libalkusb3.so.1.11.0
+    /usr/lib/libalkusb3.so.1.13.0
 )
 
 ################################################################

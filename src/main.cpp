@@ -754,7 +754,8 @@ int main(int argc, char* argv[]) {
                 event.window.windowID == SDL_GetWindowID(sdl_gl_gui.window))
                 request_quit_popup = true;
             if (event.type == SDL_KEYDOWN && event.key.repeat == 0 &&
-                event.key.keysym.sym == SDLK_SPACE) {
+                (event.key.keysym.sym == SDLK_SPACE ||
+                 event.key.keysym.sym == SDLK_b)) {
                 if (ui_mode == UiMode::Capture) {
                     if (nc.save.load()) {
                         if (allow_save_toggle()) {
