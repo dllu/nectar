@@ -1,5 +1,11 @@
 # Vertical-stripe correction experiments — 2026-07-26
 
+> **Superseded on 2026-07-27.** The global invalid-band fill and whole-height
+> cosine projection described below caused a severe roof-adjacent regression
+> that the original validation missed. See
+> `2026-07-27-clipped-roof-regression.md` for the reproduced failure, corrected
+> design, and replacement validation.
+
 ## 1. Baseline inspection
 
 The previous correction fitted an affine transform between every adjacent pair

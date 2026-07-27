@@ -1,4 +1,6 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 
@@ -30,7 +32,6 @@ class ColumnJitterCorrectionTest(unittest.TestCase):
             black_levels=np.zeros(4, dtype=np.float32),
             white_levels=np.full(4, 65535.0, dtype=np.float32),
             num_bands=16,
-            basis_size=8,
             temporal_window=31,
             # Deliberately not a divisor of WIDTH, to exercise block halos.
             block_columns=123,
@@ -83,7 +84,6 @@ class ColumnJitterCorrectionTest(unittest.TestCase):
             black_levels=np.zeros(4, dtype=np.float32),
             white_levels=np.full(4, 65535.0, dtype=np.float32),
             num_bands=16,
-            basis_size=8,
             temporal_window=31,
             block_columns=self.WIDTH,
             show_progress=False,
@@ -92,6 +92,120 @@ class ColumnJitterCorrectionTest(unittest.TestCase):
             model.band_corrections,
             single_block_model.band_corrections,
         )
+
+    def test_broad_stripe_cadence_is_reduced(self):
+        clean_template = self.make_clean_channels()[:, :, :1]
+        clean = np.repeat(clean_template, self.WIDTH, axis=2)
+        columns = np.arange(self.WIDTH, dtype=np.float32)
+        broad_error = 300.0 * np.sin(2.0 * np.pi * columns / 120.0)
+        channel_response = np.array([1.0, 0.75, 1.2, 0.9], dtype=np.float32)
+        striped = clean + channel_response[:, None, None] * broad_error[None, None, :]
+
+        model = preview.column_exposure_jitter_correction(
+            *striped,
+            black_levels=np.zeros(4, dtype=np.float32),
+            white_levels=np.full(4, 65535.0, dtype=np.float32),
+            num_bands=16,
+            fine_temporal_window=31,
+            temporal_window=255,
+            block_columns=123,
+            show_progress=False,
+        )
+        corrected = np.stack(
+            [
+                model.apply_window(striped[channel], channel, 0)
+                for channel in range(4)
+            ]
+        )
+        before = np.sqrt(np.mean(np.square(striped - clean)))
+        after = np.sqrt(np.mean(np.square(corrected - clean)))
+        self.assertLess(after, 0.5 * before)
+
+    def test_clipped_scene_transition_does_not_leak_into_other_rows(self):
+        clean = self.make_clean_channels()
+        clipped_scene = clean.copy()
+        # A narrow, overexposed roof-like feature occupies the lower half of
+        # the sensor. Its temporal-median residual must not be projected into
+        # the unaffected dark/gradient rows above it.
+        clipped_scene[:, self.HEIGHT // 2 :, 220:228] = 65535.0
+
+        model = preview.column_exposure_jitter_correction(
+            *clipped_scene,
+            black_levels=np.zeros(4, dtype=np.float32),
+            white_levels=np.full(4, 65535.0, dtype=np.float32),
+            num_bands=16,
+            fine_temporal_window=31,
+            temporal_window=255,
+            block_columns=123,
+            show_progress=False,
+        )
+        corrected = np.stack(
+            [
+                model.apply_window(clipped_scene[channel], channel, 0)
+                for channel in range(4)
+            ]
+        )
+
+        np.testing.assert_array_equal(
+            corrected[:, : self.HEIGHT // 2],
+            clipped_scene[:, : self.HEIGHT // 2],
+        )
+
+    def test_structure_mask_preserves_a_narrow_scene_feature(self):
+        clean = self.make_clean_channels()
+        scene = clean.copy()
+        # Keep the feature inside both correction caps, so the structure mask
+        # rather than the amplitude limit is what preserves it.
+        scene[:, :, 220:228] += 500.0
+        scale = 4
+        structure_mask = np.zeros(
+            (self.HEIGHT // scale, self.WIDTH // scale),
+            dtype=bool,
+        )
+        structure_mask[:, 220 // scale : 228 // scale] = True
+
+        model = preview.column_exposure_jitter_correction(
+            *scene,
+            black_levels=np.zeros(4, dtype=np.float32),
+            white_levels=np.full(4, 65535.0, dtype=np.float32),
+            num_bands=16,
+            temporal_window=31,
+            block_columns=123,
+            structure_mask=structure_mask,
+            structure_mask_scale=scale,
+            show_progress=False,
+        )
+        corrected = np.stack(
+            [model.apply_window(scene[channel], channel, 0) for channel in range(4)]
+        )
+        np.testing.assert_array_equal(
+            corrected[:, :, 220:228],
+            scene[:, :, 220:228],
+        )
+
+    def test_unsupported_owner_band_rejects_neighbor_interpolation(self):
+        corrections = np.zeros((4, 2, 1), dtype=np.float16)
+        corrections[preview.JITTER_RED, 1, 0] = 100.0
+        model = preview.ColumnJitterModel(
+            corrections,
+            image_height=8,
+            black_levels=np.zeros(4, dtype=np.float32),
+            white_levels=np.full(4, 1000.0, dtype=np.float32),
+            confidence=np.ones(1, dtype=np.float32),
+        )
+        values = np.full((2, 1), 500.0, dtype=np.float32)
+        corrected = model.correct_samples(
+            values,
+            preview.JITTER_RED,
+            np.zeros(1, dtype=np.int32),
+            rows=np.array([3, 4], dtype=np.int32),
+        )
+
+        # Both rows interpolate across the same band boundary. Row 3 belongs
+        # to unsupported band 0 and must stay exact; row 4 belongs to the
+        # supported neighbor and may receive its tapered correction.
+        self.assertEqual(float(corrected[0, 0]), 500.0)
+        self.assertGreater(float(corrected[1, 0]), 500.0)
 
     def test_clipped_samples_are_unchanged(self):
         clean = self.make_clean_channels()
@@ -135,6 +249,64 @@ class ColumnJitterCorrectionTest(unittest.TestCase):
             rtol=0.0,
             atol=0.0,
         )
+
+    def test_speed_fit_rejects_low_confidence_reversal_aliases(self):
+        x = np.arange(40, dtype=np.float64)
+        y = np.full(40, -0.3, dtype=np.float64)
+        weights = np.ones(40, dtype=np.float64)
+        y[:8] = 2.7
+        y[-8:] = 2.7
+        weights[:8] = 0.1
+        weights[-8:] = 0.1
+
+        with TemporaryDirectory() as output_dir:
+            spline = preview.robust_bspline_fit(
+                x,
+                y,
+                weights,
+                smoothness=80000,
+                g=Path(output_dir),
+            )
+
+        # The fallback clamps extrapolation to the supported interval, so the
+        # rejected opposite-direction aliases cannot reappear at either end.
+        fitted = spline(np.linspace(-100.0, 100.0, 1000))
+        self.assertTrue(np.all(fitted < 0.0))
+        np.testing.assert_allclose(fitted, -0.3, atol=1e-9, rtol=0.0)
+
+    def test_speed_fit_rejects_catastrophic_dynamic_range(self):
+        x = np.arange(80, dtype=np.float64)
+        y = np.linspace(-0.15, -0.45, len(x))
+        weights = np.ones_like(x)
+
+        with TemporaryDirectory() as output_dir:
+            spline = preview.robust_bspline_fit(
+                x,
+                y,
+                weights,
+                smoothness=80000,
+                g=Path(output_dir),
+            )
+
+        fitted = spline(np.linspace(-100.0, 200.0, 1000))
+        np.testing.assert_allclose(fitted, -0.3, atol=0.002, rtol=0.0)
+
+    def test_speed_fit_preserves_supported_moderate_change(self):
+        x = np.arange(80, dtype=np.float64)
+        y = np.linspace(-1.0, -1.2, len(x))
+        weights = np.ones_like(x)
+
+        with TemporaryDirectory() as output_dir:
+            spline = preview.robust_bspline_fit(
+                x,
+                y,
+                weights,
+                smoothness=80000,
+                g=Path(output_dir),
+            )
+
+        fitted = spline(x)
+        self.assertLess(fitted[-1], fitted[0] - 0.15)
 
 
 if __name__ == "__main__":

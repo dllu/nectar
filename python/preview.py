@@ -7,11 +7,11 @@ import time
 from collections import OrderedDict
 from pathlib import Path
 
+import bottleneck as bn
 import cv2
 import matplotlib.pyplot as plt
 from numpy.lib.stride_tricks import sliding_window_view
 import numpy as np
-from scipy.ndimage import median_filter
 from scipy.optimize import curve_fit
 from scipy.interpolate import UnivariateSpline
 from tqdm import tqdm
@@ -36,20 +36,20 @@ FORCE_CONTIGUOUS_SELECTION = True
 FLIP_OUTPUT_180 = True
 STRUCTURE_MASK_DOWNSAMPLE = 8
 STRUCTURE_MASK_THRESHOLD = 0.05
-STRUCTURE_MASK_DILATE_PX = 128
+STRUCTURE_MASK_DILATE_PX = 0
 ENABLE_JITTER_DEBUG_PLOT = False
 JITTER_DEBUG_ROW = 2000
-JITTER_VERTICAL_BANDS = 64
-JITTER_ROW_BASIS_SIZE = 12
-JITTER_TEMPORAL_WINDOW = 31
+JITTER_VERTICAL_BANDS = 256
+JITTER_FINE_TEMPORAL_WINDOW = 31
+JITTER_TEMPORAL_WINDOW = 1023
 JITTER_BLOCK_COLUMNS = 4096
 JITTER_MAX_CLIPPED_FRACTION = 0.10
 JITTER_BLACK_MARGIN = 64.0
 JITTER_WHITE_MARGIN_FRACTION = 0.03
 JITTER_WHITE_MARGIN_MIN = 256.0
-JITTER_CONSENSUS_LOW = 0.52
-JITTER_CONSENSUS_HIGH = 0.80
-
+JITTER_FINE_MAX_CORRECTION_FRACTION = 0.02
+JITTER_BROAD_MAX_CORRECTION_FRACTION = 0.01
+SPEED_MAX_FIT_DYNAMIC_RANGE = 1.5
 JITTER_RED = 0
 JITTER_GREEN1 = 1
 JITTER_GREEN2 = 2
@@ -560,34 +560,143 @@ def robust_bspline_fit(
 
     Also plots the data and the final spline fit.
     """
-    current_weights = np.copy(weights)
-    initial_weights = np.copy(weights)
-    spline = None
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
+    if x.ndim != 1 or y.shape != x.shape or weights.shape != x.shape:
+        raise ValueError("x, y, and weights must be one-dimensional and equal length")
+    if len(x) < 4:
+        raise ValueError("At least four motion samples are required for a cubic spline")
 
-    for i in range(num_iter):
-        # Use square-root weights as required by UnivariateSpline (least-squares weighting)
-        spline = UnivariateSpline(x, y, w=np.sqrt(current_weights), k=3, s=smoothness)
-        y_fit = spline(x)
-        residuals = y - y_fit
+    def fit_irls(fit_x, fit_y, fit_weights):
+        current_weights = np.copy(fit_weights)
+        spline = None
 
-        # Robust scale estimate via median absolute deviation (MAD)
-        mad = np.median(np.abs(residuals - np.median(residuals)))
-        scale = mad / 0.6745 if mad > 1e-6 else 1.0
+        for _ in range(num_iter):
+            # Use square-root weights as required by UnivariateSpline
+            # (least-squares weighting).
+            spline = UnivariateSpline(
+                fit_x,
+                fit_y,
+                w=np.sqrt(current_weights),
+                k=3,
+                s=smoothness,
+            )
+            residuals = fit_y - spline(fit_x)
 
-        # Compute scaled residuals and the Tukey biweight factors:
-        u = residuals / (c * scale)
-        robust_factor = np.square(1 - u**2)
-        robust_factor[np.abs(u) >= 1] = 0
+            # Robust scale estimate via median absolute deviation (MAD).
+            mad = np.median(np.abs(residuals - np.median(residuals)))
+            scale = mad / 0.6745 if mad > 1e-6 else 1.0
 
-        new_weights = weights * robust_factor
+            # Compute scaled residuals and Tukey biweight factors.
+            u = residuals / (c * scale)
+            robust_factor = np.square(1 - u**2)
+            robust_factor[np.abs(u) >= 1] = 0
+            new_weights = fit_weights * robust_factor
 
-        # Check for convergence in weight updates.
-        if np.linalg.norm(new_weights - current_weights) < 1e-3 * np.linalg.norm(
-            current_weights
-        ):
+            if np.linalg.norm(new_weights - current_weights) < 1e-3 * np.linalg.norm(
+                current_weights
+            ):
+                current_weights = new_weights
+                break
             current_weights = new_weights
-            break
-        current_weights = new_weights
+
+        return spline, current_weights
+
+    def crosses_zero(spline, lower, upper):
+        dense_x = np.linspace(lower, upper, 500)
+        dense_y = spline(dense_x)
+        return (np.max(dense_y) > 0) != (np.min(dense_y) > 0)
+
+    def weighted_median(values, sample_weights):
+        order = np.argsort(values)
+        cumulative = np.cumsum(sample_weights[order])
+        midpoint = 0.5 * cumulative[-1]
+        return values[order[np.searchsorted(cumulative, midpoint)]]
+
+    initial_weights = np.copy(weights)
+    fit_x = x
+    fit_y = y
+    fit_weights = weights
+    spline, current_weights = fit_irls(fit_x, fit_y, fit_weights)
+    used_direction_fallback = False
+    used_constant_fallback = False
+
+    if crosses_zero(spline, np.min(x), np.max(x)):
+        # A single pass can contain weak periodic aliases on both sides of
+        # zero. Physical motion cannot reverse within one capture, so retry
+        # using the well-supported direction instead of allowing the spline
+        # to cross zero and catastrophically stretch the output.
+        dominant_motion = weighted_median(y, weights)
+        confidence_cutoff = 0.2 * np.max(weights)
+        fallback_mask = (y * dominant_motion > 0) & (
+            weights >= confidence_cutoff
+        )
+        if np.count_nonzero(fallback_mask) < 4:
+            raise ValueError("Oscillating spline found")
+
+        fit_x = x[fallback_mask]
+        fit_y = y[fallback_mask]
+        fit_weights = weights[fallback_mask]
+        spline, current_weights = fit_irls(fit_x, fit_y, fit_weights)
+        if crosses_zero(spline, np.min(fit_x), np.max(fit_x)):
+            raise ValueError("Oscillating spline found")
+
+        # Outside the supported interval, hold the nearest fitted speed. A
+        # cubic extrapolation can otherwise invent another sign reversal.
+        support_min = float(np.min(fit_x))
+        support_max = float(np.max(fit_x))
+        unclamped_spline = spline
+
+        def spline(values):
+            return unclamped_spline(np.clip(values, support_min, support_max))
+
+        used_direction_fallback = True
+        print(
+            "speed fit: rejected reversal aliases; "
+            f"using {len(fit_x)}/{len(x)} high-confidence samples "
+            f"from {support_min:g} to {support_max:g}"
+        )
+
+    motion_dense = spline(np.linspace(np.min(x), np.max(x), 500))
+    motion_magnitude = np.abs(motion_dense)
+    dynamic_range = np.max(motion_magnitude) / max(
+        np.min(motion_magnitude),
+        1e-6,
+    )
+    if dynamic_range > SPEED_MAX_FIT_DYNAMIC_RANGE:
+        # A train cannot plausibly change image speed by this much over one
+        # selected pass without producing an obvious aspect-ratio drift. This
+        # occurs when a weak capture's local correlations acquire a smooth
+        # scene-dependent bias: IRLS cannot reject it because it is coherent.
+        # Preserve ordinary acceleration fits, but replace a catastrophic
+        # range with the robust constant supported by confident samples.
+        dominant_motion = weighted_median(y, weights)
+        confidence_cutoff = 0.2 * np.max(weights)
+        fallback_mask = (y * dominant_motion > 0) & (
+            weights >= confidence_cutoff
+        )
+        if np.count_nonzero(fallback_mask) < 4:
+            raise ValueError("Implausible speed-fit dynamic range")
+
+        fit_x = x[fallback_mask]
+        fit_y = y[fallback_mask]
+        fit_weights = weights[fallback_mask]
+        constant_motion = float(weighted_median(fit_y, fit_weights))
+
+        def spline(values):
+            values = np.asarray(values, dtype=np.float64)
+            return np.full_like(values, constant_motion, dtype=np.float64)
+
+        current_weights = fit_weights
+        used_constant_fallback = True
+        print(
+            "speed fit: "
+            f"{dynamic_range:.2f}x dynamic range exceeds "
+            f"{SPEED_MAX_FIT_DYNAMIC_RANGE:.2f}x; using robust constant "
+            f"{constant_motion:.6f} from {len(fit_x)}/{len(x)} "
+            "high-confidence samples"
+        )
 
     # Plot the original data and the fitted spline with weights below.
     fig, (ax1, ax2) = plt.subplots(
@@ -602,13 +711,29 @@ def robust_bspline_fit(
     x_dense = np.linspace(np.min(x), np.max(x), 500)
     y_dense = spline(x_dense)
     ax1.plot(x_dense, y_dense, "r-", lw=2, label="Robust Cubic B-spline")
+    if used_direction_fallback or used_constant_fallback:
+        ax1.plot(
+            fit_x,
+            fit_y,
+            "go",
+            fillstyle="none",
+            label=(
+                "Constant-speed support"
+                if used_constant_fallback
+                else "Direction-consistent support"
+            ),
+        )
     ax1.plot(x, np.zeros_like(x), "k--")
-    ax1.set_title("Robust Cubic B-spline Fit")
+    ax1.set_title(
+        "Robust constant-speed fallback"
+        if used_constant_fallback
+        else "Robust Cubic B-spline Fit"
+    )
     ax1.set_ylabel("y")
     ax1.legend()
 
     ax2.plot(x, initial_weights, "k.", label="Initial weights")
-    ax2.plot(x, current_weights, "r.", label="Final weights")
+    ax2.plot(fit_x, current_weights, "r.", label="Final weights")
     ax2.set_xlabel("x")
     ax2.set_ylabel("weight")
     ax2.legend()
@@ -880,10 +1005,17 @@ class ColumnJitterModel:
         above = upper >= self.num_bands
         lower = np.clip(lower, 0, self.num_bands - 1)
         upper = np.clip(upper, 0, self.num_bands - 1)
+        owner = np.floor(
+            (np.arange(self.image_height, dtype=np.float32) + 0.5)
+            * self.num_bands
+            / self.image_height
+        ).astype(np.int32)
+        owner = np.clip(owner, 0, self.num_bands - 1)
         weight[below] = 0.0
         weight[above] = 0.0
         self._row_band_lower = lower
         self._row_band_upper = upper
+        self._row_band_owner = owner
         self._row_band_weight = weight.astype(np.float32)
 
     def correct_samples(
@@ -934,6 +1066,14 @@ class ColumnJitterModel:
             np.float32
         )
         correction = correction_low + (correction_high - correction_low) * weight
+        # Interpolation may taper a supported band toward an unsupported
+        # neighbor, but it must never carry that neighbor's value across the
+        # boundary into a band whose own estimate is zero.
+        correction_owner = channel_model[
+            self._row_band_owner[rows, None],
+            column_grid,
+        ]
+        correction = np.where(correction_owner != 0.0, correction, 0.0)
 
         black = float(self.black_levels[channel])
         white = float(self.white_levels[channel])
@@ -1037,15 +1177,55 @@ def _jitter_band_statistics(
     return medians, ~invalid
 
 
-def _jitter_dct_bases(num_bands: int, basis_size: int):
-    basis_size = min(max(1, basis_size), num_bands)
-    band_positions = (
-        np.arange(num_bands, dtype=np.float32)[:, None] + 0.5
-    ) / num_bands
-    frequencies = np.arange(basis_size, dtype=np.float32)[None, :]
-    band_basis = np.cos(np.pi * band_positions * frequencies).astype(np.float32)
-    band_pseudoinverse = np.linalg.pinv(band_basis).astype(np.float32)
-    return band_basis, band_pseudoinverse
+def _centered_moving_median(
+    values: np.ndarray,
+    window: int,
+) -> np.ndarray:
+    """Fast centered median with nearest-value padding at both ends."""
+    radius = window // 2
+    pad_width = [(0, 0)] * values.ndim
+    pad_width[-1] = (radius, radius)
+    padded = np.pad(values, pad_width, mode="edge")
+    trailing = bn.move_median(
+        padded,
+        window=window,
+        min_count=window,
+        axis=-1,
+    )
+    start = window - 1
+    return trailing[..., start : start + values.shape[-1]].astype(
+        np.float32,
+        copy=False,
+    )
+
+
+def _jitter_structure_bands(
+    structure_mask: np.ndarray,
+    *,
+    image_height: int,
+    image_width: int,
+    num_bands: int,
+    scale: int,
+) -> np.ndarray:
+    """Reduce a downsampled scene-edge mask to jitter band/column support."""
+    if scale < 1:
+        raise ValueError("structure_mask_scale must be positive")
+    if image_height % scale or image_width % scale:
+        raise ValueError("jitter image dimensions must be divisible by mask scale")
+    expected_shape = (image_height // scale, image_width // scale)
+    structure_mask = np.asarray(structure_mask, dtype=bool)
+    if structure_mask.shape != expected_shape:
+        raise ValueError(
+            "structure_mask has shape "
+            f"{structure_mask.shape}, expected {expected_shape}"
+        )
+    if expected_shape[0] % num_bands:
+        raise ValueError("downsampled mask height must be divisible by num_bands")
+    return structure_mask.reshape(
+        num_bands,
+        expected_shape[0] // num_bands,
+        expected_shape[1],
+    ).any(axis=1)
 
 
 def column_exposure_jitter_correction(
@@ -1058,9 +1238,11 @@ def column_exposure_jitter_correction(
     black_levels: np.ndarray | None = None,
     white_levels: np.ndarray | None = None,
     num_bands: int = JITTER_VERTICAL_BANDS,
-    basis_size: int = JITTER_ROW_BASIS_SIZE,
+    fine_temporal_window: int = JITTER_FINE_TEMPORAL_WINDOW,
     temporal_window: int = JITTER_TEMPORAL_WINDOW,
     block_columns: int = JITTER_BLOCK_COLUMNS,
+    structure_mask: np.ndarray | None = None,
+    structure_mask_scale: int = 1,
     show_progress: bool = True,
 ) -> ColumnJitterModel:
     """
@@ -1069,9 +1251,14 @@ def column_exposure_jitter_correction(
     A centered temporal median supplies the local unstriped target. Unlike the
     former adjacent-column composition, this has no cumulative state: monotonic
     scene gradients are fixed points and cannot turn into correction drift.
-    Corrections are accepted only when their sign agrees across the four Bayer
-    channels and many vertical bands. Clipped bands are excluded, then the
-    vertical response is projected onto a small cosine basis.
+    A short centered median removes narrow line jitter. A longer median handles
+    broader exposure cycles, but that broad component is accepted only inside
+    a small exposure-relative envelope so a bright scene plateau cannot be
+    mistaken for camera error. Strong scene structure is excluded by a
+    downsampled edge mask. This lets each Bayer channel and row band retain its
+    own response instead of forcing unlike channels to share a sign. Clipped,
+    structured, or otherwise unsupported bands receive zero correction;
+    estimates are never filled or extrapolated from other parts of the sensor.
     """
     del g  # Retained in the signature for callers that group outputs by capture.
     channel_views = (red_view, green1, green2, blue_view)
@@ -1085,8 +1272,15 @@ def column_exposure_jitter_correction(
         raise ValueError(
             f"image height {image_height} must be divisible by {num_bands}"
         )
-    if temporal_window < 3 or temporal_window % 2 != 1:
-        raise ValueError("temporal_window must be an odd integer of at least 3")
+    if fine_temporal_window < 3 or fine_temporal_window % 2 != 1:
+        raise ValueError(
+            "fine_temporal_window must be an odd integer of at least 3"
+        )
+    if temporal_window < fine_temporal_window or temporal_window % 2 != 1:
+        raise ValueError(
+            "temporal_window must be an odd integer no smaller than "
+            "fine_temporal_window"
+        )
     if block_columns < 1:
         raise ValueError("block_columns must be positive")
 
@@ -1102,7 +1296,16 @@ def column_exposure_jitter_correction(
         raise ValueError("black_levels and white_levels must each contain 4 values")
     white_levels = np.maximum(white_levels, black_levels + 1.0)
 
-    band_basis, band_pseudoinverse = _jitter_dct_bases(num_bands, basis_size)
+    structure_bands = None
+    if structure_mask is not None:
+        structure_bands = _jitter_structure_bands(
+            structure_mask,
+            image_height=image_height,
+            image_width=image_width,
+            num_bands=num_bands,
+            scale=structure_mask_scale,
+        )
+
     band_corrections = np.empty(
         (4, num_bands, image_width),
         dtype=np.float16,
@@ -1122,7 +1325,8 @@ def column_exposure_jitter_correction(
         read_stop = min(image_width, core_stop + radius)
         core_slice = slice(core_start - read_start, core_stop - read_start)
         core_width = core_stop - core_start
-        offsets = np.empty((4, num_bands, core_width), dtype=np.float32)
+        fine_offsets = np.empty((4, num_bands, core_width), dtype=np.float32)
+        broad_offsets = np.empty((4, num_bands, core_width), dtype=np.float32)
         valid = np.empty((4, num_bands, core_width), dtype=bool)
 
         for channel, view in enumerate(channel_views):
@@ -1133,50 +1337,55 @@ def column_exposure_jitter_correction(
                 float(black_levels[channel]),
                 float(white_levels[channel]),
             )
-            local_target = median_filter(
+            fine_target = _centered_moving_median(
                 statistics,
-                size=(1, temporal_window),
-                mode="nearest",
+                fine_temporal_window,
             )
-            offsets[channel] = (local_target - statistics)[:, core_slice]
+            broad_target = _centered_moving_median(
+                statistics,
+                temporal_window,
+            )
+            fine_offsets[channel] = (fine_target - statistics)[:, core_slice]
+            broad_offsets[channel] = (
+                broad_target - fine_target
+            )[:, core_slice]
             valid[channel] = band_valid[:, core_slice]
 
-        flat_valid = valid.reshape(-1, core_width)
-        flat_offsets = offsets.reshape(-1, core_width)
-        fallback_values = np.where(flat_valid, flat_offsets, np.nan)
-        all_invalid = ~np.any(flat_valid, axis=0)
-        fallback_values[0, all_invalid] = 0.0
-        fallback = np.nanmedian(fallback_values, axis=0).astype(
-            np.float32, copy=False
-        )
-        filled_offsets = np.where(valid, offsets, fallback[None, None, :])
-
-        positive = np.sum((offsets > 0.0) & valid, axis=(0, 1))
-        negative = np.sum((offsets < 0.0) & valid, axis=(0, 1))
-        valid_count = np.sum(valid, axis=(0, 1))
-        agreement = np.maximum(positive, negative) / np.maximum(valid_count, 1)
-        confidence = np.clip(
-            (agreement - JITTER_CONSENSUS_LOW)
-            / (JITTER_CONSENSUS_HIGH - JITTER_CONSENSUS_LOW),
-            0.0,
-            1.0,
-        ).astype(np.float32)
-        valid_channel_count = np.sum(np.any(valid, axis=1), axis=0)
-        confidence[
-            (valid_count < num_bands) | (valid_channel_count < 2)
-        ] = 0.0
-        confidence_full[core_start:core_stop] = confidence
-        filled_offsets *= confidence[None, None, :]
-
-        for channel in range(4):
-            coefficients = band_pseudoinverse @ filled_offsets[channel]
-            smooth_bands = band_basis @ coefficients
-            smooth_bands = np.clip(
-                smooth_bands,
-                -np.finfo(np.float16).max,
-                np.finfo(np.float16).max,
+        if structure_bands is not None:
+            lowres_columns = (
+                np.arange(core_start, core_stop, dtype=np.int64)
+                // structure_mask_scale
             )
-            band_corrections[channel, :, core_start:core_stop] = smooth_bands
+            structured = structure_bands[:, lowres_columns]
+            valid &= ~structured[None, :, :]
+
+        spans = (white_levels - black_levels)[:, None, None]
+        fine_supported = valid & (
+            np.abs(fine_offsets)
+            <= JITTER_FINE_MAX_CORRECTION_FRACTION * spans
+        )
+        broad_supported = valid & (
+            np.abs(broad_offsets)
+            <= JITTER_BROAD_MAX_CORRECTION_FRACTION * spans
+        )
+        local_corrections = np.where(
+            fine_supported,
+            fine_offsets,
+            0.0,
+        ) + np.where(
+            broad_supported,
+            broad_offsets,
+            0.0,
+        )
+        band_corrections[:, :, core_start:core_stop] = np.clip(
+            local_corrections,
+            -np.finfo(np.float16).max,
+            np.finfo(np.float16).max,
+        )
+        confidence_full[core_start:core_stop] = np.mean(
+            fine_supported | broad_supported,
+            axis=(0, 1),
+        )
 
     return ColumnJitterModel(
         band_corrections,
@@ -1715,6 +1924,8 @@ def process_preview(
             g=g,
             black_levels=jitter_black_levels,
             white_levels=jitter_white_levels,
+            structure_mask=mask_full,
+            structure_mask_scale=STRUCTURE_MASK_DOWNSAMPLE,
         )
     if ENABLE_JITTER_DEBUG_PLOT and jitter_models is not None:
         row_idx = min(JITTER_DEBUG_ROW, green1.height - 1)
