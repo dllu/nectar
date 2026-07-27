@@ -1,12 +1,17 @@
 #!/usr/bin/env python
+from __future__ import annotations
+
+import argparse
 import math
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 import cv2
 import matplotlib.pyplot as plt
 from numpy.lib.stride_tricks import sliding_window_view
 import numpy as np
+from scipy.ndimage import median_filter
 from scipy.optimize import curve_fit
 from scipy.interpolate import UnivariateSpline
 from tqdm import tqdm
@@ -26,17 +31,29 @@ RAW_COLOR_CORRECTION = np.array(
 
 CAMERA_MAKE = "Alkeria"
 CAMERA_MODEL_NAME = "Alkeria Necta N4K2-7C"
-ENABLE_COLUMN_JITTER_CORRECTION = False
+ENABLE_COLUMN_JITTER_CORRECTION = True
 FORCE_CONTIGUOUS_SELECTION = True
 FLIP_OUTPUT_180 = True
 STRUCTURE_MASK_DOWNSAMPLE = 8
 STRUCTURE_MASK_THRESHOLD = 0.05
 STRUCTURE_MASK_DILATE_PX = 128
-ENABLE_JITTER_DEBUG_PLOT = True
+ENABLE_JITTER_DEBUG_PLOT = False
 JITTER_DEBUG_ROW = 2000
-JITTER_DOWNSAMPLE_Y = 4
-JITTER_BLUR_ITER = 2
-JITTER_X_SCALE = 32768.0
+JITTER_VERTICAL_BANDS = 64
+JITTER_ROW_BASIS_SIZE = 12
+JITTER_TEMPORAL_WINDOW = 31
+JITTER_BLOCK_COLUMNS = 4096
+JITTER_MAX_CLIPPED_FRACTION = 0.10
+JITTER_BLACK_MARGIN = 64.0
+JITTER_WHITE_MARGIN_FRACTION = 0.03
+JITTER_WHITE_MARGIN_MIN = 256.0
+JITTER_CONSENSUS_LOW = 0.52
+JITTER_CONSENSUS_HIGH = 0.80
+
+JITTER_RED = 0
+JITTER_GREEN1 = 1
+JITTER_GREEN2 = 2
+JITTER_BLUE = 3
 
 
 def _normalize_rows(matrix: np.ndarray) -> np.ndarray:
@@ -191,10 +208,18 @@ def format_contiguous_segments(indices):
 
 
 class FileDataCache:
-    def __init__(self, bin_paths, dtype, rows):
+    def __init__(
+        self,
+        bin_paths,
+        dtype,
+        rows,
+        max_cache_bytes: int = 512 * 1024 * 1024,
+    ):
         self.bin_paths = bin_paths
         self.dtype = dtype
         self.rows = rows
+        self.max_cache_bytes = max(1, max_cache_bytes)
+        self.cached_bytes = 0
         # determine columns per file
         self.file_cols = []
         for p in bin_paths:
@@ -208,14 +233,16 @@ class FileDataCache:
         self.cum_cols = np.concatenate(([0], np.cumsum(self.file_cols)))
         self.total_cols = int(self.cum_cols[-1])
         self.height = rows
-        self.cache = {}
+        self.cache = OrderedDict()
 
     @property
     def shape(self):
         return (self.height, self.total_cols)
 
     def _load_file(self, idx):
-        if idx not in self.cache:
+        if idx in self.cache:
+            self.cache.move_to_end(idx)
+        else:
             # load and reshape file idx
             data1d = np.fromfile(self.bin_paths[idx], dtype=self.dtype).astype(
                 np.float32
@@ -223,6 +250,10 @@ class FileDataCache:
             # reshape to (rows, cols) then transpose to (height, cols)
             data2d = data1d.reshape(-1, self.height).T
             self.cache[idx] = data2d
+            self.cached_bytes += data2d.nbytes
+            while self.cached_bytes > self.max_cache_bytes and len(self.cache) > 1:
+                _, evicted = self.cache.popitem(last=False)
+                self.cached_bytes -= evicted.nbytes
         return self.cache[idx]
 
     def __getitem__(self, key):
@@ -269,15 +300,15 @@ class FileDataCache:
                 lo = max(start, fstart) - fstart
                 hi = min(stop, fend) - fstart
                 arr_file = self._load_file(i)
-                blocks.append(arr_file[:, lo:hi])
+                blocks.append(arr_file[row_idx, lo:hi])
             if not blocks:
-                return np.empty((self.height, 0), dtype=np.float32)
-            arr = np.concatenate(blocks, axis=1)
+                empty = np.empty((self.height, 0), dtype=np.float32)
+                return empty[row_idx, :]
+            arr = np.concatenate(blocks, axis=-1)
             # apply column step
             if step != 1:
-                arr = arr[:, ::step]
-            # apply row indexing
-            return arr[row_idx, :]
+                arr = arr[..., ::step]
+            return arr
         # unsupported indexing
         raise IndexError("Unsupported index type for FileDataCache")
 
@@ -386,7 +417,7 @@ def windowed_cross_correlation(
     window_size: int = 4096,
     corr_size: int = 15,
     output_dir: Path = None,
-    jitter_models: np.ndarray | None = None,
+    jitter_models: ColumnJitterModel | None = None,
 ) -> np.ndarray:
     """
     green_1: (h, w) where w >> h and w >> window_size
@@ -412,14 +443,21 @@ def windowed_cross_correlation(
     ):
         window_1 = green_1[:, x : x + window_step]
         if jitter_models is not None:
-            window_1 = apply_column_models(window_1, jitter_models, x)
+            window_1 = apply_column_models(
+                window_1, jitter_models, x, JITTER_GREEN1
+            )
         window_1 = vertical_energy(window_1)
 
         corrs = np.zeros((corr_size,))
         pad = corr_half
         window_2_base = green_2[:, x - pad : x + window_step + pad]
         if jitter_models is not None:
-            window_2_base = apply_column_models(window_2_base, jitter_models, x - pad)
+            window_2_base = apply_column_models(
+                window_2_base,
+                jitter_models,
+                x - pad,
+                JITTER_GREEN2,
+            )
         window_2_base = vertical_energy(window_2_base)
 
         for corr_ind in range(corr_size):
@@ -719,40 +757,6 @@ def bin2to1(data):
     return (data[::2, ::2] + data[1::2, ::2] + data[::2, 1::2] + data[1::2, 1::2]) / 4
 
 
-def bin_vertical(data: np.ndarray, factor: int) -> np.ndarray:
-    if factor <= 1:
-        return data
-    h = (data.shape[0] // factor) * factor
-    if h == 0:
-        return np.empty((0,) + data.shape[1:], dtype=data.dtype)
-    trimmed = data[:h, ...]
-    reshaped = trimmed.reshape(h // factor, factor, *data.shape[1:])
-    return reshaped.mean(axis=1)
-
-
-def box_blur_1d(vec: np.ndarray, radius: int) -> np.ndarray:
-    if radius <= 0 or vec.size == 0:
-        return vec
-    window = 2 * radius + 1
-    pad = np.pad(vec, (radius, radius), mode="edge")
-    csum = np.cumsum(pad, dtype=np.float64)
-    csum = np.concatenate(([0.0], csum))
-    blurred = (csum[window:] - csum[:-window]) / window
-    return blurred.astype(vec.dtype, copy=False)
-
-
-def box_blur_vertical(data: np.ndarray, radius: int, iterations: int) -> np.ndarray:
-    if iterations <= 0 or radius <= 0 or data.size == 0:
-        return data
-    blurred = data.astype(np.float32, copy=False)
-    for _ in range(iterations):
-        out = np.empty_like(blurred)
-        for col in range(blurred.shape[1]):
-            out[:, col] = box_blur_1d(blurred[:, col], radius)
-        blurred = out
-    return blurred
-
-
 def estimate_white_balance(bin_paths, max_samples: int = 8) -> np.ndarray:
     if not bin_paths:
         return np.ones(3, dtype=np.float32)
@@ -833,116 +837,215 @@ def autoexposure(selected_bins, white_balance):
     return p2, p98
 
 
-def weighted_linear_regression(y, x, w, prior_beta=None, prior_weight=0.0):
-    """
-    Perform weighted linear regression: y = a + b*x + c*ind
-    where ind = np.arange(len(x))
+class ColumnJitterModel:
+    """Smooth, channel-specific additive corrections at vertical band centers."""
 
-    Parameters:
-    y : 1D numpy array
-    x : 1D numpy array (same size as y)
-    w : 1D numpy array of non-negative weights (same size as y)
+    def __init__(
+        self,
+        band_corrections: np.ndarray,
+        image_height: int,
+        black_levels: np.ndarray,
+        white_levels: np.ndarray,
+        confidence: np.ndarray,
+    ):
+        corrections = np.asarray(band_corrections)
+        if corrections.ndim != 3 or corrections.shape[0] != 4:
+            raise ValueError("band_corrections must have shape (4, bands, columns)")
+        if image_height < 1 or corrections.shape[1] < 1:
+            raise ValueError("image height and jitter band count must be positive")
+        self.band_corrections = corrections
+        self.image_height = int(image_height)
+        self.black_levels = np.asarray(black_levels, dtype=np.float32)
+        self.white_levels = np.asarray(white_levels, dtype=np.float32)
+        self.confidence = np.asarray(confidence, dtype=np.float32)
+        self.num_bands = corrections.shape[1]
+        self.width = corrections.shape[2]
+        if self.black_levels.shape != (4,) or self.white_levels.shape != (4,):
+            raise ValueError("black_levels and white_levels must each contain 4 values")
+        if self.confidence.shape != (self.width,):
+            raise ValueError("confidence must contain one value per modeled column")
 
-    Returns:
-    np.array([a, b, c])
-    """
-    n = len(x)
-    ind = np.arange(n)
-    wsum = np.sum(w)
-    if wsum <= 0:
-        raise ValueError("Weights must sum to a positive value.")
-
-    x_mean = np.sum(w * x) / wsum
-    x_scale = float(JITTER_X_SCALE)
-    ind_mean = (n - 1) / 2.0
-    ind_var = (n**2 - 1) / 12.0
-    ind_scale = math.sqrt(ind_var) if ind_var > 1e-6 else 1.0
-
-    x_norm = (x - x_mean) / x_scale
-    ind_norm = (ind - ind_mean) / ind_scale
-
-    # Design matrix: columns [1, x_norm, ind_norm]
-    X = np.column_stack((np.ones_like(x_norm), x_norm, ind_norm))
-    wX = w[:, None] * X  # n x 3
-    XtWX = X.T @ wX  # 3 x 3
-
-    # Compute X^T W y: X.T @ (w * y)
-    XtWy = X.T @ (w * y)  # 3 x 1
-
-    if prior_beta is not None and prior_weight > 0:
-        prior_beta = np.asarray(prior_beta, dtype=np.float64)
-        prior_beta_norm = np.array(
-            [
-                prior_beta[0] + prior_beta[1] * x_mean + prior_beta[2] * ind_mean,
-                prior_beta[1] * x_scale,
-                prior_beta[2] * ind_scale,
-            ],
-            dtype=np.float64,
+        # Band values live at band centers. Linear interpolation keeps application
+        # cheap during motion-corrected sampling while avoiding band boundaries.
+        band_position = (
+            (np.arange(self.image_height, dtype=np.float32) + 0.5)
+            * self.num_bands
+            / self.image_height
+            - 0.5
         )
-        prior_weight_scaled = prior_weight
-        XtWX += prior_weight_scaled * np.eye(X.shape[1])
-        XtWy += prior_weight_scaled * prior_beta_norm
+        lower = np.floor(band_position).astype(np.int32)
+        upper = lower + 1
+        weight = band_position - lower
+        below = lower < 0
+        above = upper >= self.num_bands
+        lower = np.clip(lower, 0, self.num_bands - 1)
+        upper = np.clip(upper, 0, self.num_bands - 1)
+        weight[below] = 0.0
+        weight[above] = 0.0
+        self._row_band_lower = lower
+        self._row_band_upper = upper
+        self._row_band_weight = weight.astype(np.float32)
 
-        # print("prior weight:", prior_weight_scaled, scale)
-    # Solve XtWX @ beta = XtWy for beta
-    try:
-        beta_norm = np.linalg.solve(XtWX, XtWy)
-    except np.linalg.LinAlgError:
-        if prior_beta is not None:
-            return prior_beta
-        raise
-    a_norm, b_norm, c_norm = beta_norm
-    beta = np.array(
-        [
-            a_norm - b_norm * x_mean / x_scale - c_norm * ind_mean / ind_scale,
-            b_norm / x_scale,
-            c_norm / ind_scale,
-        ],
-        dtype=np.float64,
-    )
-    return beta
+    def correct_samples(
+        self,
+        values: np.ndarray,
+        channel: int,
+        columns: np.ndarray,
+        rows: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Correct a 2-D sample array using either 1-D or per-pixel columns."""
+        values = np.asarray(values, dtype=np.float32)
+        if values.ndim != 2:
+            raise ValueError("values must be two-dimensional")
+        if not 0 <= channel < 4:
+            raise ValueError("channel must be in the range 0..3")
+        if rows is None:
+            rows = np.arange(values.shape[0], dtype=np.int32)
+        else:
+            rows = np.asarray(rows, dtype=np.int32)
+        if rows.ndim != 1 or rows.size != values.shape[0]:
+            raise ValueError("rows must contain one index per values row")
 
+        columns = np.asarray(columns, dtype=np.int32)
+        if columns.ndim == 1:
+            if columns.size != values.shape[1]:
+                raise ValueError("columns must contain one index per values column")
+            column_grid = columns[None, :]
+        elif columns.shape == values.shape:
+            column_grid = columns
+        else:
+            raise ValueError("columns must be 1-D or have the same shape as values")
+        if (
+            np.any(rows < 0)
+            or np.any(rows >= self.image_height)
+            or np.any(column_grid < 0)
+            or np.any(column_grid >= self.width)
+        ):
+            raise IndexError("jitter model sample is outside the modeled image")
 
-def apply_column_correction(x, beta):
-    ind = np.arange(len(x))
-    return beta[0] + x * beta[1] + ind * beta[2]
+        lower = self._row_band_lower[rows]
+        upper = self._row_band_upper[rows]
+        weight = self._row_band_weight[rows, None]
+        channel_model = self.band_corrections[channel]
+        correction_low = channel_model[lower[:, None], column_grid].astype(
+            np.float32
+        )
+        correction_high = channel_model[upper[:, None], column_grid].astype(
+            np.float32
+        )
+        correction = correction_low + (correction_high - correction_low) * weight
+
+        black = float(self.black_levels[channel])
+        white = float(self.white_levels[channel])
+        span = max(white - black, 1.0)
+        highlight_margin = max(
+            JITTER_WHITE_MARGIN_MIN,
+            JITTER_WHITE_MARGIN_FRACTION * span,
+        )
+        shadow_weight = np.clip(
+            (values - black) / max(JITTER_BLACK_MARGIN, 1.0), 0.0, 1.0
+        )
+        highlight_weight = np.clip(
+            (white - values) / highlight_margin, 0.0, 1.0
+        )
+        clip_weight = np.minimum(shadow_weight, highlight_weight)
+        return values + correction * clip_weight
+
+    def apply_window(
+        self, window: np.ndarray, channel: int, start_col: int
+    ) -> np.ndarray:
+        """Apply the model to a contiguous full-height image window."""
+        if window.size == 0:
+            return window
+        window = np.asarray(window, dtype=np.float32)
+        result = window.copy()
+        local_start = max(0, -start_col)
+        local_stop = min(window.shape[1], self.width - start_col)
+        if local_stop <= local_start:
+            return result
+        columns = np.arange(
+            start_col + local_start,
+            start_col + local_stop,
+            dtype=np.int32,
+        )
+        result[:, local_start:local_stop] = self.correct_samples(
+            window[:, local_start:local_stop],
+            channel,
+            columns,
+        )
+        return result
 
 
 def apply_column_models(
-    window: np.ndarray, models: np.ndarray, start_col: int
+    window: np.ndarray,
+    models: ColumnJitterModel | None,
+    start_col: int,
+    channel: int,
 ) -> np.ndarray:
     if models is None:
         return window
-    if start_col < 0:
-        start_col = 0
-    end_col = start_col + window.shape[1]
-    if end_col > models.shape[0]:
-        end_col = models.shape[0]
-        window = window[:, : end_col - start_col]
-    if window.size == 0:
-        return window
-    cols = np.arange(window.shape[1])
-    betas = models[start_col + cols]
-    rows = np.arange(window.shape[0])[:, None]
-    return (
-        betas[:, 0][None, :]
-        + window * betas[:, 1][None, :]
-        + rows * betas[:, 2][None, :]
+    return models.apply_window(window, channel, start_col)
+
+
+def _estimate_jitter_levels(channel_views, max_sample_columns: int = 8192):
+    """Estimate clipping endpoints from windows spread across the capture."""
+    width = channel_views[0].shape[1]
+    sample_width = min(512, width)
+    num_windows = max(1, min(16, math.ceil(max_sample_columns / sample_width)))
+    max_start = max(0, width - sample_width)
+    starts = np.unique(np.linspace(0, max_start, num_windows).astype(np.int64))
+    black = np.full(4, np.inf, dtype=np.float32)
+    white = np.full(4, -np.inf, dtype=np.float32)
+    for channel, view in enumerate(channel_views):
+        for start in starts:
+            sample = view[:, slice(int(start), int(start) + sample_width)]
+            if sample.size:
+                black[channel] = min(black[channel], float(np.min(sample)))
+                white[channel] = max(white[channel], float(np.max(sample)))
+    black[~np.isfinite(black)] = 0.0
+    white[~np.isfinite(white)] = 65535.0
+    white = np.maximum(white, black + 1.0)
+    return black, white
+
+
+def _jitter_band_statistics(
+    data: np.ndarray,
+    num_bands: int,
+    black: float,
+    white: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    height, width = data.shape
+    if height % num_bands:
+        raise ValueError(
+            f"image height {height} must be divisible by {num_bands} jitter bands"
+        )
+    banded = data.reshape(num_bands, height // num_bands, width)
+    medians = np.median(banded, axis=1).astype(np.float32, copy=False)
+    span = max(white - black, 1.0)
+    high_margin = max(
+        JITTER_WHITE_MARGIN_MIN,
+        JITTER_WHITE_MARGIN_FRACTION * span,
     )
-
-
-def compose_model(beta1, beta2):
-    return np.array(
-        [
-            beta1[0] + beta1[1] * beta2[0],
-            beta1[1] * beta2[1],
-            beta1[2] + beta1[1] * beta2[2],
-        ]
+    invalid = (
+        np.mean(banded <= black + JITTER_BLACK_MARGIN, axis=1)
+        > JITTER_MAX_CLIPPED_FRACTION
     )
+    invalid |= (
+        np.mean(banded >= white - high_margin, axis=1)
+        > JITTER_MAX_CLIPPED_FRACTION
+    )
+    return medians, ~invalid
 
 
-def invert_model(beta):
-    return np.array([-beta[0] / beta[1], 1 / beta[1], -beta[2] / beta[1]])
+def _jitter_dct_bases(num_bands: int, basis_size: int):
+    basis_size = min(max(1, basis_size), num_bands)
+    band_positions = (
+        np.arange(num_bands, dtype=np.float32)[:, None] + 0.5
+    ) / num_bands
+    frequencies = np.arange(basis_size, dtype=np.float32)[None, :]
+    band_basis = np.cos(np.pi * band_positions * frequencies).astype(np.float32)
+    band_pseudoinverse = np.linalg.pinv(band_basis).astype(np.float32)
+    return band_basis, band_pseudoinverse
 
 
 def column_exposure_jitter_correction(
@@ -950,275 +1053,138 @@ def column_exposure_jitter_correction(
     green1,
     green2,
     blue_view,
-    g: Path,
-    sigma=500,
-    mask_bins=None,
-    mask_scale: int = 1,
-    debug_preview: dict | None = None,
-):
-    downsample_factor = max(1, JITTER_DOWNSAMPLE_Y)
-    blur_radius = max(1, STRUCTURE_MASK_DILATE_PX // (4 * JITTER_DOWNSAMPLE_Y))
+    g: Path | None = None,
+    *,
+    black_levels: np.ndarray | None = None,
+    white_levels: np.ndarray | None = None,
+    num_bands: int = JITTER_VERTICAL_BANDS,
+    basis_size: int = JITTER_ROW_BASIS_SIZE,
+    temporal_window: int = JITTER_TEMPORAL_WINDOW,
+    block_columns: int = JITTER_BLOCK_COLUMNS,
+    show_progress: bool = True,
+) -> ColumnJitterModel:
+    """
+    Estimate absolute, channel/row-specific exposure corrections.
 
-    def preprocess_column(vec: np.ndarray) -> np.ndarray:
-        out = bin_vertical(vec, downsample_factor)
-        for _ in range(JITTER_BLUR_ITER):
-            out = box_blur_1d(out, blur_radius)
-        return out
-
-    n_cols = red_view.width
-
-    off_r = np.zeros(n_cols)
-    off_g = np.zeros(n_cols)
-    off_b = np.zeros(n_cols)
-
-    locs = [7095, 7390]
-
-    green_currs_to_plot = []
-
-    betas = np.column_stack(
-        [np.zeros(n_cols - 1), np.ones(n_cols - 1), np.zeros(n_cols - 1)]
-    )
-
-    red_prev = preprocess_column(red_view[:, 0])
-    green_prev = preprocess_column(0.5 * (green1[:, 0] + green2[:, 0]))
-    blue_prev = preprocess_column(blue_view[:, 0])
-    cache = red_view.cache
-    cum_cols = cache.cum_cols
-    file_idx = 0
-    next_boundary = cum_cols[file_idx + 1]
-    preview_sum = None
-    preview_count = None
-    preview_group = None
-    preview_height = None
-    preview_width = None
-    if debug_preview is not None and mask_scale > 0:
-        preview_height = green1.height // mask_scale
-        preview_width = n_cols // mask_scale
-        if preview_height > 0 and preview_width > 0:
-            preview_sum = np.zeros((preview_height, preview_width), dtype=np.float64)
-            preview_count = np.zeros((preview_width,), dtype=np.int64)
-            if mask_scale % downsample_factor == 0:
-                preview_group = mask_scale // downsample_factor
-    residual_image = None
-    if ENABLE_JITTER_DEBUG_PLOT and red_prev.size > 0:
-        residual_image = np.zeros((red_prev.size, n_cols - 1), dtype=np.float32)
-
-    for col in tqdm(range(1, n_cols), desc="column exposure jitter"):
-        red_curr = preprocess_column(red_view[:, col])
-        green_curr = preprocess_column(0.5 * (green1[:, col] + green2[:, col]))
-        blue_curr = preprocess_column(blue_view[:, col])
-
-        red_delta = red_curr - red_prev
-        green_delta = green_curr - green_prev
-        blue_delta = blue_curr - blue_prev
-
-        beta = np.array([0, 1, 0])
-        for iter in range(3):
-            red_delta = red_curr - apply_column_correction(red_prev, beta)
-            green_delta = green_curr - apply_column_correction(green_prev, beta)
-            blue_delta = blue_curr - apply_column_correction(blue_prev, beta)
-
-            iter_sigma2 = 0.5**iter / (sigma * sigma)
-            weight = np.exp(
-                -(np.square(red_delta) + np.square(green_delta) + np.square(blue_delta))
-                * iter_sigma2
-            )
-
-            weight = weight * weight
-            if mask_bins is not None:
-                full_col = green1.col_offset + col * green1.col_step
-                while full_col >= next_boundary and file_idx + 1 < len(cum_cols) - 1:
-                    file_idx += 1
-                    next_boundary = cum_cols[file_idx + 1]
-                local_full = full_col - cum_cols[file_idx]
-                local_green = local_full // green1.col_step
-                if mask_scale > 1:
-                    local_green = local_green // mask_scale
-                mask_bin = mask_bins[file_idx]
-                if mask_bin.size > 0 and 0 <= local_green < mask_bin.shape[1]:
-                    row_idx = np.arange(weight.size) * downsample_factor
-                    row_idx = row_idx // mask_scale
-                    row_idx = np.minimum(row_idx, mask_bin.shape[0] - 1)
-                    weight[mask_bin[row_idx, local_green]] = 0
-
-            if np.sum(weight) == 0:
-                beta = np.array([0, 1, 0], dtype=np.float64)
-                break
-
-            gray_curr = np.column_stack((red_curr, green_curr, blue_curr)).mean(axis=1)
-            gray_prev = np.column_stack((red_prev, green_prev, blue_prev)).mean(axis=1)
-            beta = weighted_linear_regression(
-                gray_curr,
-                gray_prev,
-                weight,
-                prior_beta=np.array([0, 1, 0]),
-                prior_weight=1e2,
-            )
-
-        betas[col - 1, :] = beta
-
-        if preview_sum is not None:
-            mask_col = col // mask_scale
-            if mask_col < preview_width:
-                if preview_group is not None and preview_height > 0:
-                    h = preview_height * preview_group
-                    if h > 0:
-                        downs = (
-                            green_curr[:h]
-                            .reshape(preview_height, preview_group)
-                            .mean(axis=1)
-                        )
-                    else:
-                        downs = np.zeros((preview_height,), dtype=np.float32)
-                else:
-                    row_idx_full = np.arange(green_curr.size) * downsample_factor
-                    mask_row = row_idx_full // mask_scale
-                    mask_row = np.clip(mask_row, 0, preview_height - 1)
-                    downs = np.zeros((preview_height,), dtype=np.float32)
-                    np.add.at(downs, mask_row, green_curr)
-                    counts = np.zeros((preview_height,), dtype=np.int64)
-                    np.add.at(counts, mask_row, 1)
-                    downs = downs / np.maximum(counts, 1)
-                preview_sum[:, mask_col] += downs
-                preview_count[mask_col] += 1
-        if residual_image is not None:
-            gray_curr = np.column_stack((red_curr, green_curr, blue_curr)).mean(axis=1)
-            gray_prev = np.column_stack((red_prev, green_prev, blue_prev)).mean(axis=1)
-            residual = gray_curr - apply_column_correction(gray_prev, beta)
-            residual_image[:, col - 1] = (residual * weight).astype(
-                np.float32, copy=False
-            )
-
-        red_prev = red_curr
-        green_prev = green_curr
-        blue_prev = blue_curr
-
-    beta = np.array([0, 1, 0])
-    global_models = np.zeros((n_cols, 3))
-    for col in range(n_cols):
-        global_models[col] = beta
-        if col < n_cols - 1:
-            lamb = 0.01
-            beta = (1 - lamb) * compose_model(
-                invert_model(betas[col]), beta
-            ) + lamb * np.array([0, 1, 0])
-    if residual_image is not None:
-        max_abs = float(np.max(np.abs(residual_image))) if residual_image.size else 0.0
-        if max_abs <= 0:
-            max_abs = 1.0
-        cmap_name = "berlin"
-        try:
-            cmap = plt.get_cmap(cmap_name)
-        except ValueError:
-            cmap = plt.get_cmap("seismic")
-        plt.figure(figsize=(12, 6), dpi=300)
-        plt.imshow(
-            residual_image,
-            cmap=cmap,
-            vmin=-max_abs,
-            vmax=max_abs,
-            aspect="auto",
-            origin="lower",
+    A centered temporal median supplies the local unstriped target. Unlike the
+    former adjacent-column composition, this has no cumulative state: monotonic
+    scene gradients are fixed points and cannot turn into correction drift.
+    Corrections are accepted only when their sign agrees across the four Bayer
+    channels and many vertical bands. Clipped bands are excluded, then the
+    vertical response is projected onto a small cosine basis.
+    """
+    del g  # Retained in the signature for callers that group outputs by capture.
+    channel_views = (red_view, green1, green2, blue_view)
+    heights = {view.shape[0] for view in channel_views}
+    widths = {view.shape[1] for view in channel_views}
+    if len(heights) != 1 or len(widths) != 1:
+        raise ValueError("all four jitter channels must have the same dimensions")
+    image_height = heights.pop()
+    image_width = widths.pop()
+    if image_height % num_bands:
+        raise ValueError(
+            f"image height {image_height} must be divisible by {num_bands}"
         )
-        plt.colorbar(label="signed residual")
-        plt.xlabel("column index (pair)")
-        plt.ylabel("row (downsampled)")
-        plt.title("Jitter residuals")
-        plt.tight_layout()
-        plt.savefig(g / "jitter_residuals.png")
-        plt.close()
-    if preview_sum is not None:
-        counts = np.maximum(preview_count, 1)[None, :]
-        debug_preview["green"] = (preview_sum / counts).astype(np.float32, copy=False)
-    return global_models
+    if temporal_window < 3 or temporal_window % 2 != 1:
+        raise ValueError("temporal_window must be an odd integer of at least 3")
+    if block_columns < 1:
+        raise ValueError("block_columns must be positive")
 
-    # DEBUG!!!
-    beta = np.array([0, 1, 0])
-    for iter in range(3):
-        red_prev = red_view[:, locs[0]]
-        green_prev = green1[:, locs[0]] + green2[:, locs[0]]
-        blue_prev = blue_view[:, locs[0]]
+    if black_levels is None or white_levels is None:
+        estimated_black, estimated_white = _estimate_jitter_levels(channel_views)
+        if black_levels is None:
+            black_levels = estimated_black
+        if white_levels is None:
+            white_levels = estimated_white
+    black_levels = np.asarray(black_levels, dtype=np.float32)
+    white_levels = np.asarray(white_levels, dtype=np.float32)
+    if black_levels.shape != (4,) or white_levels.shape != (4,):
+        raise ValueError("black_levels and white_levels must each contain 4 values")
+    white_levels = np.maximum(white_levels, black_levels + 1.0)
 
-        red_curr = red_view[:, locs[1]]
-        green_curr = green1[:, locs[1]] + green2[:, locs[1]]
-        blue_curr = blue_view[:, locs[1]]
+    band_basis, band_pseudoinverse = _jitter_dct_bases(num_bands, basis_size)
+    band_corrections = np.empty(
+        (4, num_bands, image_width),
+        dtype=np.float16,
+    )
+    confidence_full = np.zeros(image_width, dtype=np.float32)
+    radius = temporal_window // 2
+    block_starts = range(0, image_width, block_columns)
 
-        red_delta = red_curr - apply_column_correction(red_prev, beta)
-        green_delta = green_curr - apply_column_correction(green_prev, beta)
-        blue_delta = blue_curr - apply_column_correction(blue_prev, beta)
+    for core_start in tqdm(
+        block_starts,
+        total=math.ceil(image_width / block_columns),
+        desc="column exposure jitter",
+        disable=not show_progress,
+    ):
+        core_stop = min(image_width, core_start + block_columns)
+        read_start = max(0, core_start - radius)
+        read_stop = min(image_width, core_stop + radius)
+        core_slice = slice(core_start - read_start, core_stop - read_start)
+        core_width = core_stop - core_start
+        offsets = np.empty((4, num_bands, core_width), dtype=np.float32)
+        valid = np.empty((4, num_bands, core_width), dtype=bool)
 
-        iter_sigma2 = 0.5**iter / (sigma * sigma)
-        weight = np.exp(
-            -(np.square(red_delta) + np.square(green_delta) + np.square(blue_delta))
-            * iter_sigma2
+        for channel, view in enumerate(channel_views):
+            data = view[:, slice(read_start, read_stop)]
+            statistics, band_valid = _jitter_band_statistics(
+                data,
+                num_bands,
+                float(black_levels[channel]),
+                float(white_levels[channel]),
+            )
+            local_target = median_filter(
+                statistics,
+                size=(1, temporal_window),
+                mode="nearest",
+            )
+            offsets[channel] = (local_target - statistics)[:, core_slice]
+            valid[channel] = band_valid[:, core_slice]
+
+        flat_valid = valid.reshape(-1, core_width)
+        flat_offsets = offsets.reshape(-1, core_width)
+        fallback_values = np.where(flat_valid, flat_offsets, np.nan)
+        all_invalid = ~np.any(flat_valid, axis=0)
+        fallback_values[0, all_invalid] = 0.0
+        fallback = np.nanmedian(fallback_values, axis=0).astype(
+            np.float32, copy=False
         )
+        filled_offsets = np.where(valid, offsets, fallback[None, None, :])
 
-        weight = weight * weight
-        beta = weighted_linear_regression(green_curr, green_prev, weight)
+        positive = np.sum((offsets > 0.0) & valid, axis=(0, 1))
+        negative = np.sum((offsets < 0.0) & valid, axis=(0, 1))
+        valid_count = np.sum(valid, axis=(0, 1))
+        agreement = np.maximum(positive, negative) / np.maximum(valid_count, 1)
+        confidence = np.clip(
+            (agreement - JITTER_CONSENSUS_LOW)
+            / (JITTER_CONSENSUS_HIGH - JITTER_CONSENSUS_LOW),
+            0.0,
+            1.0,
+        ).astype(np.float32)
+        valid_channel_count = np.sum(np.any(valid, axis=1), axis=0)
+        confidence[
+            (valid_count < num_bands) | (valid_channel_count < 2)
+        ] = 0.0
+        confidence_full[core_start:core_stop] = confidence
+        filled_offsets *= confidence[None, None, :]
 
-    red_prev = red_view[:, locs[0]]
-    green_prev = green1[:, locs[0]] + green2[:, locs[0]]
-    blue_prev = blue_view[:, locs[0]]
+        for channel in range(4):
+            coefficients = band_pseudoinverse @ filled_offsets[channel]
+            smooth_bands = band_basis @ coefficients
+            smooth_bands = np.clip(
+                smooth_bands,
+                -np.finfo(np.float16).max,
+                np.finfo(np.float16).max,
+            )
+            band_corrections[channel, :, core_start:core_stop] = smooth_bands
 
-    red_curr = red_view[:, locs[1]]
-    green_curr = green1[:, locs[1]] + green2[:, locs[1]]
-    blue_curr = blue_view[:, locs[1]]
-
-    fig = plt.figure(figsize=(32, 18), dpi=300)
-    gs = fig.add_gridspec(5, 1)
-
-    # Main plot (takes up top 3/4 of the figure)
-    ax1 = fig.add_subplot(gs[0:3, 0])
-    ax1.plot(green_prev, "", label="prev")
-    ax1.plot(green_curr, "", label="curr")
-    ax1.plot(apply_column_correction(green_prev, beta), "", label="model(prev)")
-    ax1.plot([0, 2047], [0, 0], "k--")
-    ax1.set_xlim(0, 2047)
-    ax1.set_ylabel("intensity")
-    ax1.legend()
-
-    # Weight plot (takes up bottom 1/4 of the figure)
-    ax2 = fig.add_subplot(gs[3, 0])
-    ax2.plot(weight / np.max(weight), "k", label="weight")
-    ax2.set_xlim(0, 2047)
-    ax2.set_ylabel("weight")
-    ax2.set_title("weight")
-    ax2.legend()
-
-    ax3 = fig.add_subplot(gs[4, 0])
-    ax3.plot(
-        np.square(weight * (green_curr - green_prev)), label="weighted initial error"
+    return ColumnJitterModel(
+        band_corrections,
+        image_height,
+        black_levels,
+        white_levels,
+        confidence_full,
     )
-    ax3.plot(
-        np.square(weight * (green_curr - apply_column_correction(green_prev, beta))),
-        label="weighted final error",
-    )
-    ax3.plot([0, 2047], [0, 0], "k--")
-    ax3.set_xlim(0, 2047)
-    ax3.set_ylabel("intensity")
-    ax3.set_title("squared error")
-    ax3.legend()
-    plt.savefig(g / "jitter_debug.png")
-    plt.close(fig)
-
-    plt.figure(figsize=(32, 18), dpi=300)
-    plt.plot(green_prev, green_curr, "k.")
-    plt.plot(apply_column_correction(green_prev, beta), green_curr, "r.")
-    plt.xlabel("prev")
-    plt.ylabel("curr")
-    plt.savefig(g / "jitter_debug_2.png")
-    plt.close()
-
-    plt.figure(figsize=(32, 18), dpi=300)
-    for label, val in green_currs_to_plot:
-        plt.plot(val, label=label)
-    plt.xlabel("x")
-    plt.ylabel("y")
-    plt.legend()
-    plt.savefig(g / "green_currs.png")
-    plt.close()
-
-    return global_models
 
 
 def interpolate_upsample(arr, off):
@@ -1370,7 +1336,8 @@ def sample_motion_corrected_chunks(
 
             indices_local = indices_clipped - start_col
             indices_local = np.clip(indices_local, 0, r_win.shape[1] - 1)
-            row_idx = np.arange(green1.height)[:, None]
+            sample_rows = np.arange(green1.height, dtype=np.int32)
+            row_idx = sample_rows[:, None]
 
             r_vals = r_win[row_idx, indices_local]
             g1_vals = g1_win[row_idx, indices_local]
@@ -1378,14 +1345,30 @@ def sample_motion_corrected_chunks(
             b_vals = b_win[row_idx, indices_local]
 
             if jitter_models is not None:
-                betas = jitter_models[indices_clipped]
-                beta0 = betas[:, :, 0]
-                beta1 = betas[:, :, 1]
-                beta2 = betas[:, :, 2]
-                r_vals = beta0 + r_vals * beta1 + row_idx * beta2
-                g1_vals = beta0 + g1_vals * beta1 + row_idx * beta2
-                g2_vals = beta0 + g2_vals * beta1 + row_idx * beta2
-                b_vals = beta0 + b_vals * beta1 + row_idx * beta2
+                r_vals = jitter_models.correct_samples(
+                    r_vals,
+                    JITTER_RED,
+                    indices_clipped,
+                    sample_rows,
+                )
+                g1_vals = jitter_models.correct_samples(
+                    g1_vals,
+                    JITTER_GREEN1,
+                    indices_clipped,
+                    sample_rows,
+                )
+                g2_vals = jitter_models.correct_samples(
+                    g2_vals,
+                    JITTER_GREEN2,
+                    indices_clipped,
+                    sample_rows,
+                )
+                b_vals = jitter_models.correct_samples(
+                    b_vals,
+                    JITTER_BLUE,
+                    indices_clipped,
+                    sample_rows,
+                )
 
             dist = window_indices.astype(np.float32) - centers[:, None].astype(
                 np.float32
@@ -1598,7 +1581,6 @@ def estimate_skew_hough(
 def process_preview(
     g: Path,
     padding: int = 10,
-    max_chunks: int = 512,
 ):
     bins = sorted(list(g.glob("*.bin")))
 
@@ -1608,11 +1590,29 @@ def process_preview(
 
     max_green = 0
     max_green_down = 0
+    jitter_black_levels = np.full(4, np.inf, dtype=np.float32)
+    jitter_white_levels = np.full(4, -np.inf, dtype=np.float32)
     for i, bin in tqdm(enumerate(bins), total=len(bins)):
         dat1 = np.fromfile(bin, dtype=np.uint16).astype(np.float32)
         dat1_reshaped = np.reshape(dat1, (-1, 4096)).T
         raw_green = dat1_reshaped[1::2, 1::2]
         max_green = max(max_green, np.max(raw_green))
+        if ENABLE_COLUMN_JITTER_CORRECTION:
+            raw_channels = (
+                dat1_reshaped[0::2, 1::2],
+                dat1_reshaped[1::2, 1::2],
+                dat1_reshaped[0::2, 0::2],
+                dat1_reshaped[1::2, 0::2],
+            )
+            for channel, raw_channel in enumerate(raw_channels):
+                jitter_black_levels[channel] = min(
+                    jitter_black_levels[channel],
+                    float(np.min(raw_channel)),
+                )
+                jitter_white_levels[channel] = max(
+                    jitter_white_levels[channel],
+                    float(np.max(raw_channel)),
+                )
         raw_green_down = raw_green
         for _ in range(downsample_steps):
             raw_green_down = bin2to1(raw_green_down)
@@ -1663,7 +1663,6 @@ def process_preview(
 
     energy_bins = []
     green_bins = []
-    mask_widths = []
     for i, _bin_path in tqdm(
         enumerate(selected_bins), total=len(selected_bins), desc="stripe mask"
     ):
@@ -1678,7 +1677,6 @@ def process_preview(
         magnitude = np.sqrt(grad_x**2 + grad_y**2) + 0.1 * max_green_down
         energy_down = np.abs(grad_x) / magnitude
         energy_bins.append(energy_down)
-        mask_widths.append(raw_green.shape[1])
 
     if energy_bins:
         energy_full = np.hstack(energy_bins)
@@ -1698,11 +1696,6 @@ def process_preview(
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
         mask_full = cv2.dilate(mask_full.astype(np.uint8), kernel) > 0
 
-    mask_bins = []
-    start = 0
-    for width in mask_widths:
-        mask_bins.append(mask_full[:, start : start + width])
-        start += width
     if mask_full.size > 0:
         green_norm = green_full / max(max_green_down, 1.0)
         green_u8 = np.clip(green_norm * 255.0, 0, 255).astype(np.uint8)
@@ -1713,7 +1706,6 @@ def process_preview(
         cv2.imwrite(str(g / "structure_mask_preview.png"), preview)
 
     jitter_models = None
-    jitter_debug_preview = {} if ENABLE_JITTER_DEBUG_PLOT else None
     if ENABLE_COLUMN_JITTER_CORRECTION:
         jitter_models = column_exposure_jitter_correction(
             red_view,
@@ -1721,93 +1713,64 @@ def process_preview(
             green2,
             blue_view,
             g=g,
-            mask_bins=mask_bins,
-            mask_scale=STRUCTURE_MASK_DOWNSAMPLE,
-            debug_preview=jitter_debug_preview,
+            black_levels=jitter_black_levels,
+            white_levels=jitter_white_levels,
         )
-    if jitter_debug_preview and "green" in jitter_debug_preview and mask_full.size > 0:
-        green_jitter = jitter_debug_preview["green"]
-        green_jitter_norm = green_jitter / max(np.max(green_jitter), 1.0)
-        green_jitter_u8 = np.clip(green_jitter_norm * 255.0, 0, 255).astype(np.uint8)
-        base_jitter = cv2.cvtColor(green_jitter_u8, cv2.COLOR_GRAY2BGR)
-        mask_overlay = np.zeros_like(base_jitter)
-        mask_overlay[:, :, 2] = mask_full.astype(np.uint8) * 255
-        preview_jitter = cv2.addWeighted(base_jitter, 0.9, mask_overlay, 0.1, 0.0)
-        cv2.imwrite(str(g / "structure_mask_preview_blurred.png"), preview_jitter)
     if ENABLE_JITTER_DEBUG_PLOT and jitter_models is not None:
         row_idx = min(JITTER_DEBUG_ROW, green1.height - 1)
-        cols = np.arange(green1.width)
-        red_pre = red_view[row_idx, :]
-        green1_pre = green1[row_idx, :]
-        green2_pre = green2[row_idx, :]
-        blue_pre = blue_view[row_idx, :]
-        beta0 = jitter_models[:, 0]
-        beta1 = jitter_models[:, 1]
-        beta2 = jitter_models[:, 2]
-        row_term = row_idx * beta2
-        red_post = beta0 + red_pre * beta1 + row_term
-        green1_post = beta0 + green1_pre * beta1 + row_term
-        green2_post = beta0 + green2_pre * beta1 + row_term
-        blue_post = beta0 + blue_pre * beta1 + row_term
-
-        fig, (ax_pre, ax_post, ax_img, ax_beta, ax_rel) = plt.subplots(
-            5, 1, figsize=(16, 17), dpi=300, sharex=True
+        cols = np.arange(green1.width, dtype=np.int32)
+        pre_channels = (
+            red_view[row_idx, :],
+            green1[row_idx, :],
+            green2[row_idx, :],
+            blue_view[row_idx, :],
         )
-        ax_pre.plot(cols, red_pre, "r.", markersize=1, label="red pre")
-        ax_pre.plot(cols, green1_pre, "g.", markersize=1, label="green1 pre")
-        ax_pre.plot(cols, green2_pre, "k.", markersize=1, label="green2 pre")
-        ax_pre.plot(cols, blue_pre, "b.", markersize=1, label="blue pre")
+        colors = ("r", "g", "k", "b")
+        labels = ("red", "green1", "green2", "blue")
+        post_channels = tuple(
+            jitter_models.correct_samples(
+                values[None, :],
+                channel,
+                cols,
+                np.array([row_idx], dtype=np.int32),
+            )[0]
+            for channel, values in enumerate(pre_channels)
+        )
+
+        fig, (ax_pre, ax_post, ax_delta, ax_confidence) = plt.subplots(
+            4, 1, figsize=(16, 14), dpi=200, sharex=True
+        )
+        for values, color, label in zip(pre_channels, colors, labels):
+            ax_pre.plot(cols, values, color, linewidth=0.35, label=label)
         ax_pre.set_ylabel("value")
         ax_pre.set_title(f"Jitter correction row {row_idx} (pre)")
         ax_pre.legend()
 
-        ax_post.plot(cols, red_post, "r.", markersize=1, label="red post")
-        ax_post.plot(cols, green1_post, "g.", markersize=1, label="green1 post")
-        ax_post.plot(cols, green2_post, "k.", markersize=1, label="green2 post")
-        ax_post.plot(cols, blue_post, "b.", markersize=1, label="blue post")
-        ax_post.set_xlabel("column")
+        for values, color, label in zip(post_channels, colors, labels):
+            ax_post.plot(cols, values, color, linewidth=0.35, label=label)
         ax_post.set_ylabel("value")
         ax_post.set_title("post")
         ax_post.legend()
 
-        if green_full.size > 0:
-            green_norm = green_full / max(max_green_down, 1.0)
-            ax_img.imshow(
-                green_norm,
-                cmap="gray",
-                aspect="auto",
-                extent=[0, green1.width - 1, green1.height - 1, 0],
+        for pre, post, color, label in zip(
+            pre_channels, post_channels, colors, labels
+        ):
+            ax_delta.plot(
+                cols,
+                post - pre,
+                color,
+                linewidth=0.35,
+                label=label,
             )
-            ax_img.axhline(row_idx, color="r", linewidth=1)
-        ax_img.set_title("downsampled green with debug row")
-        ax_img.set_ylabel("row")
-        ax_img.set_xlabel("column")
+        ax_delta.set_title("applied additive correction")
+        ax_delta.set_ylabel("raw units")
+        ax_delta.legend()
 
-        ax_beta.plot(cols, beta1, "g-", label="beta1")
-        ax_beta.plot(cols, beta2, "b-", label="beta2")
-        ax_beta.set_title("jitter model parameters")
-        ax_beta.set_ylabel("value")
-        ax_beta.set_xlabel("column")
-        ax_beta.legend()
-        ax_beta0 = ax_beta.twinx()
-        ax_beta0.plot(cols, beta0, "r-", label="beta0")
-        ax_beta0.set_ylabel("beta0")
-        ax_beta0.legend(loc="upper right")
-
-        rel_models = np.zeros((len(cols) - 1, 3), dtype=np.float32)
-        if len(cols) > 1:
-            for i in range(len(cols) - 1):
-                rel_models[i] = compose_model(
-                    invert_model(jitter_models[i]), jitter_models[i + 1]
-                )
-        rel_cols = cols[:-1]
-        ax_rel.plot(rel_cols, rel_models[:, 0], "r-", label="rel beta0")
-        ax_rel.plot(rel_cols, rel_models[:, 1], "g-", label="rel beta1")
-        ax_rel.plot(rel_cols, rel_models[:, 2], "b-", label="rel beta2")
-        ax_rel.set_title("relative model (col -> col+1)")
-        ax_rel.set_ylabel("value")
-        ax_rel.set_xlabel("column")
-        ax_rel.legend()
+        ax_confidence.plot(cols, jitter_models.confidence, "m", linewidth=0.5)
+        ax_confidence.set_title("cross-channel/row consensus")
+        ax_confidence.set_ylabel("confidence")
+        ax_confidence.set_xlabel("column")
+        ax_confidence.set_ylim(-0.05, 1.05)
 
         fig.tight_layout()
         fig.savefig(g / "jitter_row_debug.png")
@@ -1939,42 +1902,75 @@ def process_preview(
         cv2.imwrite(str(g / "preview_stack.jpg"), stacked)
 
 
-def main():
-    # globs = linescans.glob("17-12-03-23-11-30-utc")  # bart
-    # globs = linescans.glob("2024-09-10-06-00-05*")  # yamanote
-    # globs = linescans.glob("2024-09-19*") # fuxing
-    # globs = linescans.glob("2024-09-14-02-13-13*")  # hktram
-    # globs = linescans.glob("2024-09-14-02-12-36*")  # hktram
-    # globs = linescans.glob("2024-09-14-*")  # hktrams
-    # globs = linescans.glob("2024-09*")  # hktram
-    # globs = linescans.glob("2024-09-12-01-31-01*")  # hk bus
-    # globs = linescans.glob("2024-09-12-01-49-42") # hk buses
-    # globs = linescans.glob("nyc4")
-    # globs = linescans.glob("18-08-0*")  # amtrak
-    # globs = linescans.glob("18*")
-    # globs = linescans.glob("17-10-01-23-46-50-utc")
-    # globs = linescans.glob("18-10-18-02-31-29-utc")  # maglev
-    # globs = linescans.glob("18-10-06-13-52-16-utc*")  # pato
-    # globs = linescans.glob("2025-11*") # pano
-    # globs = linescans.glob("2025-09-13-09-27-13*")  # picadilly
-    # globs = linescans.glob("2025-09-13-09-37-17*")  # picadilly
-    # globs = linescans.glob("2025-09*")
-    # globs = linescans.glob("2026-01*")
-    globs = linescans.glob("2026-06-16-02-21-07*")
+def _parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Demosaic, dewarp, and render Alkeria line-scan captures."
+    )
+    parser.add_argument(
+        "captures",
+        nargs="*",
+        help=(
+            "capture directories; relative names are resolved under "
+            f"{linescans}"
+        ),
+    )
+    parser.add_argument(
+        "--jitter",
+        action=argparse.BooleanOptionalAction,
+        default=ENABLE_COLUMN_JITTER_CORRECTION,
+        help="enable the clipping-aware vertical-stripe correction",
+    )
+    parser.add_argument(
+        "--flip-output-180",
+        action=argparse.BooleanOptionalAction,
+        default=FLIP_OUTPUT_180,
+        help="rotate final output by 180 degrees",
+    )
+    parser.add_argument(
+        "--jitter-debug",
+        action="store_true",
+        default=ENABLE_JITTER_DEBUG_PLOT,
+        help="write a row-level before/after jitter diagnostic plot",
+    )
+    parser.add_argument("--max-workers", type=int, default=3)
+    return parser.parse_args(argv)
 
-    globs = sorted(list(globs))[::-1]
 
-    max_workers = 3
-    dirs = [g for g in globs if g.is_dir()]
-    for g in globs:
-        if not g.is_dir():
-            print("skipping directory", g)
+def main(argv=None):
+    global ENABLE_COLUMN_JITTER_CORRECTION
+    global ENABLE_JITTER_DEBUG_PLOT
+    global FLIP_OUTPUT_180
+
+    args = _parse_args(argv)
+    ENABLE_COLUMN_JITTER_CORRECTION = args.jitter
+    ENABLE_JITTER_DEBUG_PLOT = args.jitter_debug
+    FLIP_OUTPUT_180 = args.flip_output_180
+
+    if args.captures:
+        candidates = []
+        for capture_arg in args.captures:
+            candidate = Path(capture_arg).expanduser()
+            if not candidate.is_absolute() and not candidate.exists():
+                candidate = linescans / candidate
+            candidates.append(candidate)
+    else:
+        candidates = sorted(
+            linescans.glob("2026-06-16-02-21-07*"),
+            reverse=True,
+        )
+
+    dirs = []
+    for candidate in candidates:
+        if candidate.is_dir():
+            dirs.append(candidate)
+        else:
+            print("skipping directory", candidate)
 
     if len(dirs) == 1:
         process_preview(dirs[0])
         return
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    with ThreadPoolExecutor(max_workers=max(1, args.max_workers)) as executor:
         future_map = {executor.submit(process_preview, g): g for g in dirs}
         try:
             for future in as_completed(future_map):
