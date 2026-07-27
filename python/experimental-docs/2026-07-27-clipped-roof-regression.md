@@ -1,5 +1,10 @@
 # Clipped-roof and long-cadence stripe regressions — 2026-07-27
 
+> **Superseded later on 2026-07-27.** The local multiscale estimator described
+> as final below removed real wheel, window, and bellows detail. See
+> `2026-07-27-detail-preserving-two-stage-jitter.md` for the reproduced
+> regression and its replacement.
+
 ## 1. Reproducing the clipped-roof failure
 
 The correction committed on 2026-07-26 was not safe around the clipped MTR

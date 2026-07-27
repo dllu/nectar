@@ -77,7 +77,11 @@ class ColumnJitterCorrectionTest(unittest.TestCase):
         for channel in range(4):
             before = np.sqrt(np.mean(np.square(striped[channel] - clean[channel])))
             after = np.sqrt(np.mean(np.square(corrected[channel] - clean[channel])))
-            self.assertLess(after, 0.35 * before)
+            # The common-mode estimator intentionally leaves the
+            # channel/row-specific remainder rather than fitting it with local
+            # scene content. It should still remove most of the injected
+            # sensor-wide component from every channel.
+            self.assertLess(after, 0.45 * before)
 
         single_block_model = preview.column_exposure_jitter_correction(
             *striped,
@@ -182,6 +186,210 @@ class ColumnJitterCorrectionTest(unittest.TestCase):
             corrected[:, :, 220:228],
             scene[:, :, 220:228],
         )
+
+    def test_localized_vertical_detail_is_not_mistaken_for_jitter(self):
+        clean = self.make_clean_channels()
+        scene = clean.copy()
+        # This intentionally has no structure mask. The feature is below both
+        # candidate caps and persists vertically like the reported wheel and
+        # bellows detail, but occupies too few separated bands to be a
+        # sensor-wide exposure change.
+        scene[:, : self.HEIGHT // 4, 220:228] += 500.0
+
+        model = self.estimate(scene)
+        corrected = np.stack(
+            [model.apply_window(scene[channel], channel, 0) for channel in range(4)]
+        )
+        np.testing.assert_array_equal(corrected, scene)
+
+    def test_single_channel_detail_cannot_create_color_artifacts(self):
+        clean = self.make_clean_channels()
+        scene = clean.copy()
+        scene[preview.JITTER_RED, :, 220:228] += 500.0
+
+        model = self.estimate(scene)
+        corrected = np.stack(
+            [model.apply_window(scene[channel], channel, 0) for channel in range(4)]
+        )
+        np.testing.assert_array_equal(corrected, scene)
+
+        # Exercise the post-model residual stage as well. A feature present in
+        # red alone is ambiguous, so the two-channel event gate must preserve
+        # it rather than manufacture a complementary green/blue blotch.
+        flat = np.stack(
+            [
+                np.full(
+                    (self.HEIGHT, self.WIDTH),
+                    10000.0 + 500.0 * channel,
+                    dtype=np.float32,
+                )
+                for channel in range(4)
+            ]
+        )
+        flat[preview.JITTER_RED, :, 220:228] += 500.0
+        aligned_model = preview.column_exposure_jitter_correction(
+            *flat,
+            black_levels=np.zeros(4, dtype=np.float32),
+            white_levels=np.full(4, 65535.0, dtype=np.float32),
+            num_bands=16,
+            temporal_window=31,
+            block_columns=123,
+            green_displacements=np.ones(self.WIDTH, dtype=np.float32),
+            show_progress=False,
+        )
+        aligned_corrected = np.stack(
+            [
+                aligned_model.apply_window(flat[channel], channel, 0)
+                for channel in range(4)
+            ]
+        )
+        np.testing.assert_array_equal(aligned_corrected, flat)
+
+    def test_motion_aligned_scene_detail_survives_the_residual_pass(self):
+        scene = np.stack(
+            [
+                np.full(
+                    (self.HEIGHT, self.WIDTH),
+                    10000.0 + 500.0 * channel,
+                    dtype=np.float32,
+                )
+                for channel in range(4)
+            ]
+        )
+        # Red/green1 observe the feature at x; green2/blue observe the same
+        # feature one line later. It is deliberately narrower than the
+        # 31-column temporal median and would be erased without edge
+        # corroboration protecting the interval between its two boundaries.
+        scene[[preview.JITTER_RED, preview.JITTER_GREEN1], :, 220:228] += 500.0
+        scene[[preview.JITTER_GREEN2, preview.JITTER_BLUE], :, 221:229] += 500.0
+
+        model = preview.column_exposure_jitter_correction(
+            *scene,
+            black_levels=np.zeros(4, dtype=np.float32),
+            white_levels=np.full(4, 65535.0, dtype=np.float32),
+            num_bands=16,
+            temporal_window=31,
+            block_columns=123,
+            green_displacements=np.ones(self.WIDTH, dtype=np.float32),
+            show_progress=False,
+        )
+        corrected = np.stack(
+            [model.apply_window(scene[channel], channel, 0) for channel in range(4)]
+        )
+        np.testing.assert_array_equal(corrected, scene)
+
+    def test_motion_aligned_residual_reduces_high_rank_sensor_noise(self):
+        num_bands = 32
+        clean = np.stack(
+            [
+                np.full(
+                    (self.HEIGHT, self.WIDTH),
+                    10000.0 + 500.0 * channel,
+                    dtype=np.float32,
+                )
+                for channel in range(4)
+            ]
+        )
+        rng = np.random.default_rng(42)
+        pair_a_error = rng.normal(
+            0.0,
+            120.0,
+            (num_bands, self.WIDTH),
+        ).astype(np.float32)
+        pair_b_error = rng.normal(
+            0.0,
+            120.0,
+            (num_bands, self.WIDTH),
+        ).astype(np.float32)
+        row_bands = np.arange(self.HEIGHT) * num_bands // self.HEIGHT
+        striped = clean.copy()
+        striped[preview.JITTER_RED] += pair_a_error[row_bands]
+        striped[preview.JITTER_GREEN1] += pair_a_error[row_bands]
+        striped[preview.JITTER_GREEN2] += pair_b_error[row_bands]
+        striped[preview.JITTER_BLUE] += pair_b_error[row_bands]
+
+        arguments = dict(
+            black_levels=np.zeros(4, dtype=np.float32),
+            white_levels=np.full(4, 65535.0, dtype=np.float32),
+            num_bands=num_bands,
+            fine_temporal_window=31,
+            temporal_window=31,
+            green_displacements=np.ones(self.WIDTH, dtype=np.float32),
+            show_progress=False,
+        )
+        model = preview.column_exposure_jitter_correction(
+            *striped,
+            block_columns=123,
+            **arguments,
+        )
+        corrected = np.stack(
+            [
+                model.apply_window(striped[channel], channel, 0)
+                for channel in range(4)
+            ]
+        )
+        base_only = preview.ColumnJitterModel(
+            model.band_corrections,
+            self.HEIGHT,
+            model.black_levels,
+            model.white_levels,
+            model.confidence,
+        )
+        base_corrected = np.stack(
+            [
+                base_only.apply_window(striped[channel], channel, 0)
+                for channel in range(4)
+            ]
+        )
+        before = np.sqrt(np.mean(np.square(striped - clean)))
+        after_base = np.sqrt(np.mean(np.square(base_corrected - clean)))
+        after_two_stage = np.sqrt(np.mean(np.square(corrected - clean)))
+        self.assertLess(after_two_stage, 0.80 * after_base)
+        self.assertLess(after_two_stage, 0.65 * before)
+
+        single_block = preview.column_exposure_jitter_correction(
+            *striped,
+            block_columns=self.WIDTH,
+            **arguments,
+        )
+        np.testing.assert_array_equal(
+            model.band_corrections,
+            single_block.band_corrections,
+        )
+        np.testing.assert_array_equal(
+            model.fine_band_corrections,
+            single_block.fine_band_corrections,
+        )
+
+    def test_repeated_single_channel_detail_cannot_become_a_color_mode(self):
+        clean = self.make_clean_channels()
+        columns = np.arange(self.WIDTH, dtype=np.float32)
+        colored_detail = 400.0 * np.sin(2.0 * np.pi * columns / 9.0)
+        scene = clean.copy()
+        scene[preview.JITTER_RED] += colored_detail[None, :]
+
+        model = self.estimate(scene)
+        corrected = np.stack(
+            [model.apply_window(scene[channel], channel, 0) for channel in range(4)]
+        )
+        np.testing.assert_array_equal(corrected, scene)
+
+    def test_repeated_local_grill_detail_is_not_smoothed_away(self):
+        clean = self.make_clean_channels()
+        columns = np.arange(self.WIDTH)
+        grill = ((columns % 12) < 4).astype(np.float32) * 500.0
+        scene = clean.copy()
+        scene[:, : self.HEIGHT // 4] += grill[None, None, :]
+
+        model = self.estimate(scene)
+        corrected = np.stack(
+            [model.apply_window(scene[channel], channel, 0) for channel in range(4)]
+        )
+
+        # A repeated grill can recur often enough to resemble sensor timing,
+        # but its minority-row residual is robustly limited before projection.
+        # At least 99% of its 500-unit contrast must survive.
+        self.assertLess(float(np.max(np.abs(corrected - scene))), 5.0)
 
     def test_unsupported_owner_band_rejects_neighbor_interpolation(self):
         corrections = np.zeros((4, 2, 1), dtype=np.float16)

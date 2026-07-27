@@ -9,6 +9,12 @@ from pathlib import Path
 
 import bottleneck as bn
 import cv2
+import matplotlib
+
+# Preview diagnostics are written to disk, including from worker threads when
+# multiple captures are requested. A GUI backend is both unnecessary and
+# unsafe there (Tk can abort during cross-thread teardown).
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from numpy.lib.stride_tricks import sliding_window_view
 import numpy as np
@@ -49,6 +55,23 @@ JITTER_WHITE_MARGIN_FRACTION = 0.03
 JITTER_WHITE_MARGIN_MIN = 256.0
 JITTER_FINE_MAX_CORRECTION_FRACTION = 0.02
 JITTER_BROAD_MAX_CORRECTION_FRACTION = 0.01
+JITTER_MODEL_MAX_CORRECTION_FRACTION = 0.005
+JITTER_MODEL_MIN_VALID_FRACTION = 0.25
+JITTER_LOW_RANK_MAX_COMPONENTS = 64
+JITTER_LOW_RANK_MAX_SAMPLE_COLUMNS = 32768
+JITTER_LOW_RANK_MIN_TEMPORAL_PARTICIPATION = 0.10
+JITTER_LOW_RANK_MIN_SPATIAL_PARTICIPATION = 0.05
+JITTER_LOW_RANK_MIN_CHANNEL_POWER = 0.05
+JITTER_LOW_RANK_MIN_NOISE_RATIO = 5.0
+JITTER_LOW_RANK_WINSOR_SIGMA = 4.0
+JITTER_LOW_RANK_MIN_ROBUST_SCALE = 1.0e-5
+JITTER_RESIDUAL_MAX_CORRECTION_FRACTION = 0.006
+JITTER_RESIDUAL_MIN_CHANNEL_FRACTION = 0.0001
+JITTER_RESIDUAL_MIN_RELATIVE_CHANNEL_POWER = 0.10
+JITTER_ALIGNED_EDGE_THRESHOLD = 0.70
+JITTER_ALIGNED_STRONG_EDGE_THRESHOLD = 3.0
+JITTER_ALIGNED_EDGE_DILATE_COLUMNS = 1
+JITTER_ALIGNED_MIN_GRADIENT_SCALE = 5.0
 SPEED_MAX_FIT_DYNAMIC_RANGE = 1.5
 JITTER_RED = 0
 JITTER_GREEN1 = 1
@@ -417,7 +440,6 @@ def windowed_cross_correlation(
     window_size: int = 4096,
     corr_size: int = 15,
     output_dir: Path = None,
-    jitter_models: ColumnJitterModel | None = None,
 ) -> np.ndarray:
     """
     green_1: (h, w) where w >> h and w >> window_size
@@ -442,22 +464,11 @@ def windowed_cross_correlation(
         enumerate(xs[1:-1]), desc="train speed estimation", total=len(xs)
     ):
         window_1 = green_1[:, x : x + window_step]
-        if jitter_models is not None:
-            window_1 = apply_column_models(
-                window_1, jitter_models, x, JITTER_GREEN1
-            )
         window_1 = vertical_energy(window_1)
 
         corrs = np.zeros((corr_size,))
         pad = corr_half
         window_2_base = green_2[:, x - pad : x + window_step + pad]
-        if jitter_models is not None:
-            window_2_base = apply_column_models(
-                window_2_base,
-                jitter_models,
-                x - pad,
-                JITTER_GREEN2,
-            )
         window_2_base = vertical_energy(window_2_base)
 
         for corr_ind in range(corr_size):
@@ -963,7 +974,7 @@ def autoexposure(selected_bins, white_balance):
 
 
 class ColumnJitterModel:
-    """Smooth, channel-specific additive corrections at vertical band centers."""
+    """Channel-specific additive corrections at vertical band centers."""
 
     def __init__(
         self,
@@ -972,6 +983,7 @@ class ColumnJitterModel:
         black_levels: np.ndarray,
         white_levels: np.ndarray,
         confidence: np.ndarray,
+        fine_band_corrections: np.ndarray | None = None,
     ):
         corrections = np.asarray(band_corrections)
         if corrections.ndim != 3 or corrections.shape[0] != 4:
@@ -985,6 +997,15 @@ class ColumnJitterModel:
         self.confidence = np.asarray(confidence, dtype=np.float32)
         self.num_bands = corrections.shape[1]
         self.width = corrections.shape[2]
+        if fine_band_corrections is None:
+            self.fine_band_corrections = None
+        else:
+            fine = np.asarray(fine_band_corrections)
+            if fine.shape != corrections.shape:
+                raise ValueError(
+                    "fine_band_corrections must match band_corrections"
+                )
+            self.fine_band_corrections = fine
         if self.black_levels.shape != (4,) or self.white_levels.shape != (4,):
             raise ValueError("black_levels and white_levels must each contain 4 values")
         if self.confidence.shape != (self.width,):
@@ -1017,6 +1038,34 @@ class ColumnJitterModel:
         self._row_band_upper = upper
         self._row_band_owner = owner
         self._row_band_weight = weight.astype(np.float32)
+
+    def _interpolate_component(
+        self,
+        component: np.ndarray,
+        channel: int,
+        column_grid: np.ndarray,
+        rows: np.ndarray,
+    ) -> np.ndarray:
+        """Interpolate one independently supported correction component."""
+        lower = self._row_band_lower[rows]
+        upper = self._row_band_upper[rows]
+        weight = self._row_band_weight[rows, None]
+        channel_model = component[channel]
+        correction_low = channel_model[lower[:, None], column_grid].astype(
+            np.float32
+        )
+        correction_high = channel_model[upper[:, None], column_grid].astype(
+            np.float32
+        )
+        correction = correction_low + (correction_high - correction_low) * weight
+        # Interpolation may taper a supported band toward an unsupported
+        # neighbor, but it must never carry that neighbor's value across the
+        # boundary into a band whose own estimate is zero.
+        correction_owner = channel_model[
+            self._row_band_owner[rows, None],
+            column_grid,
+        ]
+        return np.where(correction_owner != 0.0, correction, 0.0)
 
     def correct_samples(
         self,
@@ -1055,25 +1104,23 @@ class ColumnJitterModel:
         ):
             raise IndexError("jitter model sample is outside the modeled image")
 
-        lower = self._row_band_lower[rows]
-        upper = self._row_band_upper[rows]
-        weight = self._row_band_weight[rows, None]
-        channel_model = self.band_corrections[channel]
-        correction_low = channel_model[lower[:, None], column_grid].astype(
-            np.float32
-        )
-        correction_high = channel_model[upper[:, None], column_grid].astype(
-            np.float32
-        )
-        correction = correction_low + (correction_high - correction_low) * weight
-        # Interpolation may taper a supported band toward an unsupported
-        # neighbor, but it must never carry that neighbor's value across the
-        # boundary into a band whose own estimate is zero.
-        correction_owner = channel_model[
-            self._row_band_owner[rows, None],
+        correction = self._interpolate_component(
+            self.band_corrections,
+            channel,
             column_grid,
-        ]
-        correction = np.where(correction_owner != 0.0, correction, 0.0)
+            rows,
+        )
+        if self.fine_band_corrections is not None:
+            # The residual component has a scene-edge support mask distinct
+            # from the recurrent model. Interpolate and owner-gate it
+            # independently so an unmasked neighboring band cannot leak into
+            # a protected wheel, window, or bellows band.
+            correction += self._interpolate_component(
+                self.fine_band_corrections,
+                channel,
+                column_grid,
+                rows,
+            )
 
         black = float(self.black_levels[channel])
         white = float(self.white_levels[channel])
@@ -1228,6 +1275,278 @@ def _jitter_structure_bands(
     ).any(axis=1)
 
 
+def _winsorize_jitter_candidates(
+    normalized_candidates: np.ndarray,
+    valid: np.ndarray,
+    *,
+    num_bands: int,
+) -> np.ndarray:
+    """
+    Limit isolated scene residuals before learning recurrent sensor modes.
+
+    The two physical Bayer columns have different responses, so each
+    red/green1 and green2/blue pair gets its own robust center. A wheel edge or
+    colored window artifact occupies a minority of the rows in either group
+    and is clipped toward that center; a genuine line-wide exposure change
+    moves the group center and survives.
+    """
+    normalized_candidates = np.asarray(normalized_candidates, dtype=np.float32)
+    valid = np.asarray(valid, dtype=bool)
+    expected_shape = (4 * num_bands, normalized_candidates.shape[1])
+    if (
+        normalized_candidates.shape != expected_shape
+        or valid.shape != expected_shape
+    ):
+        raise ValueError("jitter candidates have an unexpected feature shape")
+
+    winsorized = np.zeros_like(normalized_candidates)
+    for group_start, group_stop in (
+        (0, 2 * num_bands),
+        (2 * num_bands, 4 * num_bands),
+    ):
+        group_valid = valid[group_start:group_stop]
+        columns_with_data = np.any(group_valid, axis=0)
+        if not np.any(columns_with_data):
+            continue
+        group_values = np.where(
+            group_valid[:, columns_with_data],
+            normalized_candidates[group_start:group_stop, columns_with_data],
+            np.nan,
+        )
+        center = bn.nanmedian(group_values, axis=0)
+        deviation = bn.nanmedian(np.abs(group_values - center), axis=0)
+        robust_scale = np.maximum(
+            1.4826 * deviation,
+            JITTER_LOW_RANK_MIN_ROBUST_SCALE,
+        )
+        lower = center - JITTER_LOW_RANK_WINSOR_SIGMA * robust_scale
+        upper = center + JITTER_LOW_RANK_WINSOR_SIGMA * robust_scale
+        clipped = np.clip(group_values, lower, upper)
+        clipped[~np.isfinite(clipped)] = 0.0
+        winsorized[
+            group_start:group_stop,
+            columns_with_data,
+        ] = clipped
+    return winsorized
+
+
+def _jitter_low_rank_basis(
+    normalized_candidates: np.ndarray,
+    valid: np.ndarray,
+    *,
+    num_bands: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Learn recurrent, sensor-wide correction modes from sampled columns.
+
+    Candidate residuals alone cannot distinguish a real vertical edge from an
+    exposure error. The accepted eigenmodes must instead be well above the
+    covariance noise floor, occupy many row/channel features, and recur over a
+    substantial fraction of the capture. Sparse scene details fail at least
+    the latter two tests.
+    """
+    winsorized = _winsorize_jitter_candidates(
+        normalized_candidates,
+        valid,
+        num_bands=num_bands,
+    )
+    counts = np.sum(valid, axis=1)
+    feature_means = np.divide(
+        np.sum(winsorized, axis=1),
+        counts,
+        out=np.zeros(winsorized.shape[0], dtype=np.float32),
+        where=counts > 0,
+    )
+    centered = np.where(
+        valid,
+        winsorized - feature_means[:, None],
+        0.0,
+    )
+    if centered.shape[1] < 2 or not np.any(centered):
+        return (
+            np.empty((centered.shape[0], 0), dtype=np.float32),
+            feature_means,
+        )
+
+    covariance = centered @ centered.T / float(centered.shape[1])
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    order = np.argsort(eigenvalues)[::-1]
+    eigenvalues = np.maximum(eigenvalues[order], 0.0)
+    eigenvectors = eigenvectors[:, order]
+    leading = float(eigenvalues[0])
+    if not np.isfinite(leading) or leading <= 0.0:
+        return (
+            np.empty((centered.shape[0], 0), dtype=np.float32),
+            feature_means,
+        )
+
+    # A coherent sensor mode stands well clear of the independent feature
+    # residuals in the middle of the spectrum. The relative epsilon preserves
+    # exact low-rank synthetic/capture signals whose remaining eigenvalues are
+    # zero up to roundoff.
+    noise_floor = max(
+        float(np.median(eigenvalues)),
+        leading * 1.0e-9,
+    )
+    candidate_count = min(
+        JITTER_LOW_RANK_MAX_COMPONENTS,
+        eigenvectors.shape[1],
+    )
+    candidate_basis = eigenvectors[:, :candidate_count]
+    scores = (candidate_basis.T @ centered).astype(np.float64)
+    score_power = np.sum(np.square(scores), axis=1)
+    temporal_denominator = centered.shape[1] * np.sum(
+        np.power(scores, 4),
+        axis=1,
+    )
+    temporal_participation = np.divide(
+        np.square(score_power),
+        temporal_denominator,
+        out=np.zeros(candidate_count, dtype=np.float64),
+        where=temporal_denominator > 0.0,
+    )
+    spatial_participation = np.divide(
+        1.0,
+        centered.shape[0] * np.sum(np.power(candidate_basis, 4), axis=0),
+        out=np.zeros(candidate_count, dtype=np.float32),
+        where=np.any(candidate_basis != 0.0, axis=0),
+    )
+    channel_power = np.sum(
+        np.square(
+            candidate_basis.reshape(4, num_bands, candidate_count)
+        ),
+        axis=1,
+    )
+    channel_supported = np.all(
+        channel_power >= JITTER_LOW_RANK_MIN_CHANNEL_POWER,
+        axis=0,
+    )
+    accepted = (
+        (
+            eigenvalues[:candidate_count]
+            >= JITTER_LOW_RANK_MIN_NOISE_RATIO * noise_floor
+        )
+        & (
+            temporal_participation
+            >= JITTER_LOW_RANK_MIN_TEMPORAL_PARTICIPATION
+        )
+        & (
+            spatial_participation
+            >= JITTER_LOW_RANK_MIN_SPATIAL_PARTICIPATION
+        )
+        & channel_supported
+    )
+    return (
+        candidate_basis[:, accepted].astype(np.float32, copy=False),
+        feature_means,
+    )
+
+
+def _project_jitter_low_rank(
+    normalized_candidates: np.ndarray,
+    valid: np.ndarray,
+    basis: np.ndarray,
+    feature_means: np.ndarray,
+    *,
+    num_bands: int,
+) -> np.ndarray:
+    """Project one column block onto the accepted recurrent sensor modes."""
+    if basis.shape[1] == 0:
+        return np.zeros_like(normalized_candidates, dtype=np.float32)
+    winsorized = _winsorize_jitter_candidates(
+        normalized_candidates,
+        valid,
+        num_bands=num_bands,
+    )
+    centered = np.where(
+        valid,
+        winsorized - feature_means[:, None],
+        0.0,
+    )
+    numerator = basis.T @ centered
+    denominator = np.square(basis).T @ valid.astype(np.float32)
+    scores = np.divide(
+        numerator,
+        denominator,
+        out=np.zeros_like(numerator),
+        where=denominator > 1.0e-6,
+    )
+    return basis @ scores
+
+
+def _sample_jitter_band_columns(
+    values: np.ndarray,
+    positions: np.ndarray,
+    *,
+    start_column: int = 0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Linearly sample band traces at fractional global column positions."""
+    values = np.asarray(values, dtype=np.float32)
+    positions = np.asarray(positions, dtype=np.float64)
+    if values.ndim != 2 or positions.ndim != 1:
+        raise ValueError("band traces must be 2-D and positions must be 1-D")
+
+    local = positions - float(start_column)
+    lower = np.floor(local).astype(np.int64)
+    valid = np.isfinite(local) & (lower >= 0) & (lower + 1 < values.shape[1])
+    safe_lower = np.clip(lower, 0, max(values.shape[1] - 2, 0))
+    fraction = (local - lower)[None, :]
+    if values.shape[1] < 2:
+        return (
+            np.zeros((values.shape[0], positions.size), dtype=np.float32),
+            np.zeros(positions.size, dtype=bool),
+        )
+    sampled = (
+        values[:, safe_lower] * (1.0 - fraction)
+        + values[:, safe_lower + 1] * fraction
+    )
+    sampled[:, ~valid] = 0.0
+    return sampled.astype(np.float32, copy=False), valid
+
+
+def _sample_centered_jitter_gradient(
+    values: np.ndarray,
+    positions: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Sample ``np.gradient(values, axis=1)`` without materializing it."""
+    values = np.asarray(values, dtype=np.float32)
+    positions = np.asarray(positions, dtype=np.float64)
+    if values.ndim != 2 or positions.ndim != 1:
+        raise ValueError("band traces must be 2-D and positions must be 1-D")
+    if values.shape[1] < 3:
+        return (
+            np.zeros((values.shape[0], positions.size), dtype=np.float32),
+            np.zeros(positions.size, dtype=bool),
+        )
+
+    lower = np.floor(positions).astype(np.int64)
+    valid = (
+        np.isfinite(positions)
+        & (lower >= 1)
+        & (lower + 2 < values.shape[1])
+    )
+    safe_lower = np.clip(lower, 1, values.shape[1] - 3)
+    gradient_lower = 0.5 * (
+        values[:, safe_lower + 1] - values[:, safe_lower - 1]
+    )
+    gradient_upper = 0.5 * (
+        values[:, safe_lower + 2] - values[:, safe_lower]
+    )
+    fraction = (positions - lower)[None, :]
+    sampled = gradient_lower + (gradient_upper - gradient_lower) * fraction
+    sampled[:, ~valid] = 0.0
+    return sampled.astype(np.float32, copy=False), valid
+
+
+def _dilate_jitter_edges(mask: np.ndarray, radius: int) -> np.ndarray:
+    """Dilate a band/column mask horizontally without coupling sensor rows."""
+    mask = np.asarray(mask, dtype=bool)
+    if radius <= 0 or mask.size == 0:
+        return mask
+    kernel = np.ones((1, 2 * radius + 1), dtype=np.uint8)
+    return cv2.dilate(mask.astype(np.uint8), kernel) != 0
+
+
 def column_exposure_jitter_correction(
     red_view,
     green1,
@@ -1243,6 +1562,7 @@ def column_exposure_jitter_correction(
     block_columns: int = JITTER_BLOCK_COLUMNS,
     structure_mask: np.ndarray | None = None,
     structure_mask_scale: int = 1,
+    green_displacements: np.ndarray | None = None,
     show_progress: bool = True,
 ) -> ColumnJitterModel:
     """
@@ -1251,14 +1571,27 @@ def column_exposure_jitter_correction(
     A centered temporal median supplies the local unstriped target. Unlike the
     former adjacent-column composition, this has no cumulative state: monotonic
     scene gradients are fixed points and cannot turn into correction drift.
-    A short centered median removes narrow line jitter. A longer median handles
-    broader exposure cycles, but that broad component is accepted only inside
-    a small exposure-relative envelope so a bright scene plateau cannot be
-    mistaken for camera error. Strong scene structure is excluded by a
-    downsampled edge mask. This lets each Bayer channel and row band retain its
-    own response instead of forcing unlike channels to share a sign. Clipped,
-    structured, or otherwise unsupported bands receive zero correction;
-    estimates are never filled or extrapolated from other parts of the sensor.
+    A short centered median detects narrow line jitter and a longer median
+    detects broader exposure cycles. Those per-band values are candidates only.
+    The applied model is a small set of recurrent low-rank modes shared across
+    the sensor. A wheel, window edge, bellows pleat, or one-channel color detail
+    is sparse in time or row/channel support and cannot become a correction
+    mode. Unlike local temporal smoothing, the model therefore does not erase
+    the very detail that resembles a stripe.
+
+    Strong scene structure is excluded by a downsampled edge mask. Clipped and
+    structured bands do not vote when the model is learned or projected. Once
+    a sensor-wide mode is established, its row/channel response is applied
+    consistently through those regions, with per-pixel clipping protection.
+
+    When the motion fit supplies the displacement between the two green
+    columns, a second pass removes the fine residual left by the recurrent
+    model. It operates only where both greens agree that there is no scene
+    edge. Strong corroborated edges protect their full temporal-median
+    neighborhood, and an event must appear in at least two Bayer channels.
+    This prevents a wheel, bellows pleat, grill, or one-channel color feature
+    from being replaced by a locally smoothed estimate. The recurrent and fine
+    components retain separate support masks during row interpolation.
     """
     del g  # Retained in the signature for callers that group outputs by capture.
     channel_views = (red_view, green1, green2, blue_view)
@@ -1283,6 +1616,17 @@ def column_exposure_jitter_correction(
         )
     if block_columns < 1:
         raise ValueError("block_columns must be positive")
+    if green_displacements is not None:
+        green_displacements = np.asarray(
+            green_displacements,
+            dtype=np.float64,
+        )
+        if green_displacements.shape != (image_width,):
+            raise ValueError(
+                "green_displacements must contain one value per image column"
+            )
+        if not np.all(np.isfinite(green_displacements)):
+            raise ValueError("green_displacements must all be finite")
 
     if black_levels is None or white_levels is None:
         estimated_black, estimated_white = _estimate_jitter_levels(channel_views)
@@ -1310,8 +1654,33 @@ def column_exposure_jitter_correction(
         (4, num_bands, image_width),
         dtype=np.float16,
     )
-    confidence_full = np.zeros(image_width, dtype=np.float32)
-    radius = temporal_window // 2
+    gradient_sample_columns = None
+    raw_green_gradient_samples = None
+    if green_displacements is not None and image_width >= 4:
+        gradient_sample_count = min(
+            image_width - 2,
+            JITTER_LOW_RANK_MAX_SAMPLE_COLUMNS,
+        )
+        gradient_sample_columns = np.unique(
+            np.linspace(
+                1,
+                image_width - 2,
+                gradient_sample_count,
+                dtype=np.int64,
+            )
+        )
+        raw_green_gradient_samples = np.full(
+            (2, num_bands, gradient_sample_columns.size),
+            np.nan,
+            dtype=np.float32,
+        )
+
+    alignment_margin = (
+        int(math.ceil(float(np.max(np.abs(green_displacements))))) + 2
+        if green_displacements is not None
+        else 0
+    )
+    radius = max(temporal_window // 2, alignment_margin)
     block_starts = range(0, image_width, block_columns)
 
     for core_start in tqdm(
@@ -1337,6 +1706,48 @@ def column_exposure_jitter_correction(
                 float(black_levels[channel]),
                 float(white_levels[channel]),
             )
+            if (
+                raw_green_gradient_samples is not None
+                and channel in (JITTER_GREEN1, JITTER_GREEN2)
+            ):
+                sample_start = int(
+                    np.searchsorted(
+                        gradient_sample_columns,
+                        core_start,
+                        side="left",
+                    )
+                )
+                sample_stop = int(
+                    np.searchsorted(
+                        gradient_sample_columns,
+                        core_stop,
+                        side="left",
+                    )
+                )
+                if sample_stop > sample_start:
+                    sample_x = gradient_sample_columns[
+                        sample_start:sample_stop
+                    ]
+                    sample_positions = sample_x.astype(np.float64)
+                    if channel == JITTER_GREEN2:
+                        sample_positions += green_displacements[sample_x]
+                    statistics_gradient = np.gradient(
+                        statistics,
+                        axis=1,
+                    )
+                    sampled_gradient, sampled_valid = (
+                        _sample_jitter_band_columns(
+                            statistics_gradient,
+                            sample_positions,
+                            start_column=read_start,
+                        )
+                    )
+                    sampled_gradient[:, ~sampled_valid] = np.nan
+                    raw_green_gradient_samples[
+                        channel - JITTER_GREEN1,
+                        :,
+                        sample_start:sample_stop,
+                    ] = sampled_gradient
             fine_target = _centered_moving_median(
                 statistics,
                 fine_temporal_window,
@@ -1368,7 +1779,7 @@ def column_exposure_jitter_correction(
             np.abs(broad_offsets)
             <= JITTER_BROAD_MAX_CORRECTION_FRACTION * spans
         )
-        local_corrections = np.where(
+        candidate_corrections = np.where(
             fine_supported,
             fine_offsets,
             0.0,
@@ -1377,15 +1788,259 @@ def column_exposure_jitter_correction(
             broad_offsets,
             0.0,
         )
+
+        normalized_candidates = np.clip(
+            candidate_corrections / spans,
+            -JITTER_MODEL_MAX_CORRECTION_FRACTION,
+            JITTER_MODEL_MAX_CORRECTION_FRACTION,
+        )
+        # NaN is an intentional temporary sentinel: a valid zero residual must
+        # remain distinguishable from an unsupported clipped/structured band.
         band_corrections[:, :, core_start:core_stop] = np.clip(
-            local_corrections,
+            np.where(valid, normalized_candidates, np.nan),
             -np.finfo(np.float16).max,
             np.finfo(np.float16).max,
         )
-        confidence_full[core_start:core_stop] = np.mean(
-            fine_supported | broad_supported,
-            axis=(0, 1),
+
+    feature_candidates = band_corrections.reshape(4 * num_bands, image_width)
+    sample_count = min(image_width, JITTER_LOW_RANK_MAX_SAMPLE_COLUMNS)
+    sample_columns = np.linspace(
+        0,
+        image_width - 1,
+        sample_count,
+        dtype=np.int64,
+    )
+    training_candidates = feature_candidates[:, sample_columns].astype(
+        np.float32
+    )
+    training_valid = np.isfinite(training_candidates)
+    training_candidates[~training_valid] = 0.0
+    basis, feature_means = _jitter_low_rank_basis(
+        training_candidates,
+        training_valid,
+        num_bands=num_bands,
+    )
+    if show_progress:
+        print(
+            "column exposure jitter: "
+            f"accepted {basis.shape[1]} recurrent sensor modes"
         )
+
+    confidence_full = np.zeros(image_width, dtype=np.float32)
+    minimum_valid = math.ceil(
+        JITTER_MODEL_MIN_VALID_FRACTION * 4 * num_bands
+    )
+    spans_flat = np.repeat(white_levels - black_levels, num_bands)
+    for core_start in range(0, image_width, block_columns):
+        core_stop = min(image_width, core_start + block_columns)
+        candidates = feature_candidates[:, core_start:core_stop].astype(
+            np.float32
+        )
+        valid = np.isfinite(candidates)
+        candidates[~valid] = 0.0
+        reconstructed = _project_jitter_low_rank(
+            candidates,
+            valid,
+            basis,
+            feature_means,
+            num_bands=num_bands,
+        )
+        valid_count = np.sum(valid, axis=0)
+        supported_columns = valid_count >= minimum_valid
+        reconstructed[:, ~supported_columns] = 0.0
+        reconstructed = np.clip(
+            reconstructed,
+            -JITTER_MODEL_MAX_CORRECTION_FRACTION,
+            JITTER_MODEL_MAX_CORRECTION_FRACTION,
+        )
+        feature_candidates[:, core_start:core_stop] = np.clip(
+            reconstructed * spans_flat[:, None],
+            -np.finfo(np.float16).max,
+            np.finfo(np.float16).max,
+        )
+        confidence_full[core_start:core_stop] = np.where(
+            supported_columns,
+            valid_count / float(4 * num_bands),
+            0.0,
+        )
+
+    fine_band_corrections = None
+    if raw_green_gradient_samples is not None:
+        sample_x = gradient_sample_columns.astype(np.float64)
+        aligned_sample_x = (
+            sample_x
+            + green_displacements[gradient_sample_columns]
+        )
+        model_green1_gradient, model_green1_valid = (
+            _sample_centered_jitter_gradient(
+                band_corrections[JITTER_GREEN1],
+                sample_x,
+            )
+        )
+        model_green2_gradient, model_green2_valid = (
+            _sample_centered_jitter_gradient(
+                band_corrections[JITTER_GREEN2],
+                aligned_sample_x,
+            )
+        )
+        corrected_green_gradient_samples = (
+            raw_green_gradient_samples.copy()
+        )
+        corrected_green_gradient_samples[0] += model_green1_gradient
+        corrected_green_gradient_samples[1] += model_green2_gradient
+        corrected_green_gradient_samples[0, :, ~model_green1_valid] = np.nan
+        corrected_green_gradient_samples[1, :, ~model_green2_valid] = np.nan
+        green_gradient_scales = 1.4826 * bn.nanmedian(
+            np.abs(corrected_green_gradient_samples),
+            axis=2,
+        )
+        green_gradient_scales = np.maximum(
+            green_gradient_scales,
+            JITTER_ALIGNED_MIN_GRADIENT_SCALE,
+        )
+        green_gradient_scales[~np.isfinite(green_gradient_scales)] = np.inf
+
+        # The recurrent model deliberately leaves ambiguous high-rank
+        # residuals alone. Revisit only that narrow temporal band after the
+        # motion-aligned greens can identify which changes belong to the
+        # scene. This is a separate correction component so its support mask
+        # survives vertical interpolation.
+        fine_band_corrections = np.zeros_like(band_corrections)
+        fine_radius = fine_temporal_window // 2
+        fine_read_radius = fine_radius + alignment_margin
+        for core_start in tqdm(
+            range(0, image_width, block_columns),
+            total=math.ceil(image_width / block_columns),
+            desc="fine residual jitter",
+            disable=not show_progress,
+        ):
+            core_stop = min(image_width, core_start + block_columns)
+            read_start = max(0, core_start - fine_read_radius)
+            read_stop = min(image_width, core_stop + fine_read_radius)
+            core_slice = slice(
+                core_start - read_start,
+                core_stop - read_start,
+            )
+            corrected_statistics = np.empty(
+                (4, num_bands, read_stop - read_start),
+                dtype=np.float32,
+            )
+            band_valid = np.empty_like(
+                corrected_statistics,
+                dtype=bool,
+            )
+            for channel, view in enumerate(channel_views):
+                statistics, valid_statistics = _jitter_band_statistics(
+                    view[:, slice(read_start, read_stop)],
+                    num_bands,
+                    float(black_levels[channel]),
+                    float(white_levels[channel]),
+                )
+                corrected_statistics[channel] = (
+                    statistics
+                    + band_corrections[
+                        channel,
+                        :,
+                        read_start:read_stop,
+                    ].astype(np.float32)
+                )
+                band_valid[channel] = valid_statistics
+
+            fine_target = _centered_moving_median(
+                corrected_statistics,
+                fine_temporal_window,
+            )
+            fine_offsets = (
+                fine_target - corrected_statistics
+            )[:, :, core_slice]
+
+            # Compute scene-edge support on an expanded interval so horizontal
+            # dilation is identical on either side of a processing boundary.
+            mask_start = max(0, core_start - fine_radius)
+            mask_stop = min(image_width, core_stop + fine_radius)
+            mask_columns = np.arange(
+                mask_start,
+                mask_stop,
+                dtype=np.int64,
+            )
+            green1_gradient = np.gradient(
+                corrected_statistics[JITTER_GREEN1],
+                axis=1,
+            )
+            green2_gradient = np.gradient(
+                corrected_statistics[JITTER_GREEN2],
+                axis=1,
+            )
+            sampled_green1, green1_valid = _sample_jitter_band_columns(
+                green1_gradient,
+                mask_columns,
+                start_column=read_start,
+            )
+            aligned_columns = (
+                mask_columns.astype(np.float64)
+                + green_displacements[mask_columns]
+            )
+            sampled_green2, green2_valid = _sample_jitter_band_columns(
+                green2_gradient,
+                aligned_columns,
+                start_column=read_start,
+            )
+            aligned_valid = green1_valid & green2_valid
+            edge_score = np.sign(sampled_green1 * sampled_green2) * np.minimum(
+                np.abs(sampled_green1) / green_gradient_scales[0, :, None],
+                np.abs(sampled_green2) / green_gradient_scales[1, :, None],
+            )
+            weak_edges = _dilate_jitter_edges(
+                edge_score >= JITTER_ALIGNED_EDGE_THRESHOLD,
+                JITTER_ALIGNED_EDGE_DILATE_COLUMNS,
+            )
+            strong_edges = _dilate_jitter_edges(
+                edge_score >= JITTER_ALIGNED_STRONG_EDGE_THRESHOLD,
+                fine_radius,
+            )
+            structured = weak_edges | strong_edges
+            structured[:, ~aligned_valid] = True
+            mask_core_slice = slice(
+                core_start - mask_start,
+                core_stop - mask_start,
+            )
+            structured = structured[:, mask_core_slice]
+
+            normalized_magnitude = np.abs(fine_offsets) / (
+                white_levels - black_levels
+            )[:, None, None]
+            peak_magnitude = np.max(normalized_magnitude, axis=0)
+            channel_threshold = np.maximum(
+                JITTER_RESIDUAL_MIN_CHANNEL_FRACTION,
+                (
+                    JITTER_RESIDUAL_MIN_RELATIVE_CHANNEL_POWER
+                    * peak_magnitude
+                ),
+            )
+            participating_channels = np.sum(
+                normalized_magnitude >= channel_threshold[None, :, :],
+                axis=0,
+            )
+            residual_event = participating_channels >= 2
+            supported = (
+                band_valid[:, :, core_slice]
+                & ~structured[None, :, :]
+                & residual_event[None, :, :]
+            )
+            maximum = (
+                JITTER_RESIDUAL_MAX_CORRECTION_FRACTION
+                * (white_levels - black_levels)[:, None, None]
+            )
+            residual_correction = np.clip(
+                fine_offsets,
+                -maximum,
+                maximum,
+            )
+            fine_band_corrections[:, :, core_start:core_stop] = np.where(
+                supported,
+                residual_correction,
+                0.0,
+            ).astype(np.float16)
 
     return ColumnJitterModel(
         band_corrections,
@@ -1393,6 +2048,7 @@ def column_exposure_jitter_correction(
         black_levels,
         white_levels,
         confidence_full,
+        fine_band_corrections=fine_band_corrections,
     )
 
 
@@ -1914,6 +2570,27 @@ def process_preview(
         preview = cv2.addWeighted(base, 0.9, mask_overlay, 0.1, 0.0)
         cv2.imwrite(str(g / "structure_mask_preview.png"), preview)
 
+    # Geometry is estimated from untouched Bayer planes. Besides preventing a
+    # radiometric model from stretching the train, this displacement lets the
+    # two green sensor columns corroborate real scene edges before the narrow
+    # residual correction is allowed to run.
+    sample_xs, sample_ys, _weights = windowed_cross_correlation(green1, green2)
+    spline = robust_bspline_fit(
+        x=sample_xs,
+        y=sample_ys,
+        weights=_weights,
+        smoothness=80000,
+        visualize=False,
+        g=g,
+    )
+    green_displacements = np.interp(
+        np.arange(green1.width, dtype=np.float64),
+        sample_xs,
+        sample_ys,
+        left=sample_ys[0],
+        right=sample_ys[-1],
+    )
+
     jitter_models = None
     if ENABLE_COLUMN_JITTER_CORRECTION:
         jitter_models = column_exposure_jitter_correction(
@@ -1926,6 +2603,7 @@ def process_preview(
             white_levels=jitter_white_levels,
             structure_mask=mask_full,
             structure_mask_scale=STRUCTURE_MASK_DOWNSAMPLE,
+            green_displacements=green_displacements,
         )
     if ENABLE_JITTER_DEBUG_PLOT and jitter_models is not None:
         row_idx = min(JITTER_DEBUG_ROW, green1.height - 1)
@@ -1987,19 +2665,6 @@ def process_preview(
         fig.savefig(g / "jitter_row_debug.png")
         plt.close(fig)
 
-    sample_xs, sample_ys, _weights = windowed_cross_correlation(
-        green1, green2, jitter_models=jitter_models
-    )
-
-    spline = robust_bspline_fit(
-        x=sample_xs,
-        y=sample_ys,
-        weights=_weights,
-        smoothness=80000,
-        visualize=False,
-        g=g,
-    )
-
     print(g, len(bins), data.shape)
 
     sample_positions, widths, step_scales = generate_sample_positions(
@@ -2022,7 +2687,9 @@ def process_preview(
             stride_y=hough_stride,
             skew=0.0,
             max_pix=skew_chunk_size,
-            jitter_models=jitter_models,
+            # Keep the skew fit independent of an optional radiometric
+            # correction for the same reason as the speed fit above.
+            jitter_models=None,
             step_scales=step_scales,
         ),
         g=g,
