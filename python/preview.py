@@ -24,8 +24,11 @@ RAW_COLOR_CORRECTION = np.array(
     dtype=np.float32,
 )
 
+CAMERA_MAKE = "Alkeria"
 CAMERA_MODEL_NAME = "Alkeria Necta N4K2-7C"
-ENABLE_COLUMN_JITTER_CORRECTION = True
+ENABLE_COLUMN_JITTER_CORRECTION = False
+FORCE_CONTIGUOUS_SELECTION = True
+FLIP_OUTPUT_180 = True
 STRUCTURE_MASK_DOWNSAMPLE = 8
 STRUCTURE_MASK_THRESHOLD = 0.05
 STRUCTURE_MASK_DILATE_PX = 128
@@ -47,6 +50,36 @@ def _normalize_rows(matrix: np.ndarray) -> np.ndarray:
 
 COLOR_CORRECTION = _normalize_rows(RAW_COLOR_CORRECTION)
 
+# DNG ColorMatrix values map CIE XYZ to camera-native coordinates, whereas
+# COLOR_CORRECTION maps white-balanced camera coordinates to linear sRGB.
+# These standard matrices bridge the two conventions. The D50 matrix is the
+# ICC-adapted linear-sRGB matrix used for DNG's profile connection space.
+XYZ_D65_TO_LINEAR_SRGB = np.array(
+    [
+        [3.2404542, -1.5371385, -0.4985314],
+        [-0.9692660, 1.8760108, 0.0415560],
+        [0.0556434, -0.2040259, 1.0572252],
+    ],
+    dtype=np.float64,
+)
+
+LINEAR_SRGB_TO_XYZ_D50 = np.array(
+    [
+        [0.4360747, 0.3850649, 0.1430804],
+        [0.2225045, 0.7168786, 0.0606169],
+        [0.0139322, 0.0971045, 0.7141733],
+    ],
+    dtype=np.float64,
+)
+
+DNG_COLOR_MATRIX_1 = np.linalg.solve(
+    COLOR_CORRECTION.astype(np.float64),
+    XYZ_D65_TO_LINEAR_SRGB,
+)
+DNG_FORWARD_MATRIX_1 = (
+    LINEAR_SRGB_TO_XYZ_D50 @ COLOR_CORRECTION.astype(np.float64)
+)
+
 
 def apply_color_transform(
     raw_rgb: np.ndarray,
@@ -59,6 +92,15 @@ def apply_color_transform(
     return np.tensordot(balanced, color_matrix.T, axes=([2], [0]))
 
 
+def _rational_values(
+    values: np.ndarray, *, signed: bool, denominator: int = 1_000_000
+) -> tuple[tuple[int, int], ...]:
+    values = np.asarray(values, dtype=np.float64).ravel()
+    if not signed and np.any(values < 0):
+        raise ValueError("unsigned rational values must be non-negative")
+    return tuple((int(round(value * denominator)), denominator) for value in values)
+
+
 def write_linear_dng(
     path: Path, raw_rgb: np.ndarray, white_balance: np.ndarray
 ) -> None:
@@ -67,15 +109,21 @@ def write_linear_dng(
             "tifffile is required for DNG export. Install it via `uv pip install tifffile`."
         )
 
-    linear = np.clip(raw_rgb[::-1, :, :], 0, 65535).astype(np.uint16)
+    flipped = raw_rgb[::-1, :, :]
+    if flipped.dtype == np.uint16:
+        linear = np.ascontiguousarray(flipped)
+    else:
+        linear = np.clip(flipped, 0, 65535).astype(np.uint16)
     wb = np.asarray(white_balance, dtype=np.float64)
     safe_wb = np.clip(wb, 1e-6, None)
     as_shot_neutral = 1.0 / safe_wb
     if as_shot_neutral[1] != 0:
         as_shot_neutral /= as_shot_neutral[1]
 
-    color_matrix = COLOR_CORRECTION.astype(np.float64).ravel()
     extratags = [
+        (271, "s", len(CAMERA_MAKE) + 1, CAMERA_MAKE),  # Make
+        (272, "s", len(CAMERA_MODEL_NAME) + 1, CAMERA_MODEL_NAME),  # Model
+        (274, "H", 1, 1),  # Orientation = top-left
         (50706, "B", 4, (1, 4, 0, 0)),  # DNGVersion
         (50707, "B", 4, (1, 2, 0, 0)),  # DNGBackwardVersion
         (
@@ -84,22 +132,62 @@ def write_linear_dng(
             len(CAMERA_MODEL_NAME) + 1,
             CAMERA_MODEL_NAME,
         ),  # UniqueCameraModel
-        (50721, "d", len(color_matrix), tuple(color_matrix)),  # ColorMatrix1
-        (50728, "d", 3, tuple(as_shot_neutral.tolist())),  # AsShotNeutral
-        (50730, "H", 1, 21),  # CalibrationIlluminant1 = D65
+        (
+            50721,
+            "2i",
+            9,
+            _rational_values(DNG_COLOR_MATRIX_1, signed=True),
+        ),  # ColorMatrix1: XYZ D65 -> camera
+        (
+            50728,
+            "2I",
+            3,
+            _rational_values(as_shot_neutral, signed=False),
+        ),  # AsShotNeutral
+        (50778, "H", 1, 21),  # CalibrationIlluminant1 = D65
+        (
+            50964,
+            "2i",
+            9,
+            _rational_values(DNG_FORWARD_MATRIX_1, signed=True),
+        ),  # ForwardMatrix1: white-balanced camera -> XYZ D50
     ]
 
     tifffile.imwrite(
         path,
         linear,
-        photometric="rgb",
-        metadata={"Software": "nectar-preview"},
+        photometric=tifffile.PHOTOMETRIC.LINEAR_RAW,
+        planarconfig="contig",
+        metadata=None,
+        software="nectar-preview",
         extratags=extratags,
     )
 
 
 # linescans = Path("/home/dllu/pictures/linescan")
 linescans = Path("/mnt/dataz/pictures/linescan")
+
+
+def format_contiguous_segments(indices):
+    if not indices:
+        return "none"
+
+    segments = []
+    start = indices[0]
+    prev = start
+    for idx in indices[1:]:
+        if idx == prev + 1:
+            prev = idx
+            continue
+        segments.append((start, prev))
+        start = idx
+        prev = idx
+    segments.append((start, prev))
+
+    return ", ".join(
+        str(start) if start == end else f"{start}-{end}"
+        for start, end in segments
+    )
 
 
 class FileDataCache:
@@ -1509,7 +1597,7 @@ def estimate_skew_hough(
 
 def process_preview(
     g: Path,
-    padding: int = 3,
+    padding: int = 10,
     max_chunks: int = 512,
 ):
     bins = sorted(list(g.glob("*.bin")))
@@ -1548,12 +1636,14 @@ def process_preview(
     min_score = min(scores)
     selected = set()
     for i, score in enumerate(scores):
-        if score > min_score * 1.5:
+        if score > min_score * 1.3:
             for pi in range(-padding, padding + 1):
                 if i + pi >= 0 and i + pi < len(bins):
                     selected.add(i + pi)
     selected = sorted(list(selected))
-    print("selected", selected)
+    if FORCE_CONTIGUOUS_SELECTION and selected:
+        selected = list(range(selected[0], selected[-1] + 1))
+    print("selected", format_contiguous_segments(selected))
 
     selected_bins = [bins[s] for s in selected]
 
@@ -1731,7 +1821,7 @@ def process_preview(
         x=sample_xs,
         y=sample_ys,
         weights=_weights,
-        smoothness=40000,
+        smoothness=80000,
         visualize=False,
         g=g,
     )
@@ -1791,6 +1881,7 @@ def process_preview(
         widths = widths[:n_use]
         step_scales = step_scales[:n_use]
 
+    output_chunk_count = int(math.ceil(len(sample_positions) / chunk_size))
     stacked_preview = []
     for chunk_i, raw_sampled in sample_motion_corrected_chunks(
         red_view,
@@ -1806,10 +1897,16 @@ def process_preview(
         jitter_models=jitter_models,
         step_scales=step_scales,
     ):
-        out_name = f"rgb_{chunk_i:02d}_cfpeak_deskewed_jitter"
+        output_chunk_i = (
+            output_chunk_count - 1 - chunk_i if FLIP_OUTPUT_180 else chunk_i
+        )
+        out_name = f"rgb_{output_chunk_i:02d}_cfpeak_deskewed_jitter"
         # denoised_sampled = patch_denoise(raw_sampled)
         denoised_sampled = raw_sampled
-        write_linear_dng(g / f"{out_name}_linear.dng", denoised_sampled, white_balance)
+        dng_sampled = denoised_sampled
+        if FLIP_OUTPUT_180:
+            dng_sampled = np.ascontiguousarray(dng_sampled[::-1, ::-1, :])
+        write_linear_dng(g / f"{out_name}_linear.dng", dng_sampled, white_balance)
         # calibrate, clip, sharpen, tone-map
         rgb = apply_color_transform(denoised_sampled, white_balance)
         rgb = np.clip(rgb, 0, 65536)
@@ -1823,6 +1920,8 @@ def process_preview(
         rgb *= 255
 
         rgb_u8 = rgb[:, :, ::-1].astype(np.uint8)
+        if FLIP_OUTPUT_180:
+            rgb_u8 = np.ascontiguousarray(rgb_u8[::-1, ::-1, :])
         for ext in (".jpg", ".png"):
             cv2.imwrite(str(g / (out_name + ext)), rgb_u8)
 
@@ -1834,6 +1933,8 @@ def process_preview(
         stacked_preview.append(np.clip(binned, 0, 255).astype(np.uint8))
 
     if stacked_preview:
+        if FLIP_OUTPUT_180:
+            stacked_preview = stacked_preview[::-1]
         stacked = np.vstack(stacked_preview)
         cv2.imwrite(str(g / "preview_stack.jpg"), stacked)
 
@@ -1848,17 +1949,18 @@ def main():
     # globs = linescans.glob("2024-09*")  # hktram
     # globs = linescans.glob("2024-09-12-01-31-01*")  # hk bus
     # globs = linescans.glob("2024-09-12-01-49-42") # hk buses
-    # globs = linescans.glob("nyc5")
+    # globs = linescans.glob("nyc4")
     # globs = linescans.glob("18-08-0*")  # amtrak
     # globs = linescans.glob("18*")
     # globs = linescans.glob("17-10-01-23-46-50-utc")
     # globs = linescans.glob("18-10-18-02-31-29-utc")  # maglev
-    globs = linescans.glob("18-10-06-13-52-16-utc*")  # pato
+    # globs = linescans.glob("18-10-06-13-52-16-utc*")  # pato
     # globs = linescans.glob("2025-11*") # pano
     # globs = linescans.glob("2025-09-13-09-27-13*")  # picadilly
     # globs = linescans.glob("2025-09-13-09-37-17*")  # picadilly
     # globs = linescans.glob("2025-09*")
-    # globs = linescans.glob("*")
+    # globs = linescans.glob("2026-01*")
+    globs = linescans.glob("2026-06-16-02-21-07*")
 
     globs = sorted(list(globs))[::-1]
 
