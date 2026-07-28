@@ -5,6 +5,10 @@
 > and wheel detail. See
 > `2026-07-27-shadow-detail-jitter-protection.md` for the reproduced failure
 > and the scene-aware application limit.
+>
+> **Geometry correction, 2026-07-28.** The raw-geometry isolation described
+> below was incorrect and has been superseded by
+> `2026-07-28-radiometric-first-geometry.md`.
 
 ## 1. Regression report
 
@@ -25,10 +29,10 @@ The structure mask reduced the failure but could not make the operation safe:
 small dark details and low-contrast color edges do not always cross a fixed
 edge threshold.
 
-The MTR geometry regression was separate but related. Feeding radiometrically
-corrected green planes into the subpixel speed and skew estimators allowed an
-incorrect correction to change the fitted geometry. Motion estimation now
-always uses untouched Bayer data.
+The MTR geometry regression was separate but related. At the time, it was
+attributed to allowing a radiometric correction to affect the geometry fit.
+The later capture replay showed the opposite cause: common capture-column
+stripes bias an uncorrected green-plane correlation toward zero displacement.
 
 ## 2. Rejected alternatives
 
@@ -76,8 +80,8 @@ scene.
 
 The low-rank stage leaves some high-rank, pair-specific line jitter. A second
 stage revisits only the 31-column residual after the conservative correction.
-It is enabled when raw motion estimation supplies the displacement between
-green-1 and green-2.
+It is enabled after radiometric-first motion estimation supplies the
+displacement between green-1 and green-2.
 
 For every vertical band:
 
@@ -100,17 +104,15 @@ at a wheel, window, bellows, or clipped-roof boundary: a fine correction from
 an adjacent sensor band cannot leak into a protected band merely because the
 recurrent component is supported there.
 
-## 5. Raw geometry isolation
+## 5. Radiometric-first geometry
 
-Speed correlation and skew estimation now run before and without any jitter
-model. Their raw displacement is used only as evidence for green-edge
-corroboration; stripe correction cannot feed back into the fitted speed. Final
-demosaic sampling applies the radiometric correction after the raw geometry is
-fixed.
-
-This restores the geometry separation that the earlier local implementation
-violated and prevents the visible left/right train-length change from being
-caused by stripe suppression.
+This section's original raw-geometry design has been superseded. Speed now
+uses the motion-independent recurrent radiometric model, and skew uses the same
+model while sampling at the fitted speed positions. Both fits bypass the
+display-only scene-relative shadow cap. The motion-aligned fine residual and
+scene-protection mask remain downstream rendering safeguards and are not fed
+back into geometry. See `2026-07-28-radiometric-first-geometry.md` for the
+capture replay and regression measurements.
 
 ## 6. Focused production replays
 

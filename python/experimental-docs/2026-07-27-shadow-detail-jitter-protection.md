@@ -1,5 +1,9 @@
 # Scene-aware shadow-detail protection — 2026-07-27
 
+> **Geometry correction, 2026-07-28.** Speed and skew no longer use untouched
+> Bayer planes. The motion-independent radiometric model is applied before
+> both fits; see `2026-07-28-radiometric-first-geometry.md`.
+
 ## 1. Remaining failure
 
 The recurrent plus motion-aligned fine jitter model removed most visible
@@ -65,9 +69,9 @@ scene detail over aggressive shadow correction when the two cannot be
 distinguished.
 
 The protection confidence is stored as `float16` alongside the two correction
-components and interpolated over row bands during final sampling. Correction
-estimation itself is unchanged, and speed/skew estimation still uses untouched
-raw Bayer planes.
+components and interpolated over row bands during final sampling. This
+scene-relative application limit is used for rendering only. Geometry sampling
+bypasses it and applies the complete motion-independent radiometric correction.
 
 ## 4. Focused production replays
 

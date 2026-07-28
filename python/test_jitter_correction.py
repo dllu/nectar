@@ -1,6 +1,7 @@
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import numpy as np
 
@@ -324,6 +325,36 @@ class ColumnJitterCorrectionTest(unittest.TestCase):
             block_columns=123,
             **arguments,
         )
+        recurrent_model = preview.column_exposure_jitter_correction(
+            *striped,
+            black_levels=arguments["black_levels"],
+            white_levels=arguments["white_levels"],
+            num_bands=num_bands,
+            fine_temporal_window=arguments["fine_temporal_window"],
+            temporal_window=arguments["temporal_window"],
+            block_columns=123,
+            show_progress=False,
+        )
+        explicitly_refined = preview.refine_column_exposure_jitter_correction(
+            recurrent_model,
+            *striped,
+            arguments["green_displacements"],
+            fine_temporal_window=arguments["fine_temporal_window"],
+            block_columns=123,
+            show_progress=False,
+        )
+        np.testing.assert_array_equal(
+            model.band_corrections,
+            explicitly_refined.band_corrections,
+        )
+        np.testing.assert_array_equal(
+            model.fine_band_corrections,
+            explicitly_refined.fine_band_corrections,
+        )
+        np.testing.assert_array_equal(
+            model.scene_protection,
+            explicitly_refined.scene_protection,
+        )
         corrected = np.stack(
             [
                 model.apply_window(striped[channel], channel, 0)
@@ -545,6 +576,129 @@ class ColumnJitterCorrectionTest(unittest.TestCase):
         self.assertGreater(float(protection[1, 15]), 0.0)
         self.assertLess(float(protection[1, 15]), float(protection[2, 15]))
         self.assertLess(float(protection[0, 0]), 1.0e-5)
+
+    def test_radiometric_model_precedes_speed_correlation(self):
+        rng = np.random.default_rng(7)
+        height = 32
+        width = 512
+        scene = rng.normal(0.0, 1.0, (height, width)).astype(np.float32)
+        for _ in range(4):
+            scene = (
+                np.roll(scene, 1, axis=1)
+                + 2.0 * scene
+                + np.roll(scene, -1, axis=1)
+            ) / 4.0
+        scene = 10000.0 + 1200.0 * scene
+
+        true_displacement = 2
+        green1 = scene.copy()
+        green2 = np.empty_like(scene)
+        green2[:, :true_displacement] = scene[:, :1]
+        green2[:, true_displacement:] = scene[:, :-true_displacement]
+
+        columns = np.arange(width, dtype=np.float32)
+        stripe = (
+            2800.0 * np.sin(2.0 * np.pi * columns / 4.0)
+            + 1800.0 * np.sin(2.0 * np.pi * columns / 11.0)
+        )
+        green1 += stripe
+        green2 += stripe
+
+        corrections = np.zeros((4, 1, width), dtype=np.float16)
+        corrections[preview.JITTER_GREEN1, 0] = -stripe
+        corrections[preview.JITTER_GREEN2, 0] = -stripe
+        model = preview.ColumnJitterModel(
+            corrections,
+            image_height=height,
+            black_levels=np.zeros(4, dtype=np.float32),
+            white_levels=np.full(4, 65535.0, dtype=np.float32),
+            confidence=np.ones(width, dtype=np.float32),
+        )
+
+        with patch.object(
+            preview,
+            "tqdm",
+            lambda iterable, **_kwargs: iterable,
+        ):
+            _, raw_displacements, _ = preview.windowed_cross_correlation(
+                green1,
+                green2,
+                window_step=16,
+                window_size=64,
+                corr_size=9,
+            )
+            _, corrected_displacements, _ = (
+                preview.windowed_cross_correlation(
+                    green1,
+                    green2,
+                    window_step=16,
+                    window_size=64,
+                    corr_size=9,
+                    jitter_models=model,
+                )
+            )
+
+        # The line-wide radiometric stripe is common at zero capture
+        # displacement and overwhelms the raw fit. Applying the model first
+        # recovers the actual two-column scene displacement.
+        self.assertLess(abs(float(np.median(raw_displacements))), 0.1)
+        self.assertAlmostEqual(
+            float(np.median(corrected_displacements)),
+            true_displacement,
+            delta=0.05,
+        )
+
+    def test_geometry_sampling_bypasses_scene_relative_rendering_limit(self):
+        class ArrayView:
+            def __init__(self, values):
+                self.values = values
+                self.height, self.width = values.shape
+
+            def __getitem__(self, key):
+                return self.values[key]
+
+        height = 2
+        width = 5
+        raw = ArrayView(
+            np.full((height, width), 1000.0, dtype=np.float32)
+        )
+        corrections = np.full((4, 1, width), 1000.0, dtype=np.float16)
+        model = preview.ColumnJitterModel(
+            corrections,
+            image_height=height,
+            black_levels=np.zeros(4, dtype=np.float32),
+            white_levels=np.full(4, 65535.0, dtype=np.float32),
+            confidence=np.ones(width, dtype=np.float32),
+        )
+        arguments = dict(
+            red_view=raw,
+            green1=raw,
+            green2=raw,
+            blue_view=raw,
+            sample_positions=np.array([2.0]),
+            widths=np.array([0.75]),
+            jitter_models=model,
+        )
+
+        with patch.object(
+            preview,
+            "tqdm",
+            lambda iterable, **_kwargs: iterable,
+        ):
+            protected = next(
+                preview.sample_motion_corrected_chunks(**arguments)
+            )[1]
+            geometry = next(
+                preview.sample_motion_corrected_chunks(
+                    **arguments,
+                    jitter_protect_scene=False,
+                )
+            )[1]
+
+        # Rendering limits the correction to 5% of the local signal. Geometry
+        # consumes the complete raw-coordinate correction instead.
+        np.testing.assert_allclose(protected, 1050.0)
+        np.testing.assert_allclose(geometry, 2000.0)
 
     def test_speed_fit_rejects_low_confidence_reversal_aliases(self):
         x = np.arange(40, dtype=np.float64)

@@ -444,6 +444,7 @@ def windowed_cross_correlation(
     window_size: int = 4096,
     corr_size: int = 15,
     output_dir: Path = None,
+    jitter_models: ColumnJitterModel | None = None,
 ) -> np.ndarray:
     """
     green_1: (h, w) where w >> h and w >> window_size
@@ -468,11 +469,32 @@ def windowed_cross_correlation(
         enumerate(xs[1:-1]), desc="train speed estimation", total=len(xs)
     ):
         window_1 = green_1[:, x : x + window_step]
+        if jitter_models is not None:
+            # Speed fitting needs the complete recurrent radiometric
+            # correction. The scene-relative rendering limit is deliberately
+            # bypassed here: it protects appearance, while the low-rank model
+            # itself describes the capture-column error that would otherwise
+            # correlate at zero displacement.
+            window_1 = apply_column_models(
+                window_1,
+                jitter_models,
+                x,
+                JITTER_GREEN1,
+                protect_scene=False,
+            )
         window_1 = vertical_energy(window_1)
 
         corrs = np.zeros((corr_size,))
         pad = corr_half
         window_2_base = green_2[:, x - pad : x + window_step + pad]
+        if jitter_models is not None:
+            window_2_base = apply_column_models(
+                window_2_base,
+                jitter_models,
+                x - pad,
+                JITTER_GREEN2,
+                protect_scene=False,
+            )
         window_2_base = vertical_energy(window_2_base)
 
         for corr_ind in range(corr_size):
@@ -1118,6 +1140,8 @@ class ColumnJitterModel:
         channel: int,
         columns: np.ndarray,
         rows: np.ndarray | None = None,
+        *,
+        protect_scene: bool = True,
     ) -> np.ndarray:
         """Correct a 2-D sample array using either 1-D or per-pixel columns."""
         values = np.asarray(values, dtype=np.float32)
@@ -1170,35 +1194,33 @@ class ColumnJitterModel:
         black = float(self.black_levels[channel])
         white = float(self.white_levels[channel])
         span = max(white - black, 1.0)
-        signal = np.maximum(values - black, 0.0)
-        # The model is estimated in full-scale additive units, but that makes
-        # the same legal correction disproportionately large near black. A
-        # 300-DN correction is harmless on a bright body panel and can erase
-        # an entire low-contrast bellows fold in a 2,000-DN shadow. In regions
-        # with corroborated scene structure, limit the combined recurrent and
-        # fine correction relative to the actual black-subtracted sample.
-        # Models without motion-aligned scene evidence use this conservative
-        # limit everywhere. This also keeps exact black a fixed point.
-        relative_limit = JITTER_MAX_RELATIVE_SIGNAL_CORRECTION * signal
-        limited_correction = np.clip(
-            correction,
-            -relative_limit,
-            relative_limit,
-        )
-        if self.scene_protection is not None:
-            # Motion-aligned green edges identify locations where an additive
-            # correction could alter real scene contrast. Flat regions retain
-            # the full correction, which is important for removing stripes
-            # from dark backgrounds surrounding a protected roof or bellows.
-            protection = self._interpolate_scene_protection(
-                column_grid,
-                rows,
+        if protect_scene:
+            signal = np.maximum(values - black, 0.0)
+            # The model is estimated in full-scale additive units, but that
+            # makes the same legal correction disproportionately large near
+            # black. In regions with corroborated scene structure, limit the
+            # combined recurrent and fine correction relative to the actual
+            # black-subtracted sample. Models without motion-aligned scene
+            # evidence use this conservative limit everywhere.
+            relative_limit = JITTER_MAX_RELATIVE_SIGNAL_CORRECTION * signal
+            limited_correction = np.clip(
+                correction,
+                -relative_limit,
+                relative_limit,
             )
-            correction = correction + protection * (
-                limited_correction - correction
-            )
-        else:
-            correction = limited_correction
+            if self.scene_protection is not None:
+                # Motion-aligned green edges identify locations where an
+                # additive correction could alter real scene contrast. Flat
+                # regions retain the full correction.
+                protection = self._interpolate_scene_protection(
+                    column_grid,
+                    rows,
+                )
+                correction = correction + protection * (
+                    limited_correction - correction
+                )
+            else:
+                correction = limited_correction
         highlight_margin = max(
             JITTER_WHITE_MARGIN_MIN,
             JITTER_WHITE_MARGIN_FRACTION * span,
@@ -1213,7 +1235,12 @@ class ColumnJitterModel:
         return values + correction * clip_weight
 
     def apply_window(
-        self, window: np.ndarray, channel: int, start_col: int
+        self,
+        window: np.ndarray,
+        channel: int,
+        start_col: int,
+        *,
+        protect_scene: bool = True,
     ) -> np.ndarray:
         """Apply the model to a contiguous full-height image window."""
         if window.size == 0:
@@ -1233,6 +1260,7 @@ class ColumnJitterModel:
             window[:, local_start:local_stop],
             channel,
             columns,
+            protect_scene=protect_scene,
         )
         return result
 
@@ -1242,10 +1270,17 @@ def apply_column_models(
     models: ColumnJitterModel | None,
     start_col: int,
     channel: int,
+    *,
+    protect_scene: bool = True,
 ) -> np.ndarray:
     if models is None:
         return window
-    return models.apply_window(window, channel, start_col)
+    return models.apply_window(
+        window,
+        channel,
+        start_col,
+        protect_scene=protect_scene,
+    )
 
 
 def _estimate_jitter_levels(channel_views, max_sample_columns: int = 8192):
@@ -1636,6 +1671,344 @@ def _feather_jitter_scene_protection(mask: np.ndarray) -> np.ndarray:
     return np.clip(protection, 0.0, 1.0).astype(np.float16)
 
 
+def refine_column_exposure_jitter_correction(
+    recurrent_model: ColumnJitterModel,
+    red_view,
+    green1,
+    green2,
+    blue_view,
+    green_displacements: np.ndarray,
+    *,
+    fine_temporal_window: int = JITTER_FINE_TEMPORAL_WINDOW,
+    block_columns: int = JITTER_BLOCK_COLUMNS,
+    show_progress: bool = True,
+) -> ColumnJitterModel:
+    """
+    Add the motion-aligned fine residual to an existing recurrent model.
+
+    The recurrent radiometric model is independent of geometry and can
+    therefore correct the two green planes before speed fitting. Once that
+    corrected speed fit supplies their displacement, this function adds the
+    fine residual and scene-protection confidence used by skew fitting and
+    final rendering without re-estimating the recurrent component.
+    """
+    channel_views = (red_view, green1, green2, blue_view)
+    heights = {view.shape[0] for view in channel_views}
+    widths = {view.shape[1] for view in channel_views}
+    if len(heights) != 1 or len(widths) != 1:
+        raise ValueError("all four jitter channels must have the same dimensions")
+    image_height = heights.pop()
+    image_width = widths.pop()
+    if (
+        recurrent_model.image_height != image_height
+        or recurrent_model.width != image_width
+    ):
+        raise ValueError("recurrent jitter model does not match the channel views")
+    if fine_temporal_window < 3 or fine_temporal_window % 2 != 1:
+        raise ValueError(
+            "fine_temporal_window must be an odd integer of at least 3"
+        )
+    if block_columns < 1:
+        raise ValueError("block_columns must be positive")
+
+    green_displacements = np.asarray(
+        green_displacements,
+        dtype=np.float64,
+    )
+    if green_displacements.shape != (image_width,):
+        raise ValueError(
+            "green_displacements must contain one value per image column"
+        )
+    if not np.all(np.isfinite(green_displacements)):
+        raise ValueError("green_displacements must all be finite")
+    if image_width < 4:
+        return recurrent_model
+
+    band_corrections = recurrent_model.band_corrections
+    black_levels = recurrent_model.black_levels
+    white_levels = recurrent_model.white_levels
+    num_bands = recurrent_model.num_bands
+    alignment_margin = (
+        int(math.ceil(float(np.max(np.abs(green_displacements))))) + 2
+    )
+
+    # Estimate robust aligned-green gradient scales using the same raw-plus-
+    # model operation order as the original one-call implementation. Keeping
+    # this pass separate lets the recurrent model feed geometry first without
+    # changing even threshold-adjacent fine-mask decisions during rendering.
+    gradient_sample_count = min(
+        image_width - 2,
+        JITTER_LOW_RANK_MAX_SAMPLE_COLUMNS,
+    )
+    gradient_sample_columns = np.unique(
+        np.linspace(
+            1,
+            image_width - 2,
+            gradient_sample_count,
+            dtype=np.int64,
+        )
+    )
+    raw_green_gradient_samples = np.full(
+        (2, num_bands, gradient_sample_columns.size),
+        np.nan,
+        dtype=np.float32,
+    )
+    gradient_read_radius = alignment_margin + 2
+    green_views = (
+        (JITTER_GREEN1, green1),
+        (JITTER_GREEN2, green2),
+    )
+    for core_start in tqdm(
+        range(0, image_width, block_columns),
+        total=math.ceil(image_width / block_columns),
+        desc="aligned green gradient scale",
+        disable=not show_progress,
+    ):
+        core_stop = min(image_width, core_start + block_columns)
+        sample_start = int(
+            np.searchsorted(
+                gradient_sample_columns,
+                core_start,
+                side="left",
+            )
+        )
+        sample_stop = int(
+            np.searchsorted(
+                gradient_sample_columns,
+                core_stop,
+                side="left",
+            )
+        )
+        if sample_stop <= sample_start:
+            continue
+        read_start = max(0, core_start - gradient_read_radius)
+        read_stop = min(image_width, core_stop + gradient_read_radius)
+        sample_x = gradient_sample_columns[sample_start:sample_stop]
+        for green_index, (channel, view) in enumerate(green_views):
+            statistics, _ = _jitter_band_statistics(
+                view[:, slice(read_start, read_stop)],
+                num_bands,
+                float(black_levels[channel]),
+                float(white_levels[channel]),
+            )
+            sample_positions = sample_x.astype(np.float64)
+            if channel == JITTER_GREEN2:
+                sample_positions += green_displacements[sample_x]
+            sampled_gradient, sampled_valid = _sample_jitter_band_columns(
+                np.gradient(statistics, axis=1),
+                sample_positions,
+                start_column=read_start,
+            )
+            sampled_gradient[:, ~sampled_valid] = np.nan
+            raw_green_gradient_samples[
+                green_index,
+                :,
+                sample_start:sample_stop,
+            ] = sampled_gradient
+
+    sample_x = gradient_sample_columns.astype(np.float64)
+    aligned_sample_x = sample_x + green_displacements[gradient_sample_columns]
+    model_green1_gradient, model_green1_valid = (
+        _sample_centered_jitter_gradient(
+            band_corrections[JITTER_GREEN1],
+            sample_x,
+        )
+    )
+    model_green2_gradient, model_green2_valid = (
+        _sample_centered_jitter_gradient(
+            band_corrections[JITTER_GREEN2],
+            aligned_sample_x,
+        )
+    )
+    corrected_green_gradient_samples = raw_green_gradient_samples.copy()
+    corrected_green_gradient_samples[0] += model_green1_gradient
+    corrected_green_gradient_samples[1] += model_green2_gradient
+    corrected_green_gradient_samples[0, :, ~model_green1_valid] = np.nan
+    corrected_green_gradient_samples[1, :, ~model_green2_valid] = np.nan
+    green_gradient_scales = 1.4826 * bn.nanmedian(
+        np.abs(corrected_green_gradient_samples),
+        axis=2,
+    )
+    green_gradient_scales = np.maximum(
+        green_gradient_scales,
+        JITTER_ALIGNED_MIN_GRADIENT_SCALE,
+    )
+    green_gradient_scales[~np.isfinite(green_gradient_scales)] = np.inf
+
+    # The recurrent model deliberately leaves ambiguous high-rank residuals
+    # alone. Revisit only that narrow temporal band after the corrected speed
+    # fit has aligned the greens well enough to separate scene edges from
+    # capture-column errors.
+    fine_band_corrections = np.zeros_like(band_corrections)
+    scene_protection = np.zeros(
+        (num_bands, image_width),
+        dtype=bool,
+    )
+    fine_radius = fine_temporal_window // 2
+    protection_radius = max(
+        fine_radius,
+        JITTER_SCENE_PROTECTION_DILATE_COLUMNS,
+    )
+    fine_read_radius = protection_radius + alignment_margin
+    for core_start in tqdm(
+        range(0, image_width, block_columns),
+        total=math.ceil(image_width / block_columns),
+        desc="fine residual jitter",
+        disable=not show_progress,
+    ):
+        core_stop = min(image_width, core_start + block_columns)
+        read_start = max(0, core_start - fine_read_radius)
+        read_stop = min(image_width, core_stop + fine_read_radius)
+        core_slice = slice(
+            core_start - read_start,
+            core_stop - read_start,
+        )
+        corrected_statistics = np.empty(
+            (4, num_bands, read_stop - read_start),
+            dtype=np.float32,
+        )
+        band_valid = np.empty_like(
+            corrected_statistics,
+            dtype=bool,
+        )
+        for channel, view in enumerate(channel_views):
+            statistics, valid_statistics = _jitter_band_statistics(
+                view[:, slice(read_start, read_stop)],
+                num_bands,
+                float(black_levels[channel]),
+                float(white_levels[channel]),
+            )
+            corrected_statistics[channel] = (
+                statistics
+                + band_corrections[
+                    channel,
+                    :,
+                    read_start:read_stop,
+                ].astype(np.float32)
+            )
+            band_valid[channel] = valid_statistics
+
+        fine_target = _centered_moving_median(
+            corrected_statistics,
+            fine_temporal_window,
+        )
+        fine_offsets = (
+            fine_target - corrected_statistics
+        )[:, :, core_slice]
+
+        # Compute scene-edge support on an expanded interval so horizontal
+        # dilation is identical on either side of a processing boundary.
+        mask_start = max(0, core_start - protection_radius)
+        mask_stop = min(image_width, core_stop + protection_radius)
+        mask_columns = np.arange(
+            mask_start,
+            mask_stop,
+            dtype=np.int64,
+        )
+        green1_gradient = np.gradient(
+            corrected_statistics[JITTER_GREEN1],
+            axis=1,
+        )
+        green2_gradient = np.gradient(
+            corrected_statistics[JITTER_GREEN2],
+            axis=1,
+        )
+        sampled_green1, green1_valid = _sample_jitter_band_columns(
+            green1_gradient,
+            mask_columns,
+            start_column=read_start,
+        )
+        aligned_columns = (
+            mask_columns.astype(np.float64)
+            + green_displacements[mask_columns]
+        )
+        sampled_green2, green2_valid = _sample_jitter_band_columns(
+            green2_gradient,
+            aligned_columns,
+            start_column=read_start,
+        )
+        aligned_valid = green1_valid & green2_valid
+        edge_score = np.sign(sampled_green1 * sampled_green2) * np.minimum(
+            np.abs(sampled_green1) / green_gradient_scales[0, :, None],
+            np.abs(sampled_green2) / green_gradient_scales[1, :, None],
+        )
+        weak_edges = _dilate_jitter_edges(
+            edge_score >= JITTER_ALIGNED_EDGE_THRESHOLD,
+            JITTER_ALIGNED_EDGE_DILATE_COLUMNS,
+        )
+        strong_edge_seed = (
+            edge_score >= JITTER_ALIGNED_STRONG_EDGE_THRESHOLD
+        )
+        strong_edges = _dilate_jitter_edges(
+            strong_edge_seed,
+            fine_radius,
+        )
+        protected_scene = _dilate_jitter_edges(
+            strong_edge_seed,
+            JITTER_SCENE_PROTECTION_DILATE_COLUMNS,
+        )
+        structured = weak_edges | strong_edges
+        structured[:, ~aligned_valid] = True
+        mask_core_slice = slice(
+            core_start - mask_start,
+            core_stop - mask_start,
+        )
+        structured = structured[:, mask_core_slice]
+        scene_protection[:, core_start:core_stop] = protected_scene[
+            :,
+            mask_core_slice,
+        ]
+
+        normalized_magnitude = np.abs(fine_offsets) / (
+            white_levels - black_levels
+        )[:, None, None]
+        peak_magnitude = np.max(normalized_magnitude, axis=0)
+        channel_threshold = np.maximum(
+            JITTER_RESIDUAL_MIN_CHANNEL_FRACTION,
+            (
+                JITTER_RESIDUAL_MIN_RELATIVE_CHANNEL_POWER
+                * peak_magnitude
+            ),
+        )
+        participating_channels = np.sum(
+            normalized_magnitude >= channel_threshold[None, :, :],
+            axis=0,
+        )
+        residual_event = participating_channels >= 2
+        supported = (
+            band_valid[:, :, core_slice]
+            & ~structured[None, :, :]
+            & residual_event[None, :, :]
+        )
+        maximum = (
+            JITTER_RESIDUAL_MAX_CORRECTION_FRACTION
+            * (white_levels - black_levels)[:, None, None]
+        )
+        residual_correction = np.clip(
+            fine_offsets,
+            -maximum,
+            maximum,
+        )
+        fine_band_corrections[:, :, core_start:core_stop] = np.where(
+            supported,
+            residual_correction,
+            0.0,
+        ).astype(np.float16)
+
+    scene_protection = _feather_jitter_scene_protection(
+        scene_protection
+    )
+    return ColumnJitterModel(
+        band_corrections,
+        image_height,
+        black_levels,
+        white_levels,
+        recurrent_model.confidence,
+        fine_band_corrections=fine_band_corrections,
+        scene_protection=scene_protection,
+    )
+
+
 def column_exposure_jitter_correction(
     red_view,
     green1,
@@ -1746,33 +2119,7 @@ def column_exposure_jitter_correction(
         (4, num_bands, image_width),
         dtype=np.float16,
     )
-    gradient_sample_columns = None
-    raw_green_gradient_samples = None
-    if green_displacements is not None and image_width >= 4:
-        gradient_sample_count = min(
-            image_width - 2,
-            JITTER_LOW_RANK_MAX_SAMPLE_COLUMNS,
-        )
-        gradient_sample_columns = np.unique(
-            np.linspace(
-                1,
-                image_width - 2,
-                gradient_sample_count,
-                dtype=np.int64,
-            )
-        )
-        raw_green_gradient_samples = np.full(
-            (2, num_bands, gradient_sample_columns.size),
-            np.nan,
-            dtype=np.float32,
-        )
-
-    alignment_margin = (
-        int(math.ceil(float(np.max(np.abs(green_displacements))))) + 2
-        if green_displacements is not None
-        else 0
-    )
-    radius = max(temporal_window // 2, alignment_margin)
+    radius = temporal_window // 2
     block_starts = range(0, image_width, block_columns)
 
     for core_start in tqdm(
@@ -1798,48 +2145,6 @@ def column_exposure_jitter_correction(
                 float(black_levels[channel]),
                 float(white_levels[channel]),
             )
-            if (
-                raw_green_gradient_samples is not None
-                and channel in (JITTER_GREEN1, JITTER_GREEN2)
-            ):
-                sample_start = int(
-                    np.searchsorted(
-                        gradient_sample_columns,
-                        core_start,
-                        side="left",
-                    )
-                )
-                sample_stop = int(
-                    np.searchsorted(
-                        gradient_sample_columns,
-                        core_stop,
-                        side="left",
-                    )
-                )
-                if sample_stop > sample_start:
-                    sample_x = gradient_sample_columns[
-                        sample_start:sample_stop
-                    ]
-                    sample_positions = sample_x.astype(np.float64)
-                    if channel == JITTER_GREEN2:
-                        sample_positions += green_displacements[sample_x]
-                    statistics_gradient = np.gradient(
-                        statistics,
-                        axis=1,
-                    )
-                    sampled_gradient, sampled_valid = (
-                        _sample_jitter_band_columns(
-                            statistics_gradient,
-                            sample_positions,
-                            start_column=read_start,
-                        )
-                    )
-                    sampled_gradient[:, ~sampled_valid] = np.nan
-                    raw_green_gradient_samples[
-                        channel - JITTER_GREEN1,
-                        :,
-                        sample_start:sample_stop,
-                    ] = sampled_gradient
             fine_target = _centered_moving_median(
                 statistics,
                 fine_temporal_window,
@@ -1956,215 +2261,25 @@ def column_exposure_jitter_correction(
             0.0,
         )
 
-    fine_band_corrections = None
-    scene_protection = None
-    if raw_green_gradient_samples is not None:
-        sample_x = gradient_sample_columns.astype(np.float64)
-        aligned_sample_x = (
-            sample_x
-            + green_displacements[gradient_sample_columns]
-        )
-        model_green1_gradient, model_green1_valid = (
-            _sample_centered_jitter_gradient(
-                band_corrections[JITTER_GREEN1],
-                sample_x,
-            )
-        )
-        model_green2_gradient, model_green2_valid = (
-            _sample_centered_jitter_gradient(
-                band_corrections[JITTER_GREEN2],
-                aligned_sample_x,
-            )
-        )
-        corrected_green_gradient_samples = (
-            raw_green_gradient_samples.copy()
-        )
-        corrected_green_gradient_samples[0] += model_green1_gradient
-        corrected_green_gradient_samples[1] += model_green2_gradient
-        corrected_green_gradient_samples[0, :, ~model_green1_valid] = np.nan
-        corrected_green_gradient_samples[1, :, ~model_green2_valid] = np.nan
-        green_gradient_scales = 1.4826 * bn.nanmedian(
-            np.abs(corrected_green_gradient_samples),
-            axis=2,
-        )
-        green_gradient_scales = np.maximum(
-            green_gradient_scales,
-            JITTER_ALIGNED_MIN_GRADIENT_SCALE,
-        )
-        green_gradient_scales[~np.isfinite(green_gradient_scales)] = np.inf
-
-        # The recurrent model deliberately leaves ambiguous high-rank
-        # residuals alone. Revisit only that narrow temporal band after the
-        # motion-aligned greens can identify which changes belong to the
-        # scene. This is a separate correction component so its support mask
-        # survives vertical interpolation.
-        fine_band_corrections = np.zeros_like(band_corrections)
-        scene_protection = np.zeros(
-            (num_bands, image_width),
-            dtype=bool,
-        )
-        fine_radius = fine_temporal_window // 2
-        protection_radius = max(
-            fine_radius,
-            JITTER_SCENE_PROTECTION_DILATE_COLUMNS,
-        )
-        fine_read_radius = protection_radius + alignment_margin
-        for core_start in tqdm(
-            range(0, image_width, block_columns),
-            total=math.ceil(image_width / block_columns),
-            desc="fine residual jitter",
-            disable=not show_progress,
-        ):
-            core_stop = min(image_width, core_start + block_columns)
-            read_start = max(0, core_start - fine_read_radius)
-            read_stop = min(image_width, core_stop + fine_read_radius)
-            core_slice = slice(
-                core_start - read_start,
-                core_stop - read_start,
-            )
-            corrected_statistics = np.empty(
-                (4, num_bands, read_stop - read_start),
-                dtype=np.float32,
-            )
-            band_valid = np.empty_like(
-                corrected_statistics,
-                dtype=bool,
-            )
-            for channel, view in enumerate(channel_views):
-                statistics, valid_statistics = _jitter_band_statistics(
-                    view[:, slice(read_start, read_stop)],
-                    num_bands,
-                    float(black_levels[channel]),
-                    float(white_levels[channel]),
-                )
-                corrected_statistics[channel] = (
-                    statistics
-                    + band_corrections[
-                        channel,
-                        :,
-                        read_start:read_stop,
-                    ].astype(np.float32)
-                )
-                band_valid[channel] = valid_statistics
-
-            fine_target = _centered_moving_median(
-                corrected_statistics,
-                fine_temporal_window,
-            )
-            fine_offsets = (
-                fine_target - corrected_statistics
-            )[:, :, core_slice]
-
-            # Compute scene-edge support on an expanded interval so horizontal
-            # dilation is identical on either side of a processing boundary.
-            mask_start = max(0, core_start - protection_radius)
-            mask_stop = min(image_width, core_stop + protection_radius)
-            mask_columns = np.arange(
-                mask_start,
-                mask_stop,
-                dtype=np.int64,
-            )
-            green1_gradient = np.gradient(
-                corrected_statistics[JITTER_GREEN1],
-                axis=1,
-            )
-            green2_gradient = np.gradient(
-                corrected_statistics[JITTER_GREEN2],
-                axis=1,
-            )
-            sampled_green1, green1_valid = _sample_jitter_band_columns(
-                green1_gradient,
-                mask_columns,
-                start_column=read_start,
-            )
-            aligned_columns = (
-                mask_columns.astype(np.float64)
-                + green_displacements[mask_columns]
-            )
-            sampled_green2, green2_valid = _sample_jitter_band_columns(
-                green2_gradient,
-                aligned_columns,
-                start_column=read_start,
-            )
-            aligned_valid = green1_valid & green2_valid
-            edge_score = np.sign(sampled_green1 * sampled_green2) * np.minimum(
-                np.abs(sampled_green1) / green_gradient_scales[0, :, None],
-                np.abs(sampled_green2) / green_gradient_scales[1, :, None],
-            )
-            weak_edges = _dilate_jitter_edges(
-                edge_score >= JITTER_ALIGNED_EDGE_THRESHOLD,
-                JITTER_ALIGNED_EDGE_DILATE_COLUMNS,
-            )
-            strong_edge_seed = (
-                edge_score >= JITTER_ALIGNED_STRONG_EDGE_THRESHOLD
-            )
-            strong_edges = _dilate_jitter_edges(
-                strong_edge_seed,
-                fine_radius,
-            )
-            protected_scene = _dilate_jitter_edges(
-                strong_edge_seed,
-                JITTER_SCENE_PROTECTION_DILATE_COLUMNS,
-            )
-            structured = weak_edges | strong_edges
-            structured[:, ~aligned_valid] = True
-            mask_core_slice = slice(
-                core_start - mask_start,
-                core_stop - mask_start,
-            )
-            structured = structured[:, mask_core_slice]
-            scene_protection[:, core_start:core_stop] = protected_scene[
-                :,
-                mask_core_slice,
-            ]
-
-            normalized_magnitude = np.abs(fine_offsets) / (
-                white_levels - black_levels
-            )[:, None, None]
-            peak_magnitude = np.max(normalized_magnitude, axis=0)
-            channel_threshold = np.maximum(
-                JITTER_RESIDUAL_MIN_CHANNEL_FRACTION,
-                (
-                    JITTER_RESIDUAL_MIN_RELATIVE_CHANNEL_POWER
-                    * peak_magnitude
-                ),
-            )
-            participating_channels = np.sum(
-                normalized_magnitude >= channel_threshold[None, :, :],
-                axis=0,
-            )
-            residual_event = participating_channels >= 2
-            supported = (
-                band_valid[:, :, core_slice]
-                & ~structured[None, :, :]
-                & residual_event[None, :, :]
-            )
-            maximum = (
-                JITTER_RESIDUAL_MAX_CORRECTION_FRACTION
-                * (white_levels - black_levels)[:, None, None]
-            )
-            residual_correction = np.clip(
-                fine_offsets,
-                -maximum,
-                maximum,
-            )
-            fine_band_corrections[:, :, core_start:core_stop] = np.where(
-                supported,
-                residual_correction,
-                0.0,
-            ).astype(np.float16)
-        scene_protection = _feather_jitter_scene_protection(
-            scene_protection
-        )
-
-    return ColumnJitterModel(
+    recurrent_model = ColumnJitterModel(
         band_corrections,
         image_height,
         black_levels,
         white_levels,
         confidence_full,
-        fine_band_corrections=fine_band_corrections,
-        scene_protection=scene_protection,
+    )
+    if green_displacements is None:
+        return recurrent_model
+    return refine_column_exposure_jitter_correction(
+        recurrent_model,
+        red_view,
+        green1,
+        green2,
+        blue_view,
+        green_displacements,
+        fine_temporal_window=fine_temporal_window,
+        block_columns=block_columns,
+        show_progress=show_progress,
     )
 
 
@@ -2264,6 +2379,7 @@ def sample_motion_corrected_chunks(
     skew: float = 0.0,
     max_pix: int = 16384,
     jitter_models=None,
+    jitter_protect_scene: bool = True,
     step_scales=None,
 ):
     indices = list(range(0, len(sample_positions), stride_x))
@@ -2331,24 +2447,28 @@ def sample_motion_corrected_chunks(
                     JITTER_RED,
                     indices_clipped,
                     sample_rows,
+                    protect_scene=jitter_protect_scene,
                 )
                 g1_vals = jitter_models.correct_samples(
                     g1_vals,
                     JITTER_GREEN1,
                     indices_clipped,
                     sample_rows,
+                    protect_scene=jitter_protect_scene,
                 )
                 g2_vals = jitter_models.correct_samples(
                     g2_vals,
                     JITTER_GREEN2,
                     indices_clipped,
                     sample_rows,
+                    protect_scene=jitter_protect_scene,
                 )
                 b_vals = jitter_models.correct_samples(
                     b_vals,
                     JITTER_BLUE,
                     indices_clipped,
                     sample_rows,
+                    protect_scene=jitter_protect_scene,
                 )
 
             dist = window_indices.astype(np.float32) - centers[:, None].astype(
@@ -2686,11 +2806,29 @@ def process_preview(
         preview = cv2.addWeighted(base, 0.9, mask_overlay, 0.1, 0.0)
         cv2.imwrite(str(g / "structure_mask_preview.png"), preview)
 
-    # Geometry is estimated from untouched Bayer planes. Besides preventing a
-    # radiometric model from stretching the train, this displacement lets the
-    # two green sensor columns corroborate real scene edges before the narrow
-    # residual correction is allowed to run.
-    sample_xs, sample_ys, _weights = windowed_cross_correlation(green1, green2)
+    # Radiometric correction is a property of the raw capture coordinates and
+    # must precede geometry estimation. In particular, a line-wide exposure
+    # stripe appears at zero displacement in both greens and can otherwise
+    # overwhelm the scene displacement that encodes speed.
+    jitter_models = None
+    if ENABLE_COLUMN_JITTER_CORRECTION:
+        jitter_models = column_exposure_jitter_correction(
+            red_view,
+            green1,
+            green2,
+            blue_view,
+            g=g,
+            black_levels=jitter_black_levels,
+            white_levels=jitter_white_levels,
+            structure_mask=mask_full,
+            structure_mask_scale=STRUCTURE_MASK_DOWNSAMPLE,
+        )
+
+    sample_xs, sample_ys, _weights = windowed_cross_correlation(
+        green1,
+        green2,
+        jitter_models=jitter_models,
+    )
     spline = robust_bspline_fit(
         x=sample_xs,
         y=sample_ys,
@@ -2707,19 +2845,54 @@ def process_preview(
         right=sample_ys[-1],
     )
 
-    jitter_models = None
-    if ENABLE_COLUMN_JITTER_CORRECTION:
-        jitter_models = column_exposure_jitter_correction(
+    print(g, len(bins), data.shape)
+
+    sample_positions, widths, step_scales = generate_sample_positions(
+        spline, sample_xs, green1.width
+    )
+    step_scales = np.asarray(step_scales, dtype=np.float32)
+    # chunk size for sampling
+    skew_chunk_size = 4096
+    hough_stride = 3
+
+    skew = estimate_skew_hough(
+        sample_motion_corrected_chunks(
             red_view,
             green1,
             green2,
             blue_view,
-            g=g,
-            black_levels=jitter_black_levels,
-            white_levels=jitter_white_levels,
-            structure_mask=mask_full,
-            structure_mask_scale=STRUCTURE_MASK_DOWNSAMPLE,
-            green_displacements=green_displacements,
+            sample_positions,
+            widths,
+            stride_x=hough_stride,
+            stride_y=hough_stride,
+            skew=0.0,
+            max_pix=skew_chunk_size,
+            jitter_models=jitter_models,
+            # Scene-relative limiting protects rendered shadow detail but is
+            # not part of the raw-coordinate radiometric model. Geometry must
+            # see the complete correction, just as the speed fit does.
+            jitter_protect_scene=False,
+            step_scales=step_scales,
+        ),
+        g=g,
+        stride_x=hough_stride,
+        stride_y=hough_stride,
+    )
+
+    print("estimated skew", skew)
+
+    # Geometry is now final. The optional motion-aligned residual and
+    # scene-protection mask are rendering safeguards, not inputs to either
+    # geometry fit; keeping them separate preserves the acyclic raw
+    # radiometry -> speed -> skew dependency.
+    if jitter_models is not None:
+        jitter_models = refine_column_exposure_jitter_correction(
+            jitter_models,
+            red_view,
+            green1,
+            green2,
+            blue_view,
+            green_displacements,
         )
     if ENABLE_JITTER_DEBUG_PLOT and jitter_models is not None:
         row_idx = min(JITTER_DEBUG_ROW, green1.height - 1)
@@ -2780,40 +2953,6 @@ def process_preview(
         fig.tight_layout()
         fig.savefig(g / "jitter_row_debug.png")
         plt.close(fig)
-
-    print(g, len(bins), data.shape)
-
-    sample_positions, widths, step_scales = generate_sample_positions(
-        spline, sample_xs, green1.width
-    )
-    step_scales = np.asarray(step_scales, dtype=np.float32)
-    # chunk size for sampling
-    skew_chunk_size = 4096
-    hough_stride = 3
-
-    skew = estimate_skew_hough(
-        sample_motion_corrected_chunks(
-            red_view,
-            green1,
-            green2,
-            blue_view,
-            sample_positions,
-            widths,
-            stride_x=hough_stride,
-            stride_y=hough_stride,
-            skew=0.0,
-            max_pix=skew_chunk_size,
-            # Keep the skew fit independent of an optional radiometric
-            # correction for the same reason as the speed fit above.
-            jitter_models=None,
-            step_scales=step_scales,
-        ),
-        g=g,
-        stride_x=hough_stride,
-        stride_y=hough_stride,
-    )
-
-    print("estimated skew", skew)
 
     out_height = green1.height * 2
     center_y = (out_height - 1) / 2.0
