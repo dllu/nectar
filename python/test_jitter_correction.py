@@ -277,6 +277,8 @@ class ColumnJitterCorrectionTest(unittest.TestCase):
             [model.apply_window(scene[channel], channel, 0) for channel in range(4)]
         )
         np.testing.assert_array_equal(corrected, scene)
+        self.assertIsNotNone(model.scene_protection)
+        self.assertTrue(np.all(model.scene_protection[:, 220:229]))
 
     def test_motion_aligned_residual_reduces_high_rank_sensor_noise(self):
         num_bands = 32
@@ -359,6 +361,10 @@ class ColumnJitterCorrectionTest(unittest.TestCase):
         np.testing.assert_array_equal(
             model.fine_band_corrections,
             single_block.fine_band_corrections,
+        )
+        np.testing.assert_array_equal(
+            model.scene_protection,
+            single_block.scene_protection,
         )
 
     def test_repeated_single_channel_detail_cannot_become_a_color_mode(self):
@@ -457,6 +463,88 @@ class ColumnJitterCorrectionTest(unittest.TestCase):
             rtol=0.0,
             atol=0.0,
         )
+
+    def test_dark_samples_limit_combined_correction_relative_to_signal(self):
+        recurrent = np.zeros((4, 1, 5), dtype=np.float16)
+        residual = np.zeros_like(recurrent)
+        recurrent[preview.JITTER_GREEN1, 0] = np.array(
+            [400.0, 400.0, 400.0, -400.0, -400.0],
+            dtype=np.float16,
+        )
+        residual[preview.JITTER_GREEN1, 0] = recurrent[
+            preview.JITTER_GREEN1,
+            0,
+        ]
+        model = preview.ColumnJitterModel(
+            recurrent,
+            image_height=1,
+            black_levels=np.full(4, 1000.0, dtype=np.float32),
+            white_levels=np.full(4, 65000.0, dtype=np.float32),
+            confidence=np.ones(5, dtype=np.float32),
+            fine_band_corrections=residual,
+            scene_protection=np.ones((1, 5), dtype=bool),
+        )
+        values = np.array(
+            [[900.0, 1000.0, 2000.0, 20000.0, 2000.0]],
+            dtype=np.float32,
+        )
+        corrected = model.correct_samples(
+            values,
+            preview.JITTER_GREEN1,
+            np.arange(5, dtype=np.int32),
+        )
+
+        # Values at or below black stay fixed. The +/-800-DN combined model is
+        # limited to 5% of the dark samples' 1,000-DN black-subtracted signal,
+        # while the same correction remains legal on the bright sample.
+        np.testing.assert_array_equal(
+            corrected,
+            np.array(
+                [[900.0, 1000.0, 2050.0, 19200.0, 1950.0]],
+                dtype=np.float32,
+            ),
+        )
+
+    def test_flat_dark_samples_keep_full_correction_with_aligned_evidence(self):
+        recurrent = np.zeros((4, 1, 1), dtype=np.float16)
+        residual = np.zeros_like(recurrent)
+        recurrent[preview.JITTER_GREEN1, 0, 0] = 400.0
+        residual[preview.JITTER_GREEN1, 0, 0] = 400.0
+        model = preview.ColumnJitterModel(
+            recurrent,
+            image_height=1,
+            black_levels=np.full(4, 1000.0, dtype=np.float32),
+            white_levels=np.full(4, 65000.0, dtype=np.float32),
+            confidence=np.ones(1, dtype=np.float32),
+            fine_band_corrections=residual,
+            scene_protection=np.zeros((1, 1), dtype=bool),
+        )
+        corrected = model.correct_samples(
+            np.array([[2000.0]], dtype=np.float32),
+            preview.JITTER_GREEN1,
+            np.zeros(1, dtype=np.int32),
+        )
+
+        # A flat shadow is allowed to use the complete sensor correction. The
+        # relative limit is reserved for motion-corroborated scene detail.
+        np.testing.assert_array_equal(
+            corrected,
+            np.array([[2800.0]], dtype=np.float32),
+        )
+
+    def test_scene_protection_is_feathered_across_columns_and_bands(self):
+        mask = np.zeros((5, 31), dtype=bool)
+        mask[2, 12:19] = True
+
+        protection_half = preview._feather_jitter_scene_protection(mask)
+        protection = protection_half.astype(np.float32)
+
+        self.assertEqual(protection_half.dtype, np.float16)
+        self.assertGreater(float(protection[2, 11]), 0.0)
+        self.assertLess(float(protection[2, 11]), 1.0)
+        self.assertGreater(float(protection[1, 15]), 0.0)
+        self.assertLess(float(protection[1, 15]), float(protection[2, 15]))
+        self.assertLess(float(protection[0, 0]), 1.0e-5)
 
     def test_speed_fit_rejects_low_confidence_reversal_aliases(self):
         x = np.arange(40, dtype=np.float64)

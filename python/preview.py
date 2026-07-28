@@ -68,10 +68,14 @@ JITTER_LOW_RANK_MIN_ROBUST_SCALE = 1.0e-5
 JITTER_RESIDUAL_MAX_CORRECTION_FRACTION = 0.006
 JITTER_RESIDUAL_MIN_CHANNEL_FRACTION = 0.0001
 JITTER_RESIDUAL_MIN_RELATIVE_CHANNEL_POWER = 0.10
+JITTER_MAX_RELATIVE_SIGNAL_CORRECTION = 0.05
 JITTER_ALIGNED_EDGE_THRESHOLD = 0.70
 JITTER_ALIGNED_STRONG_EDGE_THRESHOLD = 3.0
 JITTER_ALIGNED_EDGE_DILATE_COLUMNS = 1
 JITTER_ALIGNED_MIN_GRADIENT_SCALE = 5.0
+JITTER_SCENE_PROTECTION_DILATE_COLUMNS = 256
+JITTER_SCENE_PROTECTION_FEATHER_COLUMNS = 3.0
+JITTER_SCENE_PROTECTION_FEATHER_BANDS = 0.75
 SPEED_MAX_FIT_DYNAMIC_RANGE = 1.5
 JITTER_RED = 0
 JITTER_GREEN1 = 1
@@ -984,6 +988,7 @@ class ColumnJitterModel:
         white_levels: np.ndarray,
         confidence: np.ndarray,
         fine_band_corrections: np.ndarray | None = None,
+        scene_protection: np.ndarray | None = None,
     ):
         corrections = np.asarray(band_corrections)
         if corrections.ndim != 3 or corrections.shape[0] != 4:
@@ -1006,6 +1011,27 @@ class ColumnJitterModel:
                     "fine_band_corrections must match band_corrections"
                 )
             self.fine_band_corrections = fine
+        if scene_protection is None:
+            self.scene_protection = None
+        else:
+            protection = np.asarray(scene_protection)
+            if protection.shape != corrections.shape[1:]:
+                raise ValueError(
+                    "scene_protection must have shape (bands, columns)"
+                )
+            if protection.dtype == np.bool_:
+                protection = protection.astype(np.float32)
+            else:
+                protection = protection.astype(np.float32, copy=False)
+                if (
+                    not np.all(np.isfinite(protection))
+                    or np.any(protection < 0.0)
+                    or np.any(protection > 1.0)
+                ):
+                    raise ValueError(
+                        "scene_protection values must be between 0 and 1"
+                    )
+            self.scene_protection = protection.astype(np.float16)
         if self.black_levels.shape != (4,) or self.white_levels.shape != (4,):
             raise ValueError("black_levels and white_levels must each contain 4 values")
         if self.confidence.shape != (self.width,):
@@ -1067,6 +1093,25 @@ class ColumnJitterModel:
         ]
         return np.where(correction_owner != 0.0, correction, 0.0)
 
+    def _interpolate_scene_protection(
+        self,
+        column_grid: np.ndarray,
+        rows: np.ndarray,
+    ) -> np.ndarray:
+        """Interpolate feathered scene confidence between sensor-row bands."""
+        lower = self._row_band_lower[rows]
+        upper = self._row_band_upper[rows]
+        weight = self._row_band_weight[rows, None]
+        protection_low = self.scene_protection[
+            lower[:, None],
+            column_grid,
+        ].astype(np.float32)
+        protection_high = self.scene_protection[
+            upper[:, None],
+            column_grid,
+        ].astype(np.float32)
+        return protection_low + (protection_high - protection_low) * weight
+
     def correct_samples(
         self,
         values: np.ndarray,
@@ -1125,6 +1170,35 @@ class ColumnJitterModel:
         black = float(self.black_levels[channel])
         white = float(self.white_levels[channel])
         span = max(white - black, 1.0)
+        signal = np.maximum(values - black, 0.0)
+        # The model is estimated in full-scale additive units, but that makes
+        # the same legal correction disproportionately large near black. A
+        # 300-DN correction is harmless on a bright body panel and can erase
+        # an entire low-contrast bellows fold in a 2,000-DN shadow. In regions
+        # with corroborated scene structure, limit the combined recurrent and
+        # fine correction relative to the actual black-subtracted sample.
+        # Models without motion-aligned scene evidence use this conservative
+        # limit everywhere. This also keeps exact black a fixed point.
+        relative_limit = JITTER_MAX_RELATIVE_SIGNAL_CORRECTION * signal
+        limited_correction = np.clip(
+            correction,
+            -relative_limit,
+            relative_limit,
+        )
+        if self.scene_protection is not None:
+            # Motion-aligned green edges identify locations where an additive
+            # correction could alter real scene contrast. Flat regions retain
+            # the full correction, which is important for removing stripes
+            # from dark backgrounds surrounding a protected roof or bellows.
+            protection = self._interpolate_scene_protection(
+                column_grid,
+                rows,
+            )
+            correction = correction + protection * (
+                limited_correction - correction
+            )
+        else:
+            correction = limited_correction
         highlight_margin = max(
             JITTER_WHITE_MARGIN_MIN,
             JITTER_WHITE_MARGIN_FRACTION * span,
@@ -1547,6 +1621,21 @@ def _dilate_jitter_edges(mask: np.ndarray, radius: int) -> np.ndarray:
     return cv2.dilate(mask.astype(np.uint8), kernel) != 0
 
 
+def _feather_jitter_scene_protection(mask: np.ndarray) -> np.ndarray:
+    """Turn strong aligned edges into a smooth correction-limit confidence."""
+    mask = np.asarray(mask, dtype=bool)
+    if mask.size == 0:
+        return mask.astype(np.float16)
+    protection = cv2.GaussianBlur(
+        mask.astype(np.float32),
+        (0, 0),
+        sigmaX=JITTER_SCENE_PROTECTION_FEATHER_COLUMNS,
+        sigmaY=JITTER_SCENE_PROTECTION_FEATHER_BANDS,
+        borderType=cv2.BORDER_REPLICATE,
+    )
+    return np.clip(protection, 0.0, 1.0).astype(np.float16)
+
+
 def column_exposure_jitter_correction(
     red_view,
     green1,
@@ -1591,7 +1680,10 @@ def column_exposure_jitter_correction(
     neighborhood, and an event must appear in at least two Bayer channels.
     This prevents a wheel, bellows pleat, grill, or one-channel color feature
     from being replaced by a locally smoothed estimate. The recurrent and fine
-    components retain separate support masks during row interpolation.
+    components retain separate support masks during row interpolation. The
+    same aligned scene evidence limits the recurrent additive correction
+    relative to local shadow signal, while flat regions still receive the full
+    correction.
     """
     del g  # Retained in the signature for callers that group outputs by capture.
     channel_views = (red_view, green1, green2, blue_view)
@@ -1865,6 +1957,7 @@ def column_exposure_jitter_correction(
         )
 
     fine_band_corrections = None
+    scene_protection = None
     if raw_green_gradient_samples is not None:
         sample_x = gradient_sample_columns.astype(np.float64)
         aligned_sample_x = (
@@ -1906,8 +1999,16 @@ def column_exposure_jitter_correction(
         # scene. This is a separate correction component so its support mask
         # survives vertical interpolation.
         fine_band_corrections = np.zeros_like(band_corrections)
+        scene_protection = np.zeros(
+            (num_bands, image_width),
+            dtype=bool,
+        )
         fine_radius = fine_temporal_window // 2
-        fine_read_radius = fine_radius + alignment_margin
+        protection_radius = max(
+            fine_radius,
+            JITTER_SCENE_PROTECTION_DILATE_COLUMNS,
+        )
+        fine_read_radius = protection_radius + alignment_margin
         for core_start in tqdm(
             range(0, image_width, block_columns),
             total=math.ceil(image_width / block_columns),
@@ -1956,8 +2057,8 @@ def column_exposure_jitter_correction(
 
             # Compute scene-edge support on an expanded interval so horizontal
             # dilation is identical on either side of a processing boundary.
-            mask_start = max(0, core_start - fine_radius)
-            mask_stop = min(image_width, core_stop + fine_radius)
+            mask_start = max(0, core_start - protection_radius)
+            mask_stop = min(image_width, core_stop + protection_radius)
             mask_columns = np.arange(
                 mask_start,
                 mask_stop,
@@ -1994,9 +2095,16 @@ def column_exposure_jitter_correction(
                 edge_score >= JITTER_ALIGNED_EDGE_THRESHOLD,
                 JITTER_ALIGNED_EDGE_DILATE_COLUMNS,
             )
+            strong_edge_seed = (
+                edge_score >= JITTER_ALIGNED_STRONG_EDGE_THRESHOLD
+            )
             strong_edges = _dilate_jitter_edges(
-                edge_score >= JITTER_ALIGNED_STRONG_EDGE_THRESHOLD,
+                strong_edge_seed,
                 fine_radius,
+            )
+            protected_scene = _dilate_jitter_edges(
+                strong_edge_seed,
+                JITTER_SCENE_PROTECTION_DILATE_COLUMNS,
             )
             structured = weak_edges | strong_edges
             structured[:, ~aligned_valid] = True
@@ -2005,6 +2113,10 @@ def column_exposure_jitter_correction(
                 core_stop - mask_start,
             )
             structured = structured[:, mask_core_slice]
+            scene_protection[:, core_start:core_stop] = protected_scene[
+                :,
+                mask_core_slice,
+            ]
 
             normalized_magnitude = np.abs(fine_offsets) / (
                 white_levels - black_levels
@@ -2041,6 +2153,9 @@ def column_exposure_jitter_correction(
                 residual_correction,
                 0.0,
             ).astype(np.float16)
+        scene_protection = _feather_jitter_scene_protection(
+            scene_protection
+        )
 
     return ColumnJitterModel(
         band_corrections,
@@ -2049,6 +2164,7 @@ def column_exposure_jitter_correction(
         white_levels,
         confidence_full,
         fine_band_corrections=fine_band_corrections,
+        scene_protection=scene_protection,
     )
 
 

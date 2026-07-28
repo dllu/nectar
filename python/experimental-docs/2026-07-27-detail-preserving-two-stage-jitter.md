@@ -1,5 +1,11 @@
 # Detail-preserving two-stage jitter correction — 2026-07-27
 
+> **Updated later on 2026-07-27.** The two-stage estimator remains in use, but
+> its unrestricted additive application still flattened low-signal bellows
+> and wheel detail. See
+> `2026-07-27-shadow-detail-jitter-protection.md` for the reproduced failure
+> and the scene-aware application limit.
+
 ## 1. Regression report
 
 The local multiscale estimator documented as final in
