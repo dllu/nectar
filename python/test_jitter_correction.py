@@ -19,9 +19,7 @@ class ColumnJitterCorrectionTest(unittest.TestCase):
             8000.0
             + 15.0 * cols
             + 1000.0 * np.sin(np.pi * rows / self.HEIGHT)
-            + 600.0
-            * np.exp(-np.square((cols - 260.0) / 55.0))
-            * (rows > 50)
+            + 600.0 * np.exp(-np.square((cols - 260.0) / 55.0)) * (rows > 50)
         )
         return np.stack(
             [scene * (0.8 + 0.1 * channel) + 300.0 * channel for channel in range(4)]
@@ -53,13 +51,9 @@ class ColumnJitterCorrectionTest(unittest.TestCase):
         clean = self.make_clean_channels()
         rng = np.random.default_rng(4)
         line_error = rng.normal(0.0, 120.0, self.WIDTH).astype(np.float32)
-        line_error += 180.0 * np.sin(
-            np.arange(self.WIDTH, dtype=np.float32) * 2.3
-        )
+        line_error += 180.0 * np.sin(np.arange(self.WIDTH, dtype=np.float32) * 2.3)
         rows = np.arange(self.HEIGHT, dtype=np.float32)
-        row_response = 0.7 + 0.3 * np.cos(
-            (rows + 0.5) * 2.0 * np.pi / self.HEIGHT
-        )
+        row_response = 0.7 + 0.3 * np.cos((rows + 0.5) * 2.0 * np.pi / self.HEIGHT)
         channel_response = np.array([1.0, 0.82, 1.14, 0.93], dtype=np.float32)
         striped = clean + (
             channel_response[:, None, None]
@@ -69,10 +63,7 @@ class ColumnJitterCorrectionTest(unittest.TestCase):
 
         model = self.estimate(striped)
         corrected = np.stack(
-            [
-                model.apply_window(striped[channel], channel, 0)
-                for channel in range(4)
-            ]
+            [model.apply_window(striped[channel], channel, 0) for channel in range(4)]
         )
 
         for channel in range(4):
@@ -117,10 +108,7 @@ class ColumnJitterCorrectionTest(unittest.TestCase):
             show_progress=False,
         )
         corrected = np.stack(
-            [
-                model.apply_window(striped[channel], channel, 0)
-                for channel in range(4)
-            ]
+            [model.apply_window(striped[channel], channel, 0) for channel in range(4)]
         )
         before = np.sqrt(np.mean(np.square(striped - clean)))
         after = np.sqrt(np.mean(np.square(corrected - clean)))
@@ -356,10 +344,7 @@ class ColumnJitterCorrectionTest(unittest.TestCase):
             explicitly_refined.scene_protection,
         )
         corrected = np.stack(
-            [
-                model.apply_window(striped[channel], channel, 0)
-                for channel in range(4)
-            ]
+            [model.apply_window(striped[channel], channel, 0) for channel in range(4)]
         )
         base_only = preview.ColumnJitterModel(
             model.band_corrections,
@@ -584,9 +569,7 @@ class ColumnJitterCorrectionTest(unittest.TestCase):
         scene = rng.normal(0.0, 1.0, (height, width)).astype(np.float32)
         for _ in range(4):
             scene = (
-                np.roll(scene, 1, axis=1)
-                + 2.0 * scene
-                + np.roll(scene, -1, axis=1)
+                np.roll(scene, 1, axis=1) + 2.0 * scene + np.roll(scene, -1, axis=1)
             ) / 4.0
         scene = 10000.0 + 1200.0 * scene
 
@@ -597,9 +580,8 @@ class ColumnJitterCorrectionTest(unittest.TestCase):
         green2[:, true_displacement:] = scene[:, :-true_displacement]
 
         columns = np.arange(width, dtype=np.float32)
-        stripe = (
-            2800.0 * np.sin(2.0 * np.pi * columns / 4.0)
-            + 1800.0 * np.sin(2.0 * np.pi * columns / 11.0)
+        stripe = 2800.0 * np.sin(2.0 * np.pi * columns / 4.0) + 1800.0 * np.sin(
+            2.0 * np.pi * columns / 11.0
         )
         green1 += stripe
         green2 += stripe
@@ -627,15 +609,13 @@ class ColumnJitterCorrectionTest(unittest.TestCase):
                 window_size=64,
                 corr_size=9,
             )
-            _, corrected_displacements, _ = (
-                preview.windowed_cross_correlation(
-                    green1,
-                    green2,
-                    window_step=16,
-                    window_size=64,
-                    corr_size=9,
-                    jitter_models=model,
-                )
+            _, corrected_displacements, _ = preview.windowed_cross_correlation(
+                green1,
+                green2,
+                window_step=16,
+                window_size=64,
+                corr_size=9,
+                jitter_models=model,
             )
 
         # The line-wide radiometric stripe is common at zero capture
@@ -653,15 +633,14 @@ class ColumnJitterCorrectionTest(unittest.TestCase):
             def __init__(self, values):
                 self.values = values
                 self.height, self.width = values.shape
+                self.shape = values.shape
 
             def __getitem__(self, key):
                 return self.values[key]
 
         height = 2
         width = 5
-        raw = ArrayView(
-            np.full((height, width), 1000.0, dtype=np.float32)
-        )
+        raw = ArrayView(np.full((height, width), 1000.0, dtype=np.float32))
         corrections = np.full((4, 1, width), 1000.0, dtype=np.float16)
         model = preview.ColumnJitterModel(
             corrections,
@@ -685,9 +664,7 @@ class ColumnJitterCorrectionTest(unittest.TestCase):
             "tqdm",
             lambda iterable, **_kwargs: iterable,
         ):
-            protected = next(
-                preview.sample_motion_corrected_chunks(**arguments)
-            )[1]
+            protected = next(preview.sample_motion_corrected_chunks(**arguments))[1]
             geometry = next(
                 preview.sample_motion_corrected_chunks(
                     **arguments,
@@ -699,6 +676,131 @@ class ColumnJitterCorrectionTest(unittest.TestCase):
         # consumes the complete raw-coordinate correction instead.
         np.testing.assert_allclose(protected, 1050.0)
         np.testing.assert_allclose(geometry, 2000.0)
+
+    def test_skew_green_sampler_matches_full_bayer_sampler(self):
+        class ArrayView:
+            def __init__(self, values):
+                self.values = values
+                self.height, self.width = values.shape
+                self.shape = values.shape
+
+            def __getitem__(self, key):
+                return self.values[key]
+
+        rng = np.random.default_rng(31)
+        height = 8
+        width = 37
+        channels = rng.uniform(
+            100.0,
+            60000.0,
+            size=(4, height, width),
+        ).astype(np.float32)
+        views = [ArrayView(channel) for channel in channels]
+        corrections = rng.normal(
+            0.0,
+            80.0,
+            size=(4, 4, width),
+        ).astype(np.float16)
+        # Exercise independent owner gating as well as clipping fades.
+        corrections[:, 1, 7:12] = 0.0
+        channels[preview.JITTER_GREEN1, 2, 9] = 0.0
+        channels[preview.JITTER_GREEN2, 5, 28] = 65535.0
+        model = preview.ColumnJitterModel(
+            corrections,
+            image_height=height,
+            black_levels=np.zeros(4, dtype=np.float32),
+            white_levels=np.full(4, 65535.0, dtype=np.float32),
+            confidence=np.ones(width, dtype=np.float32),
+        )
+        sample_positions = [
+            0.2,
+            1.75,
+            4.1,
+            8.6,
+            13.25,
+            19.8,
+            26.4,
+            31.9,
+            35.7,
+        ]
+        widths = [1.0, 1.25, 1.8, 2.1, 1.0, 1.4, 2.25, 1.1, 1.0]
+
+        with patch.object(
+            preview,
+            "tqdm",
+            lambda iterable, **_kwargs: iterable,
+        ):
+            full_chunks = list(
+                preview.sample_motion_corrected_chunks(
+                    views[preview.JITTER_RED],
+                    views[preview.JITTER_GREEN1],
+                    views[preview.JITTER_GREEN2],
+                    views[preview.JITTER_BLUE],
+                    sample_positions,
+                    widths,
+                    stride_x=2,
+                    stride_y=3,
+                    skew=0.0,
+                    max_pix=2,
+                    jitter_models=model,
+                    jitter_protect_scene=False,
+                )
+            )
+            green_chunks = list(
+                preview.sample_skew_corrected_green_chunks(
+                    views[preview.JITTER_GREEN1],
+                    views[preview.JITTER_GREEN2],
+                    sample_positions,
+                    widths,
+                    stride_x=2,
+                    stride_y=3,
+                    max_pix=2,
+                    jitter_models=model,
+                )
+            )
+
+        self.assertEqual(len(green_chunks), len(full_chunks))
+        for (full_idx, full_rgb), (green_idx, sampled_green) in zip(
+            full_chunks,
+            green_chunks,
+        ):
+            self.assertEqual(green_idx, full_idx)
+            np.testing.assert_array_equal(sampled_green, full_rgb[:, :, 1])
+
+    def test_sparse_skew_histogram_matches_dense_accumulation(self):
+        rng = np.random.default_rng(47)
+        height = 19
+        width = 31
+        hist_len = width * 3
+        hist_offset = width
+        weights = rng.uniform(0.0, 1.0, size=(height, width)).astype(np.float32)
+        mask = rng.random((height, width)) < 0.2
+        weights *= mask
+        edge_y, edge_x = np.nonzero(mask)
+        edge_weights = weights[edge_y, edge_x]
+        xs = np.arange(width, dtype=np.int32)
+
+        for skew in (-0.5, -0.125, 0.0, 0.125, 0.5):
+            expected = np.zeros(hist_len, dtype=np.float64)
+            for row_idx, y in enumerate(np.arange(height, dtype=np.int32)):
+                shift = int(round(skew * y))
+                bin_indices = xs - shift + hist_offset
+                valid = (bin_indices >= 0) & (bin_indices < hist_len)
+                expected += np.bincount(
+                    bin_indices[valid],
+                    weights=weights[row_idx, valid],
+                    minlength=hist_len,
+                )
+
+            actual = preview._sparse_skew_histogram(
+                edge_y,
+                edge_x,
+                edge_weights,
+                skew=skew,
+                hist_len=hist_len,
+                hist_offset=hist_offset,
+            )
+            np.testing.assert_array_equal(actual, expected)
 
     def test_speed_fit_rejects_low_confidence_reversal_aliases(self):
         x = np.arange(40, dtype=np.float64)

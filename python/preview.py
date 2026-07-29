@@ -44,6 +44,7 @@ STRUCTURE_MASK_DOWNSAMPLE = 8
 STRUCTURE_MASK_THRESHOLD = 0.05
 STRUCTURE_MASK_DILATE_PX = 0
 ENABLE_JITTER_DEBUG_PLOT = False
+ENABLE_SKEW_DEBUG_OUTPUT = False
 JITTER_DEBUG_ROW = 2000
 JITTER_VERTICAL_BANDS = 256
 JITTER_FINE_TEMPORAL_WINDOW = 31
@@ -120,9 +121,7 @@ DNG_COLOR_MATRIX_1 = np.linalg.solve(
     COLOR_CORRECTION.astype(np.float64),
     XYZ_D65_TO_LINEAR_SRGB,
 )
-DNG_FORWARD_MATRIX_1 = (
-    LINEAR_SRGB_TO_XYZ_D50 @ COLOR_CORRECTION.astype(np.float64)
-)
+DNG_FORWARD_MATRIX_1 = LINEAR_SRGB_TO_XYZ_D50 @ COLOR_CORRECTION.astype(np.float64)
 
 
 def apply_color_transform(
@@ -229,8 +228,7 @@ def format_contiguous_segments(indices):
     segments.append((start, prev))
 
     return ", ".join(
-        str(start) if start == end else f"{start}-{end}"
-        for start, end in segments
+        str(start) if start == end else f"{start}-{end}" for start, end in segments
     )
 
 
@@ -666,9 +664,7 @@ def robust_bspline_fit(
         # to cross zero and catastrophically stretch the output.
         dominant_motion = weighted_median(y, weights)
         confidence_cutoff = 0.2 * np.max(weights)
-        fallback_mask = (y * dominant_motion > 0) & (
-            weights >= confidence_cutoff
-        )
+        fallback_mask = (y * dominant_motion > 0) & (weights >= confidence_cutoff)
         if np.count_nonzero(fallback_mask) < 4:
             raise ValueError("Oscillating spline found")
 
@@ -710,9 +706,7 @@ def robust_bspline_fit(
         # range with the robust constant supported by confident samples.
         dominant_motion = weighted_median(y, weights)
         confidence_cutoff = 0.2 * np.max(weights)
-        fallback_mask = (y * dominant_motion > 0) & (
-            weights >= confidence_cutoff
-        )
+        fallback_mask = (y * dominant_motion > 0) & (weights >= confidence_cutoff)
         if np.count_nonzero(fallback_mask) < 4:
             raise ValueError("Implausible speed-fit dynamic range")
 
@@ -1029,18 +1023,14 @@ class ColumnJitterModel:
         else:
             fine = np.asarray(fine_band_corrections)
             if fine.shape != corrections.shape:
-                raise ValueError(
-                    "fine_band_corrections must match band_corrections"
-                )
+                raise ValueError("fine_band_corrections must match band_corrections")
             self.fine_band_corrections = fine
         if scene_protection is None:
             self.scene_protection = None
         else:
             protection = np.asarray(scene_protection)
             if protection.shape != corrections.shape[1:]:
-                raise ValueError(
-                    "scene_protection must have shape (bands, columns)"
-                )
+                raise ValueError("scene_protection must have shape (bands, columns)")
             if protection.dtype == np.bool_:
                 protection = protection.astype(np.float32)
             else:
@@ -1050,9 +1040,7 @@ class ColumnJitterModel:
                     or np.any(protection < 0.0)
                     or np.any(protection > 1.0)
                 ):
-                    raise ValueError(
-                        "scene_protection values must be between 0 and 1"
-                    )
+                    raise ValueError("scene_protection values must be between 0 and 1")
             self.scene_protection = protection.astype(np.float16)
         if self.black_levels.shape != (4,) or self.white_levels.shape != (4,):
             raise ValueError("black_levels and white_levels must each contain 4 values")
@@ -1062,11 +1050,8 @@ class ColumnJitterModel:
         # Band values live at band centers. Linear interpolation keeps application
         # cheap during motion-corrected sampling while avoiding band boundaries.
         band_position = (
-            (np.arange(self.image_height, dtype=np.float32) + 0.5)
-            * self.num_bands
-            / self.image_height
-            - 0.5
-        )
+            np.arange(self.image_height, dtype=np.float32) + 0.5
+        ) * self.num_bands / self.image_height - 0.5
         lower = np.floor(band_position).astype(np.int32)
         upper = lower + 1
         weight = band_position - lower
@@ -1099,12 +1084,8 @@ class ColumnJitterModel:
         upper = self._row_band_upper[rows]
         weight = self._row_band_weight[rows, None]
         channel_model = component[channel]
-        correction_low = channel_model[lower[:, None], column_grid].astype(
-            np.float32
-        )
-        correction_high = channel_model[upper[:, None], column_grid].astype(
-            np.float32
-        )
+        correction_low = channel_model[lower[:, None], column_grid].astype(np.float32)
+        correction_high = channel_model[upper[:, None], column_grid].astype(np.float32)
         correction = correction_low + (correction_high - correction_low) * weight
         # Interpolation may taper a supported band toward an unsupported
         # neighbor, but it must never carry that neighbor's value across the
@@ -1216,9 +1197,7 @@ class ColumnJitterModel:
                     column_grid,
                     rows,
                 )
-                correction = correction + protection * (
-                    limited_correction - correction
-                )
+                correction = correction + protection * (limited_correction - correction)
             else:
                 correction = limited_correction
         highlight_margin = max(
@@ -1228,9 +1207,7 @@ class ColumnJitterModel:
         shadow_weight = np.clip(
             (values - black) / max(JITTER_BLACK_MARGIN, 1.0), 0.0, 1.0
         )
-        highlight_weight = np.clip(
-            (white - values) / highlight_margin, 0.0, 1.0
-        )
+        highlight_weight = np.clip((white - values) / highlight_margin, 0.0, 1.0)
         clip_weight = np.minimum(shadow_weight, highlight_weight)
         return values + correction * clip_weight
 
@@ -1327,8 +1304,7 @@ def _jitter_band_statistics(
         > JITTER_MAX_CLIPPED_FRACTION
     )
     invalid |= (
-        np.mean(banded >= white - high_margin, axis=1)
-        > JITTER_MAX_CLIPPED_FRACTION
+        np.mean(banded >= white - high_margin, axis=1) > JITTER_MAX_CLIPPED_FRACTION
     )
     return medians, ~invalid
 
@@ -1402,10 +1378,7 @@ def _winsorize_jitter_candidates(
     normalized_candidates = np.asarray(normalized_candidates, dtype=np.float32)
     valid = np.asarray(valid, dtype=bool)
     expected_shape = (4 * num_bands, normalized_candidates.shape[1])
-    if (
-        normalized_candidates.shape != expected_shape
-        or valid.shape != expected_shape
-    ):
+    if normalized_candidates.shape != expected_shape or valid.shape != expected_shape:
         raise ValueError("jitter candidates have an unexpected feature shape")
 
     winsorized = np.zeros_like(normalized_candidates)
@@ -1521,9 +1494,7 @@ def _jitter_low_rank_basis(
         where=np.any(candidate_basis != 0.0, axis=0),
     )
     channel_power = np.sum(
-        np.square(
-            candidate_basis.reshape(4, num_bands, candidate_count)
-        ),
+        np.square(candidate_basis.reshape(4, num_bands, candidate_count)),
         axis=1,
     )
     channel_supported = np.all(
@@ -1531,18 +1502,9 @@ def _jitter_low_rank_basis(
         axis=0,
     )
     accepted = (
-        (
-            eigenvalues[:candidate_count]
-            >= JITTER_LOW_RANK_MIN_NOISE_RATIO * noise_floor
-        )
-        & (
-            temporal_participation
-            >= JITTER_LOW_RANK_MIN_TEMPORAL_PARTICIPATION
-        )
-        & (
-            spatial_participation
-            >= JITTER_LOW_RANK_MIN_SPATIAL_PARTICIPATION
-        )
+        (eigenvalues[:candidate_count] >= JITTER_LOW_RANK_MIN_NOISE_RATIO * noise_floor)
+        & (temporal_participation >= JITTER_LOW_RANK_MIN_TEMPORAL_PARTICIPATION)
+        & (spatial_participation >= JITTER_LOW_RANK_MIN_SPATIAL_PARTICIPATION)
         & channel_supported
     )
     return (
@@ -1606,8 +1568,7 @@ def _sample_jitter_band_columns(
             np.zeros(positions.size, dtype=bool),
         )
     sampled = (
-        values[:, safe_lower] * (1.0 - fraction)
-        + values[:, safe_lower + 1] * fraction
+        values[:, safe_lower] * (1.0 - fraction) + values[:, safe_lower + 1] * fraction
     )
     sampled[:, ~valid] = 0.0
     return sampled.astype(np.float32, copy=False), valid
@@ -1629,18 +1590,10 @@ def _sample_centered_jitter_gradient(
         )
 
     lower = np.floor(positions).astype(np.int64)
-    valid = (
-        np.isfinite(positions)
-        & (lower >= 1)
-        & (lower + 2 < values.shape[1])
-    )
+    valid = np.isfinite(positions) & (lower >= 1) & (lower + 2 < values.shape[1])
     safe_lower = np.clip(lower, 1, values.shape[1] - 3)
-    gradient_lower = 0.5 * (
-        values[:, safe_lower + 1] - values[:, safe_lower - 1]
-    )
-    gradient_upper = 0.5 * (
-        values[:, safe_lower + 2] - values[:, safe_lower]
-    )
+    gradient_lower = 0.5 * (values[:, safe_lower + 1] - values[:, safe_lower - 1])
+    gradient_upper = 0.5 * (values[:, safe_lower + 2] - values[:, safe_lower])
     fraction = (positions - lower)[None, :]
     sampled = gradient_lower + (gradient_upper - gradient_lower) * fraction
     sampled[:, ~valid] = 0.0
@@ -1705,9 +1658,7 @@ def refine_column_exposure_jitter_correction(
     ):
         raise ValueError("recurrent jitter model does not match the channel views")
     if fine_temporal_window < 3 or fine_temporal_window % 2 != 1:
-        raise ValueError(
-            "fine_temporal_window must be an odd integer of at least 3"
-        )
+        raise ValueError("fine_temporal_window must be an odd integer of at least 3")
     if block_columns < 1:
         raise ValueError("block_columns must be positive")
 
@@ -1716,9 +1667,7 @@ def refine_column_exposure_jitter_correction(
         dtype=np.float64,
     )
     if green_displacements.shape != (image_width,):
-        raise ValueError(
-            "green_displacements must contain one value per image column"
-        )
+        raise ValueError("green_displacements must contain one value per image column")
     if not np.all(np.isfinite(green_displacements)):
         raise ValueError("green_displacements must all be finite")
     if image_width < 4:
@@ -1728,9 +1677,7 @@ def refine_column_exposure_jitter_correction(
     black_levels = recurrent_model.black_levels
     white_levels = recurrent_model.white_levels
     num_bands = recurrent_model.num_bands
-    alignment_margin = (
-        int(math.ceil(float(np.max(np.abs(green_displacements))))) + 2
-    )
+    alignment_margin = int(math.ceil(float(np.max(np.abs(green_displacements))))) + 2
 
     # Estimate robust aligned-green gradient scales using the same raw-plus-
     # model operation order as the original one-call implementation. Keeping
@@ -1808,17 +1755,13 @@ def refine_column_exposure_jitter_correction(
 
     sample_x = gradient_sample_columns.astype(np.float64)
     aligned_sample_x = sample_x + green_displacements[gradient_sample_columns]
-    model_green1_gradient, model_green1_valid = (
-        _sample_centered_jitter_gradient(
-            band_corrections[JITTER_GREEN1],
-            sample_x,
-        )
+    model_green1_gradient, model_green1_valid = _sample_centered_jitter_gradient(
+        band_corrections[JITTER_GREEN1],
+        sample_x,
     )
-    model_green2_gradient, model_green2_valid = (
-        _sample_centered_jitter_gradient(
-            band_corrections[JITTER_GREEN2],
-            aligned_sample_x,
-        )
+    model_green2_gradient, model_green2_valid = _sample_centered_jitter_gradient(
+        band_corrections[JITTER_GREEN2],
+        aligned_sample_x,
     )
     corrected_green_gradient_samples = raw_green_gradient_samples.copy()
     corrected_green_gradient_samples[0] += model_green1_gradient
@@ -1878,23 +1821,18 @@ def refine_column_exposure_jitter_correction(
                 float(black_levels[channel]),
                 float(white_levels[channel]),
             )
-            corrected_statistics[channel] = (
-                statistics
-                + band_corrections[
-                    channel,
-                    :,
-                    read_start:read_stop,
-                ].astype(np.float32)
-            )
+            corrected_statistics[channel] = statistics + band_corrections[
+                channel,
+                :,
+                read_start:read_stop,
+            ].astype(np.float32)
             band_valid[channel] = valid_statistics
 
         fine_target = _centered_moving_median(
             corrected_statistics,
             fine_temporal_window,
         )
-        fine_offsets = (
-            fine_target - corrected_statistics
-        )[:, :, core_slice]
+        fine_offsets = (fine_target - corrected_statistics)[:, :, core_slice]
 
         # Compute scene-edge support on an expanded interval so horizontal
         # dilation is identical on either side of a processing boundary.
@@ -1919,8 +1857,7 @@ def refine_column_exposure_jitter_correction(
             start_column=read_start,
         )
         aligned_columns = (
-            mask_columns.astype(np.float64)
-            + green_displacements[mask_columns]
+            mask_columns.astype(np.float64) + green_displacements[mask_columns]
         )
         sampled_green2, green2_valid = _sample_jitter_band_columns(
             green2_gradient,
@@ -1936,9 +1873,7 @@ def refine_column_exposure_jitter_correction(
             edge_score >= JITTER_ALIGNED_EDGE_THRESHOLD,
             JITTER_ALIGNED_EDGE_DILATE_COLUMNS,
         )
-        strong_edge_seed = (
-            edge_score >= JITTER_ALIGNED_STRONG_EDGE_THRESHOLD
-        )
+        strong_edge_seed = edge_score >= JITTER_ALIGNED_STRONG_EDGE_THRESHOLD
         strong_edges = _dilate_jitter_edges(
             strong_edge_seed,
             fine_radius,
@@ -1959,16 +1894,13 @@ def refine_column_exposure_jitter_correction(
             mask_core_slice,
         ]
 
-        normalized_magnitude = np.abs(fine_offsets) / (
-            white_levels - black_levels
-        )[:, None, None]
+        normalized_magnitude = (
+            np.abs(fine_offsets) / (white_levels - black_levels)[:, None, None]
+        )
         peak_magnitude = np.max(normalized_magnitude, axis=0)
         channel_threshold = np.maximum(
             JITTER_RESIDUAL_MIN_CHANNEL_FRACTION,
-            (
-                JITTER_RESIDUAL_MIN_RELATIVE_CHANNEL_POWER
-                * peak_magnitude
-            ),
+            (JITTER_RESIDUAL_MIN_RELATIVE_CHANNEL_POWER * peak_magnitude),
         )
         participating_channels = np.sum(
             normalized_magnitude >= channel_threshold[None, :, :],
@@ -1995,9 +1927,7 @@ def refine_column_exposure_jitter_correction(
             0.0,
         ).astype(np.float16)
 
-    scene_protection = _feather_jitter_scene_protection(
-        scene_protection
-    )
+    scene_protection = _feather_jitter_scene_protection(scene_protection)
     return ColumnJitterModel(
         band_corrections,
         image_height,
@@ -2071,9 +2001,7 @@ def column_exposure_jitter_correction(
             f"image height {image_height} must be divisible by {num_bands}"
         )
     if fine_temporal_window < 3 or fine_temporal_window % 2 != 1:
-        raise ValueError(
-            "fine_temporal_window must be an odd integer of at least 3"
-        )
+        raise ValueError("fine_temporal_window must be an odd integer of at least 3")
     if temporal_window < fine_temporal_window or temporal_window % 2 != 1:
         raise ValueError(
             "temporal_window must be an odd integer no smaller than "
@@ -2154,27 +2082,22 @@ def column_exposure_jitter_correction(
                 temporal_window,
             )
             fine_offsets[channel] = (fine_target - statistics)[:, core_slice]
-            broad_offsets[channel] = (
-                broad_target - fine_target
-            )[:, core_slice]
+            broad_offsets[channel] = (broad_target - fine_target)[:, core_slice]
             valid[channel] = band_valid[:, core_slice]
 
         if structure_bands is not None:
             lowres_columns = (
-                np.arange(core_start, core_stop, dtype=np.int64)
-                // structure_mask_scale
+                np.arange(core_start, core_stop, dtype=np.int64) // structure_mask_scale
             )
             structured = structure_bands[:, lowres_columns]
             valid &= ~structured[None, :, :]
 
         spans = (white_levels - black_levels)[:, None, None]
         fine_supported = valid & (
-            np.abs(fine_offsets)
-            <= JITTER_FINE_MAX_CORRECTION_FRACTION * spans
+            np.abs(fine_offsets) <= JITTER_FINE_MAX_CORRECTION_FRACTION * spans
         )
         broad_supported = valid & (
-            np.abs(broad_offsets)
-            <= JITTER_BROAD_MAX_CORRECTION_FRACTION * spans
+            np.abs(broad_offsets) <= JITTER_BROAD_MAX_CORRECTION_FRACTION * spans
         )
         candidate_corrections = np.where(
             fine_supported,
@@ -2207,9 +2130,7 @@ def column_exposure_jitter_correction(
         sample_count,
         dtype=np.int64,
     )
-    training_candidates = feature_candidates[:, sample_columns].astype(
-        np.float32
-    )
+    training_candidates = feature_candidates[:, sample_columns].astype(np.float32)
     training_valid = np.isfinite(training_candidates)
     training_candidates[~training_valid] = 0.0
     basis, feature_means = _jitter_low_rank_basis(
@@ -2219,20 +2140,15 @@ def column_exposure_jitter_correction(
     )
     if show_progress:
         print(
-            "column exposure jitter: "
-            f"accepted {basis.shape[1]} recurrent sensor modes"
+            f"column exposure jitter: accepted {basis.shape[1]} recurrent sensor modes"
         )
 
     confidence_full = np.zeros(image_width, dtype=np.float32)
-    minimum_valid = math.ceil(
-        JITTER_MODEL_MIN_VALID_FRACTION * 4 * num_bands
-    )
+    minimum_valid = math.ceil(JITTER_MODEL_MIN_VALID_FRACTION * 4 * num_bands)
     spans_flat = np.repeat(white_levels - black_levels, num_bands)
     for core_start in range(0, image_width, block_columns):
         core_stop = min(image_width, core_start + block_columns)
-        candidates = feature_candidates[:, core_start:core_stop].astype(
-            np.float32
-        )
+        candidates = feature_candidates[:, core_start:core_stop].astype(np.float32)
         valid = np.isfinite(candidates)
         candidates[~valid] = 0.0
         reconstructed = _project_jitter_low_rank(
@@ -2508,6 +2424,173 @@ def sample_motion_corrected_chunks(
         chunk_i += 1
 
 
+def sample_skew_corrected_green_chunks(
+    green1,
+    green2,
+    sample_positions,
+    widths,
+    *,
+    stride_x: int = 1,
+    stride_y: int = 1,
+    max_pix: int = 16384,
+    jitter_models=None,
+):
+    """
+    Produce the speed-corrected green image used for zero-skew fitting.
+
+    Skew estimation only consumes the green channel and samples at zero
+    candidate skew. Correct each contiguous raw-coordinate green block once,
+    then reuse those corrected pixels across the overlapping output apertures.
+    This preserves the same radiometry-before-geometry operation order as the
+    full Bayer sampler without reading or correcting red and blue.
+    """
+    if stride_x < 1 or stride_y < 1 or max_pix < 1:
+        raise ValueError("sampling strides and chunk size must be positive")
+    if green1.shape != green2.shape:
+        raise ValueError("green channel views must have the same shape")
+    if len(sample_positions) != len(widths):
+        raise ValueError("sample_positions and widths must have equal length")
+
+    indices = list(range(0, len(sample_positions), stride_x))
+    if not indices:
+        return
+
+    image_height, image_width = green1.shape
+    chunk_i = 0
+    for start in range(0, len(indices), max_pix):
+        batch_indices = indices[start : start + max_pix]
+        pad_left = start > 0
+        if pad_left:
+            use_indices = [indices[start - 1]] + batch_indices
+        else:
+            use_indices = list(batch_indices)
+
+        use_positions = np.asarray(
+            [sample_positions[i] for i in use_indices],
+            dtype=np.float64,
+        )
+        use_widths = np.asarray(
+            [widths[i] for i in use_indices],
+            dtype=np.float64,
+        )
+        if (
+            not np.all(np.isfinite(use_positions))
+            or not np.all(np.isfinite(use_widths))
+            or np.any(use_widths <= 0.0)
+        ):
+            raise ValueError("sample positions and widths must be finite and positive")
+
+        window_halves = np.ceil(use_widths).astype(np.int64)
+        bases = np.floor(use_positions).astype(np.int64)
+        left_columns = np.clip(
+            bases - window_halves,
+            0,
+            image_width - 1,
+        )
+        right_columns = np.clip(
+            bases + window_halves,
+            0,
+            image_width - 1,
+        )
+        read_start = int(np.min(left_columns))
+        read_stop = int(np.max(right_columns)) + 1
+
+        green1_block = green1[:, slice(read_start, read_stop)]
+        green2_block = green2[:, slice(read_start, read_stop)]
+        if jitter_models is not None:
+            green1_block = apply_column_models(
+                green1_block,
+                jitter_models,
+                read_start,
+                JITTER_GREEN1,
+                protect_scene=False,
+            )
+            green2_block = apply_column_models(
+                green2_block,
+                jitter_models,
+                read_start,
+                JITTER_GREEN2,
+                protect_scene=False,
+            )
+
+        sampled_green = np.zeros(
+            (2 * image_height, len(use_indices)),
+            dtype=np.float32,
+        )
+        for j, sample_idx in tqdm(
+            enumerate(use_indices),
+            total=len(use_indices),
+            desc="sampling skew chunk",
+        ):
+            xi = sample_positions[sample_idx]
+            wi = widths[sample_idx]
+            window_half = int(math.ceil(wi))
+            base = int(np.floor(xi))
+            offsets = np.arange(
+                -window_half,
+                window_half + 1,
+                dtype=np.int32,
+            )
+            window_indices = base + offsets
+            valid = (window_indices >= 0) & (window_indices < image_width)
+            indices_clipped = np.clip(window_indices, 0, image_width - 1)
+            indices_local = indices_clipped - read_start
+
+            green1_values = green1_block[:, indices_local]
+            green2_values = green2_block[:, indices_local]
+
+            dist = indices_clipped.astype(np.float32) - np.float32(xi)
+            weights = np.zeros_like(dist, dtype=np.float32)
+            mask = (np.abs(dist) < wi) & valid
+            weights[mask] = 1 + np.cos(np.pi * dist[mask] / wi)
+            sum_weight = np.sum(weights)
+            if sum_weight == 0.0:
+                sum_weight = np.float32(1.0)
+
+            green1_weighted = (
+                np.sum(green1_values * weights[None, :], axis=1) / sum_weight
+            )
+            green2_weighted = (
+                np.sum(green2_values * weights[None, :], axis=1) / sum_weight
+            )
+            green1_interp = interpolate_upsample(green1_weighted, 1)
+            green2_interp = interpolate_upsample(green2_weighted, 0)
+
+            if j == 0:
+                sampled_green[:, 0] += green1_interp * 0.5
+            if j < len(use_indices) - 1:
+                sampled_green[:, j + 1] += green1_interp * 0.5
+            sampled_green[:, j] += green2_interp * 0.5
+
+        if pad_left:
+            sampled_green = sampled_green[:, 1:]
+        if stride_y > 1:
+            sampled_green = sampled_green[::stride_y, :]
+
+        yield chunk_i, sampled_green
+        chunk_i += 1
+
+
+def _sparse_skew_histogram(
+    edge_y: np.ndarray,
+    edge_x: np.ndarray,
+    edge_weights: np.ndarray,
+    *,
+    skew: float,
+    hist_len: int,
+    hist_offset: int,
+) -> np.ndarray:
+    """Accumulate one Hough projection using only nonzero edge weights."""
+    shifts = np.rint(skew * edge_y).astype(np.int32)
+    bin_indices = edge_x - shifts + hist_offset
+    valid = (bin_indices >= 0) & (bin_indices < hist_len)
+    return np.bincount(
+        bin_indices[valid],
+        weights=edge_weights[valid],
+        minlength=hist_len,
+    )
+
+
 def estimate_skew_hough(
     chunk_iter,
     *,
@@ -2518,6 +2601,7 @@ def estimate_skew_hough(
     skew_max: float = 0.05,
     bins: int = 69,
     energy_percentile: float = 98,
+    write_debug: bool = False,
 ):
     skews = np.linspace(skew_min, skew_max, bins, dtype=np.float32)
     scores = np.zeros_like(skews, dtype=np.float64)
@@ -2541,7 +2625,12 @@ def estimate_skew_hough(
     for _chunk_i, chunk in tqdm(chunk_iter, desc="estimating skew"):
         if chunk.size == 0:
             continue
-        gray = chunk[:, :, 1].astype(np.float32)
+        if chunk.ndim == 2:
+            gray = np.asarray(chunk, dtype=np.float32)
+        elif chunk.ndim == 3 and chunk.shape[2] >= 2:
+            gray = chunk[:, :, 1].astype(np.float32)
+        else:
+            raise ValueError("skew chunks must be grayscale or RGB arrays")
         grad_y, grad_x = np.gradient(gray)
         magnitude = np.sqrt(grad_x**2 + grad_y**2) + 0.1 * np.max(gray)
         energy = np.abs(grad_x) / magnitude
@@ -2557,31 +2646,30 @@ def estimate_skew_hough(
         width = chunk.shape[1]
         hist_len = width * 3
         hist_offset = width
-        xs = np.arange(width, dtype=np.int32)
-        ys = np.arange(chunk.shape[0], dtype=np.int32)
+        edge_y, edge_x = np.nonzero(mask)
+        edge_weights = weights[edge_y, edge_x]
         scale = stride_y / stride_x
         total_weight = float(np.sum(weights)) + 1e-6
 
         chunk_scores = np.zeros_like(skews, dtype=np.float64)
-        histograms = np.zeros((len(skews), hist_len), dtype=np.float64)
+        histograms = (
+            np.zeros((len(skews), hist_len), dtype=np.float64) if write_debug else None
+        )
         peak_values = [[] for _ in range(len(skews))]
         for i, skew in enumerate(skews):
             skew_ds = skew * scale
-            hist = np.zeros(hist_len, dtype=np.float64)
-            for row_idx, y in enumerate(ys):
-                shift = int(round(skew_ds * y))
-                b_idx = xs - shift + hist_offset
-                valid = (b_idx >= 0) & (b_idx < hist_len)
-                if not np.any(valid):
-                    continue
-                hist += np.bincount(
-                    b_idx[valid],
-                    weights=weights[row_idx, valid],
-                    minlength=hist_len,
-                )
+            hist = _sparse_skew_histogram(
+                edge_y,
+                edge_x,
+                edge_weights,
+                skew=skew_ds,
+                hist_len=hist_len,
+                hist_offset=hist_offset,
+            )
             if hist.size:
                 hist_norm = hist / total_weight
-                histograms[i, :] = hist_norm
+                if histograms is not None:
+                    histograms[i, :] = hist_norm
                 peak_idxs = find_peaks_nms(hist_norm, min_distance=12)
                 if peak_idxs.size:
                     peak_values[i] = sorted(
@@ -2610,49 +2698,45 @@ def estimate_skew_hough(
                 continue
             chunk_scores[i] = float(np.sum(vals[:k]))
 
-        best_idx = int(np.argmax(chunk_scores))
-        best_skew = skews[best_idx]
-        skew_ds = best_skew * scale
-        best_hist = (
-            histograms[best_idx]
-            if histograms.size
-            else np.zeros(hist_len, dtype=np.float64)
-        )
-        best_offset = hist_offset
+        if write_debug:
+            best_idx = int(np.argmax(chunk_scores))
+            best_skew = skews[best_idx]
+            skew_ds = best_skew * scale
+            best_hist = histograms[best_idx]
+            best_offset = hist_offset
 
-        energy_norm = energy / max(np.max(energy), 1e-6)
-        mask_u8 = mask.astype(np.uint8) * 255
-        energy_u8 = (np.clip(energy_norm, 0, 1) * 255).astype(np.uint8)
+            energy_norm = energy / max(np.max(energy), 1e-6)
+            mask_u8 = mask.astype(np.uint8) * 255
+            energy_u8 = (np.clip(energy_norm, 0, 1) * 255).astype(np.uint8)
 
-        energy_vis = cv2.cvtColor(energy_u8, cv2.COLOR_GRAY2BGR)
-        energy_vis = np.ascontiguousarray(energy_vis[::-1, :, :])
-        mask_vis = np.ascontiguousarray(mask_u8[::-1, :])
+            energy_vis = cv2.cvtColor(energy_u8, cv2.COLOR_GRAY2BGR)
+            energy_vis = np.ascontiguousarray(energy_vis[::-1, :, :])
+            mask_vis = np.ascontiguousarray(mask_u8[::-1, :])
 
-        peak_thresh = 0.7 * np.max(best_hist) if best_hist.size else 0
-        if peak_thresh > 0:
-            peaks = np.zeros_like(best_hist, dtype=bool)
-            peaks[1:-1] = (best_hist[1:-1] > best_hist[:-2]) & (
-                best_hist[1:-1] >= best_hist[2:]
-            )
-            peaks &= best_hist >= peak_thresh
-            peak_idxs = np.where(peaks)[0]
-        else:
-            peak_idxs = []
+            peak_thresh = 0.7 * np.max(best_hist) if best_hist.size else 0
+            if peak_thresh > 0:
+                peaks = np.zeros_like(best_hist, dtype=bool)
+                peaks[1:-1] = (best_hist[1:-1] > best_hist[:-2]) & (
+                    best_hist[1:-1] >= best_hist[2:]
+                )
+                peaks &= best_hist >= peak_thresh
+                peak_idxs = np.where(peaks)[0]
+            else:
+                peak_idxs = []
 
-        h = energy_vis.shape[0]
-        for b in peak_idxs:
-            intercept = b - best_offset
-            x0 = int(round(intercept + skew_ds * (h - 1)))
-            x1 = int(round(intercept))
-            y0 = 0
-            y1 = h - 1
-            if (0 <= x0 < energy_vis.shape[1]) or (0 <= x1 < energy_vis.shape[1]):
-                cv2.line(energy_vis, (x0, y0), (x1, y1), (0, 0, 255), 1)
+            h = energy_vis.shape[0]
+            for b in peak_idxs:
+                intercept = b - best_offset
+                x0 = int(round(intercept + skew_ds * (h - 1)))
+                x1 = int(round(intercept))
+                y0 = 0
+                y1 = h - 1
+                if (0 <= x0 < energy_vis.shape[1]) or (0 <= x1 < energy_vis.shape[1]):
+                    cv2.line(energy_vis, (x0, y0), (x1, y1), (0, 0, 255), 1)
 
-        cv2.imwrite(str(g / f"skew_energy_{_chunk_i:02d}.png"), energy_vis)
-        cv2.imwrite(str(g / f"skew_mask_{_chunk_i:02d}.png"), mask_vis)
+            cv2.imwrite(str(g / f"skew_energy_{_chunk_i:02d}.png"), energy_vis)
+            cv2.imwrite(str(g / f"skew_mask_{_chunk_i:02d}.png"), mask_vis)
 
-        if histograms.size:
             fig, ax = plt.subplots(figsize=(16, 9), dpi=300)
             ax.imshow(
                 histograms,
@@ -2667,11 +2751,11 @@ def estimate_skew_hough(
             fig.savefig(g / f"skew_histogram{_chunk_i:02d}.png")
             plt.close(fig)
 
-        plt.figure(figsize=(16, 9), dpi=300)
-        plt.plot(chunk_scores, "b.", label="Skew response")
-        plt.legend()
-        plt.savefig(g / f"skew_response_{_chunk_i:04d}.png")
-        plt.close()
+            plt.figure(figsize=(16, 9), dpi=300)
+            plt.plot(chunk_scores, "b.", label="Skew response")
+            plt.legend()
+            plt.savefig(g / f"skew_response_{_chunk_i:04d}.png")
+            plt.close()
         scores += chunk_scores
 
     if np.all(scores == 0):
@@ -2787,9 +2871,9 @@ def process_preview(
         green_full = np.empty((0, 0), dtype=np.float32)
 
     mask_full = energy_full > STRUCTURE_MASK_THRESHOLD
-    if mask_full.size > 0:
-        preview_mask = mask_full.astype(np.uint8) * 255
-        cv2.imwrite(str(g / "structure_mask_undilated.png"), preview_mask)
+    # if mask_full.size > 0:
+    # preview_mask = mask_full.astype(np.uint8) * 255
+    # cv2.imwrite(str(g / "structure_mask_undilated.png"), preview_mask)
 
     if STRUCTURE_MASK_DILATE_PX > 0 and mask_full.size > 0:
         dilate_px = max(1, STRUCTURE_MASK_DILATE_PX // STRUCTURE_MASK_DOWNSAMPLE)
@@ -2803,8 +2887,8 @@ def process_preview(
         base = cv2.cvtColor(green_u8, cv2.COLOR_GRAY2BGR)
         mask_overlay = np.zeros_like(base)
         mask_overlay[:, :, 2] = mask_full.astype(np.uint8) * 255
-        preview = cv2.addWeighted(base, 0.9, mask_overlay, 0.1, 0.0)
-        cv2.imwrite(str(g / "structure_mask_preview.png"), preview)
+        # preview = cv2.addWeighted(base, 0.9, mask_overlay, 0.1, 0.0)
+        # cv2.imwrite(str(g / "structure_mask_preview.png"), preview)
 
     # Radiometric correction is a property of the raw capture coordinates and
     # must precede geometry estimation. In particular, a line-wide exposure
@@ -2856,27 +2940,20 @@ def process_preview(
     hough_stride = 3
 
     skew = estimate_skew_hough(
-        sample_motion_corrected_chunks(
-            red_view,
+        sample_skew_corrected_green_chunks(
             green1,
             green2,
-            blue_view,
             sample_positions,
             widths,
             stride_x=hough_stride,
             stride_y=hough_stride,
-            skew=0.0,
             max_pix=skew_chunk_size,
             jitter_models=jitter_models,
-            # Scene-relative limiting protects rendered shadow detail but is
-            # not part of the raw-coordinate radiometric model. Geometry must
-            # see the complete correction, just as the speed fit does.
-            jitter_protect_scene=False,
-            step_scales=step_scales,
         ),
         g=g,
         stride_x=hough_stride,
         stride_y=hough_stride,
+        write_debug=ENABLE_SKEW_DEBUG_OUTPUT,
     )
 
     print("estimated skew", skew)
@@ -2930,9 +3007,7 @@ def process_preview(
         ax_post.set_title("post")
         ax_post.legend()
 
-        for pre, post, color, label in zip(
-            pre_channels, post_channels, colors, labels
-        ):
+        for pre, post, color, label in zip(pre_channels, post_channels, colors, labels):
             ax_delta.plot(
                 cols,
                 post - pre,
@@ -3042,10 +3117,7 @@ def _parse_args(argv=None):
     parser.add_argument(
         "captures",
         nargs="*",
-        help=(
-            "capture directories; relative names are resolved under "
-            f"{linescans}"
-        ),
+        help=(f"capture directories; relative names are resolved under {linescans}"),
     )
     parser.add_argument(
         "--jitter",
@@ -3065,18 +3137,26 @@ def _parse_args(argv=None):
         default=ENABLE_JITTER_DEBUG_PLOT,
         help="write a row-level before/after jitter diagnostic plot",
     )
-    parser.add_argument("--max-workers", type=int, default=3)
+    parser.add_argument(
+        "--skew-debug",
+        action="store_true",
+        default=ENABLE_SKEW_DEBUG_OUTPUT,
+        help="write per-chunk skew energy, mask, histogram, and response plots",
+    )
+    parser.add_argument("--max-workers", type=int, default=6)
     return parser.parse_args(argv)
 
 
 def main(argv=None):
     global ENABLE_COLUMN_JITTER_CORRECTION
     global ENABLE_JITTER_DEBUG_PLOT
+    global ENABLE_SKEW_DEBUG_OUTPUT
     global FLIP_OUTPUT_180
 
     args = _parse_args(argv)
     ENABLE_COLUMN_JITTER_CORRECTION = args.jitter
     ENABLE_JITTER_DEBUG_PLOT = args.jitter_debug
+    ENABLE_SKEW_DEBUG_OUTPUT = args.skew_debug
     FLIP_OUTPUT_180 = args.flip_output_180
 
     if args.captures:
