@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
+import tempfile
+import threading
 import time
 from collections import OrderedDict
+from datetime import datetime
 from pathlib import Path
 
 import bottleneck as bn
@@ -18,6 +22,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from numpy.lib.stride_tricks import sliding_window_view
 import numpy as np
+from PIL import ExifTags, Image, TiffImagePlugin
 from scipy.optimize import curve_fit
 from scipy.interpolate import UnivariateSpline
 from tqdm import tqdm
@@ -37,6 +42,9 @@ RAW_COLOR_CORRECTION = np.array(
 
 CAMERA_MAKE = "Alkeria"
 CAMERA_MODEL_NAME = "Alkeria Necta N4K2-7C"
+CAPTURE_DATETIME_FORMAT = "%Y-%m-%d-%H-%M-%S"
+DNG_DATETIME_FORMAT = "%Y:%m:%d %H:%M:%S"
+SHUTTER_TICKS_PER_SECOND = 10_000_000  # Capture UI stores shutter in 100 ns ticks.
 ENABLE_COLUMN_JITTER_CORRECTION = True
 FORCE_CONTIGUOUS_SELECTION = True
 FLIP_OUTPUT_180 = True
@@ -82,6 +90,23 @@ JITTER_RED = 0
 JITTER_GREEN1 = 1
 JITTER_GREEN2 = 2
 JITTER_BLUE = 3
+
+
+_progress_state = threading.local()
+
+
+def progress(iterable, *, show: bool = True, **tqdm_kwargs):
+    """Display at most one progress bar per thread."""
+    depth = getattr(_progress_state, "depth", 0)
+    if not show or depth:
+        yield from iterable
+        return
+
+    _progress_state.depth = depth + 1
+    try:
+        yield from tqdm(iterable, **tqdm_kwargs)
+    finally:
+        _progress_state.depth = depth
 
 
 def _normalize_rows(matrix: np.ndarray) -> np.ndarray:
@@ -144,8 +169,83 @@ def _rational_values(
     return tuple((int(round(value * denominator)), denominator) for value in values)
 
 
+def parse_capture_datetime(capture_dir: Path) -> datetime | None:
+    candidate = capture_dir.name[:19]
+    try:
+        captured_at = datetime.strptime(candidate, CAPTURE_DATETIME_FORMAT)
+    except ValueError:
+        return None
+    if captured_at.strftime(CAPTURE_DATETIME_FORMAT) != candidate:
+        return None
+    return captured_at
+
+
+def parse_exposure_time(capture_dir: Path) -> tuple[int, int] | None:
+    try:
+        settings = (capture_dir / "capture_settings.txt").read_text(
+            encoding="utf-8"
+        )
+    except (OSError, UnicodeError):
+        return None
+
+    for line in settings.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip() == "shutterspeed":
+            try:
+                shutter_ticks = int(value.strip())
+            except ValueError:
+                return None
+            if not 0 <= shutter_ticks <= np.iinfo(np.uint32).max:
+                return None
+            return shutter_ticks, SHUTTER_TICKS_PER_SECOND
+    return None
+
+
+def build_jpeg_exif(
+    captured_at: datetime | None,
+    exposure_time: tuple[int, int] | None,
+) -> np.ndarray:
+    exif = Image.Exif()
+    exif[ExifTags.Base.Make] = CAMERA_MAKE
+    exif[ExifTags.Base.Model] = CAMERA_MODEL_NAME
+    exif[ExifTags.Base.Orientation] = 1
+    exif[ExifTags.Base.Software] = "nectar-preview"
+
+    exif_ifd = exif.get_ifd(ExifTags.IFD.Exif)
+    if captured_at is not None:
+        captured_at_text = captured_at.strftime(DNG_DATETIME_FORMAT)
+        exif[ExifTags.Base.DateTime] = captured_at_text
+        exif_ifd[ExifTags.Base.DateTimeOriginal] = captured_at_text
+    if exposure_time is not None:
+        exif_ifd[ExifTags.Base.ExposureTime] = TiffImagePlugin.IFDRational(
+            *exposure_time
+        )
+
+    exif_bytes = exif.tobytes()
+    if not exif_bytes.startswith(b"Exif\x00\x00"):
+        raise RuntimeError("Pillow produced an invalid EXIF payload")
+    return np.frombuffer(exif_bytes, dtype=np.uint8, offset=6)
+
+
+def write_jpeg(path: Path, bgr: np.ndarray, exif: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    written = cv2.imwriteWithMetadata(
+        str(path),
+        bgr,
+        [cv2.IMAGE_METADATA_EXIF],
+        [exif],
+    )
+    if not written:
+        raise OSError(f"failed to write JPEG: {path}")
+
+
 def write_linear_dng(
-    path: Path, raw_rgb: np.ndarray, white_balance: np.ndarray
+    path: Path,
+    raw_rgb: np.ndarray,
+    white_balance: np.ndarray,
+    *,
+    captured_at: datetime | None = None,
+    exposure_time: tuple[int, int] | None = None,
 ) -> None:
     if tifffile is None:
         raise RuntimeError(
@@ -195,6 +295,19 @@ def write_linear_dng(
             _rational_values(DNG_FORWARD_MATRIX_1, signed=True),
         ),  # ForwardMatrix1: white-balanced camera -> XYZ D50
     ]
+    captured_at_text = None
+    if captured_at is not None:
+        captured_at_text = captured_at.strftime(DNG_DATETIME_FORMAT)
+        extratags.append(
+            (
+                36867,
+                "s",
+                len(captured_at_text) + 1,
+                captured_at_text,
+            )
+        )  # DateTimeOriginal
+    if exposure_time is not None:
+        extratags.append((33434, "2I", 1, (exposure_time,)))  # ExposureTime
 
     tifffile.imwrite(
         path,
@@ -203,12 +316,59 @@ def write_linear_dng(
         planarconfig="contig",
         metadata=None,
         software="nectar-preview",
+        datetime=captured_at_text,
         extratags=extratags,
     )
 
 
+def sha1sum(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha1(usedforsecurity=False)
+    with path.open("rb") as file:
+        while chunk := file.read(chunk_size):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_hashed_linear_dng(
+    output_dir: Path,
+    name_prefix: str,
+    raw_rgb: np.ndarray,
+    white_balance: np.ndarray,
+    *,
+    capture_dir: Path | None = None,
+) -> tuple[Path, str]:
+    """Write a DNG and append the SHA-1 of its finalized bytes to its name."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    metadata_dir = capture_dir if capture_dir is not None else output_dir
+    with tempfile.NamedTemporaryFile(
+        dir=output_dir,
+        prefix=f".{name_prefix}_",
+        suffix=".dng",
+        delete=False,
+    ) as temporary_file:
+        temporary_path = Path(temporary_file.name)
+
+    try:
+        write_linear_dng(
+            temporary_path,
+            raw_rgb,
+            white_balance,
+            captured_at=parse_capture_datetime(metadata_dir),
+            exposure_time=parse_exposure_time(metadata_dir),
+        )
+        dng_sha1 = sha1sum(temporary_path)
+        dng_path = output_dir / f"{name_prefix}_{dng_sha1}.dng"
+        temporary_path.replace(dng_path)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+    return dng_path, dng_sha1
+
+
 # linescans = Path("/home/dllu/pictures/linescan")
 linescans = Path("/mnt/dataz/pictures/linescan")
+DEFAULT_OUTPUT_DIR = linescans / "raw"
 
 
 def format_contiguous_segments(indices):
@@ -443,6 +603,7 @@ def windowed_cross_correlation(
     corr_size: int = 15,
     output_dir: Path = None,
     jitter_models: ColumnJitterModel | None = None,
+    show_progress: bool = True,
 ) -> np.ndarray:
     """
     green_1: (h, w) where w >> h and w >> window_size
@@ -463,8 +624,11 @@ def windowed_cross_correlation(
         magnitude = np.sqrt(grad_x**2 + grad_y**2) + 0.1 * np.max(block)
         return grad_x / magnitude
 
-    for xi, x in tqdm(
-        enumerate(xs[1:-1]), desc="train speed estimation", total=len(xs)
+    for xi, x in progress(
+        enumerate(xs[1:-1]),
+        desc="train speed estimation",
+        total=len(xs),
+        show=show_progress,
     ):
         window_1 = green_1[:, x : x + window_step]
         if jitter_models is not None:
@@ -576,7 +740,15 @@ def windowed_cross_correlation(
 
 
 def robust_bspline_fit(
-    x, y, weights, smoothness, g: Path, num_iter=10, c=4.685, visualize: bool = False
+    x,
+    y,
+    weights,
+    smoothness,
+    g: Path,
+    num_iter=10,
+    c=4.685,
+    visualize: bool = False,
+    verbose: bool = True,
 ):
     """
     Fit a robust cubic B-spline to (x, y) data with given weights using iterative re-weighting.
@@ -685,11 +857,12 @@ def robust_bspline_fit(
             return unclamped_spline(np.clip(values, support_min, support_max))
 
         used_direction_fallback = True
-        print(
-            "speed fit: rejected reversal aliases; "
-            f"using {len(fit_x)}/{len(x)} high-confidence samples "
-            f"from {support_min:g} to {support_max:g}"
-        )
+        if verbose:
+            print(
+                "speed fit: rejected reversal aliases; "
+                f"using {len(fit_x)}/{len(x)} high-confidence samples "
+                f"from {support_min:g} to {support_max:g}"
+            )
 
     motion_dense = spline(np.linspace(np.min(x), np.max(x), 500))
     motion_magnitude = np.abs(motion_dense)
@@ -721,13 +894,14 @@ def robust_bspline_fit(
 
         current_weights = fit_weights
         used_constant_fallback = True
-        print(
-            "speed fit: "
-            f"{dynamic_range:.2f}x dynamic range exceeds "
-            f"{SPEED_MAX_FIT_DYNAMIC_RANGE:.2f}x; using robust constant "
-            f"{constant_motion:.6f} from {len(fit_x)}/{len(x)} "
-            "high-confidence samples"
-        )
+        if verbose:
+            print(
+                "speed fit: "
+                f"{dynamic_range:.2f}x dynamic range exceeds "
+                f"{SPEED_MAX_FIT_DYNAMIC_RANGE:.2f}x; using robust constant "
+                f"{constant_motion:.6f} from {len(fit_x)}/{len(x)} "
+                "high-confidence samples"
+            )
 
     # Plot the original data and the fitted spline with weights below.
     fig, (ax1, ax2) = plt.subplots(
@@ -796,7 +970,11 @@ def sharpen(rgb: np.ndarray) -> np.ndarray:
 
 
 def patch_denoise(
-    data: np.ndarray, neighbour_size: int = 64, similarity_thresh: float = 3
+    data: np.ndarray,
+    neighbour_size: int = 64,
+    similarity_thresh: float = 3,
+    *,
+    show_progress: bool = True,
 ):
     # Patch-based denoising by searching horizontally along rows for similar 3x3 patches.
     denoised = data.copy().astype(np.float32)  # Ensure float32 for speed/memory.
@@ -813,7 +991,11 @@ def patch_denoise(
     time_bc = 0
     time_cd = 0
 
-    for row in tqdm(range(1, height - 1), desc="denoising"):
+    for row in progress(
+        range(1, height - 1),
+        desc="denoising",
+        show=show_progress,
+    ):
         time_a = time.time()
 
         # Extract features (27 x N, float32).
@@ -900,7 +1082,8 @@ def patch_denoise(
         time_bc += time_c - time_b
         time_cd += time_d - time_c
 
-    print("times", time_ab, time_bc, time_cd)
+    if show_progress:
+        print("times", time_ab, time_bc, time_cd)
     return denoised
 
 
@@ -913,16 +1096,22 @@ def bin2to1(data):
     return (data[::2, ::2] + data[1::2, ::2] + data[::2, 1::2] + data[1::2, 1::2]) / 4
 
 
-def estimate_white_balance(bin_paths, max_samples: int = 8) -> np.ndarray:
+def estimate_white_balance(
+    bin_paths,
+    max_samples: int = 8,
+    *,
+    show_progress: bool = True,
+) -> np.ndarray:
     if not bin_paths:
         return np.ones(3, dtype=np.float32)
 
     channel_sum = np.zeros(3, dtype=np.float64)
     total_pixels = 0
 
-    for bin_path in tqdm(
+    for bin_path in progress(
         bin_paths[:max_samples],
         desc="white balance",
+        show=show_progress,
     ):
         dat1 = np.fromfile(bin_path, dtype=np.uint16).astype(np.float32)
         dat1_reshaped = np.reshape(dat1, (-1, 4096)).T
@@ -961,14 +1150,17 @@ def get_percentile(hist, bin_edges, total, percent):
     return bin_edges[idx] + frac * bin_width
 
 
-def autoexposure(selected_bins, white_balance):
+def autoexposure(selected_bins, white_balance, *, show_progress: bool = True):
     num_bins = 65536
     bin_edges = np.arange(0, num_bins + 1, dtype=np.float64)
     histogram = np.zeros(num_bins, dtype=np.int64)
     total_values = 0
 
-    for i, bin in tqdm(
-        enumerate(selected_bins), total=len(selected_bins), desc="autoexposure"
+    for i, bin in progress(
+        enumerate(selected_bins),
+        total=len(selected_bins),
+        desc="autoexposure",
+        show=show_progress,
     ):
         dat1 = np.fromfile(bin, dtype=np.uint16).astype(np.float32)
         dat1_reshaped = np.reshape(dat1, (-1, 4096)).T
@@ -1705,11 +1897,11 @@ def refine_column_exposure_jitter_correction(
         (JITTER_GREEN1, green1),
         (JITTER_GREEN2, green2),
     )
-    for core_start in tqdm(
+    for core_start in progress(
         range(0, image_width, block_columns),
         total=math.ceil(image_width / block_columns),
         desc="aligned green gradient scale",
-        disable=not show_progress,
+        show=show_progress,
     ):
         core_stop = min(image_width, core_start + block_columns)
         sample_start = int(
@@ -1793,11 +1985,11 @@ def refine_column_exposure_jitter_correction(
         JITTER_SCENE_PROTECTION_DILATE_COLUMNS,
     )
     fine_read_radius = protection_radius + alignment_margin
-    for core_start in tqdm(
+    for core_start in progress(
         range(0, image_width, block_columns),
         total=math.ceil(image_width / block_columns),
         desc="fine residual jitter",
-        disable=not show_progress,
+        show=show_progress,
     ):
         core_stop = min(image_width, core_start + block_columns)
         read_start = max(0, core_start - fine_read_radius)
@@ -2050,11 +2242,11 @@ def column_exposure_jitter_correction(
     radius = temporal_window // 2
     block_starts = range(0, image_width, block_columns)
 
-    for core_start in tqdm(
+    for core_start in progress(
         block_starts,
         total=math.ceil(image_width / block_columns),
         desc="column exposure jitter",
-        disable=not show_progress,
+        show=show_progress,
     ):
         core_stop = min(image_width, core_start + block_columns)
         read_start = max(0, core_start - radius)
@@ -2297,6 +2489,7 @@ def sample_motion_corrected_chunks(
     jitter_models=None,
     jitter_protect_scene: bool = True,
     step_scales=None,
+    show_progress: bool = True,
 ):
     indices = list(range(0, len(sample_positions), stride_x))
     if not indices:
@@ -2320,10 +2513,11 @@ def sample_motion_corrected_chunks(
         out_width = len(use_indices)
         raw_sampled = np.zeros((2 * green1.height, out_width, 3), dtype=np.float32)
 
-        for j, sample_idx in tqdm(
+        for j, sample_idx in progress(
             enumerate(use_indices),
             total=len(use_indices),
             desc="sampling chunk",
+            show=show_progress,
         ):
             xi = sample_positions[sample_idx]
             wi = widths[sample_idx]
@@ -2434,6 +2628,7 @@ def sample_skew_corrected_green_chunks(
     stride_y: int = 1,
     max_pix: int = 16384,
     jitter_models=None,
+    show_progress: bool = True,
 ):
     """
     Produce the speed-corrected green image used for zero-skew fitting.
@@ -2517,10 +2712,11 @@ def sample_skew_corrected_green_chunks(
             (2 * image_height, len(use_indices)),
             dtype=np.float32,
         )
-        for j, sample_idx in tqdm(
+        for j, sample_idx in progress(
             enumerate(use_indices),
             total=len(use_indices),
             desc="sampling skew chunk",
+            show=show_progress,
         ):
             xi = sample_positions[sample_idx]
             wi = widths[sample_idx]
@@ -2602,6 +2798,7 @@ def estimate_skew_hough(
     bins: int = 69,
     energy_percentile: float = 98,
     write_debug: bool = False,
+    show_progress: bool = True,
 ):
     skews = np.linspace(skew_min, skew_max, bins, dtype=np.float32)
     scores = np.zeros_like(skews, dtype=np.float64)
@@ -2622,7 +2819,11 @@ def estimate_skew_hough(
                 selected.append(int(idx))
         return np.array(selected, dtype=np.int32)
 
-    for _chunk_i, chunk in tqdm(chunk_iter, desc="estimating skew"):
+    for _chunk_i, chunk in progress(
+        chunk_iter,
+        desc="estimating skew",
+        show=show_progress,
+    ):
         if chunk.size == 0:
             continue
         if chunk.ndim == 2:
@@ -2766,8 +2967,18 @@ def estimate_skew_hough(
 def process_preview(
     g: Path,
     padding: int = 10,
-):
+    *,
+    show_progress: bool = True,
+    output_dir: Path = DEFAULT_OUTPUT_DIR,
+) -> int:
     bins = sorted(list(g.glob("*.bin")))
+    capture_timestamp = g.name
+    output_dir = Path(output_dir).expanduser()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    jpeg_exif = build_jpeg_exif(
+        parse_capture_datetime(g),
+        parse_exposure_time(g),
+    )
 
     downsample_steps = int(math.log2(STRUCTURE_MASK_DOWNSAMPLE))
     if 2**downsample_steps != STRUCTURE_MASK_DOWNSAMPLE:
@@ -2777,7 +2988,12 @@ def process_preview(
     max_green_down = 0
     jitter_black_levels = np.full(4, np.inf, dtype=np.float32)
     jitter_white_levels = np.full(4, -np.inf, dtype=np.float32)
-    for i, bin in tqdm(enumerate(bins), total=len(bins)):
+    for i, bin in progress(
+        enumerate(bins),
+        total=len(bins),
+        desc="scanning raw frames",
+        show=show_progress,
+    ):
         dat1 = np.fromfile(bin, dtype=np.uint16).astype(np.float32)
         dat1_reshaped = np.reshape(dat1, (-1, 4096)).T
         raw_green = dat1_reshaped[1::2, 1::2]
@@ -2804,7 +3020,12 @@ def process_preview(
         max_green_down = max(max_green_down, np.max(raw_green_down))
 
     scores = []
-    for i, bin in tqdm(enumerate(bins), total=len(bins), desc="finding moving region"):
+    for i, bin in progress(
+        enumerate(bins),
+        total=len(bins),
+        desc="finding moving region",
+        show=show_progress,
+    ):
         dat1 = np.fromfile(bin, dtype=np.uint16).astype(np.float32)
         dat1_reshaped = np.reshape(dat1, (-1, 4096)).T
 
@@ -2828,14 +3049,23 @@ def process_preview(
     selected = sorted(list(selected))
     if FORCE_CONTIGUOUS_SELECTION and selected:
         selected = list(range(selected[0], selected[-1] + 1))
-    print("selected", format_contiguous_segments(selected))
+    if show_progress:
+        print("selected", format_contiguous_segments(selected))
 
     selected_bins = [bins[s] for s in selected]
 
-    white_balance = estimate_white_balance(selected_bins)
-    print("white balance", white_balance)
+    white_balance = estimate_white_balance(
+        selected_bins,
+        show_progress=show_progress,
+    )
+    if show_progress:
+        print("white balance", white_balance)
 
-    p2, p98 = autoexposure(selected_bins, white_balance)
+    p2, p98 = autoexposure(
+        selected_bins,
+        white_balance,
+        show_progress=show_progress,
+    )
 
     # lazily load binary data across selected files without full-memory concatenation
     cache = FileDataCache(selected_bins, dtype=np.uint16, rows=4096)
@@ -2848,8 +3078,11 @@ def process_preview(
 
     energy_bins = []
     green_bins = []
-    for i, _bin_path in tqdm(
-        enumerate(selected_bins), total=len(selected_bins), desc="stripe mask"
+    for i, _bin_path in progress(
+        enumerate(selected_bins),
+        total=len(selected_bins),
+        desc="stripe mask",
+        show=show_progress,
     ):
         start = cache.cum_cols[i] // green1.col_step
         stop = cache.cum_cols[i + 1] // green1.col_step
@@ -2906,12 +3139,14 @@ def process_preview(
             white_levels=jitter_white_levels,
             structure_mask=mask_full,
             structure_mask_scale=STRUCTURE_MASK_DOWNSAMPLE,
+            show_progress=show_progress,
         )
 
     sample_xs, sample_ys, _weights = windowed_cross_correlation(
         green1,
         green2,
         jitter_models=jitter_models,
+        show_progress=show_progress,
     )
     spline = robust_bspline_fit(
         x=sample_xs,
@@ -2920,6 +3155,7 @@ def process_preview(
         smoothness=80000,
         visualize=False,
         g=g,
+        verbose=show_progress,
     )
     green_displacements = np.interp(
         np.arange(green1.width, dtype=np.float64),
@@ -2929,7 +3165,8 @@ def process_preview(
         right=sample_ys[-1],
     )
 
-    print(g, len(bins), data.shape)
+    if show_progress:
+        print(g, len(bins), data.shape)
 
     sample_positions, widths, step_scales = generate_sample_positions(
         spline, sample_xs, green1.width
@@ -2949,14 +3186,17 @@ def process_preview(
             stride_y=hough_stride,
             max_pix=skew_chunk_size,
             jitter_models=jitter_models,
+            show_progress=show_progress,
         ),
         g=g,
         stride_x=hough_stride,
         stride_y=hough_stride,
         write_debug=ENABLE_SKEW_DEBUG_OUTPUT,
+        show_progress=show_progress,
     )
 
-    print("estimated skew", skew)
+    if show_progress:
+        print("estimated skew", skew)
 
     # Geometry is now final. The optional motion-aligned residual and
     # scene-protection mask are rendering safeguards, not inputs to either
@@ -2970,6 +3210,7 @@ def process_preview(
             green2,
             blue_view,
             green_displacements,
+            show_progress=show_progress,
         )
     if ENABLE_JITTER_DEBUG_PLOT and jitter_models is not None:
         row_idx = min(JITTER_DEBUG_ROW, green1.height - 1)
@@ -3067,17 +3308,25 @@ def process_preview(
         max_pix=chunk_size,
         jitter_models=jitter_models,
         step_scales=step_scales,
+        show_progress=show_progress,
     ):
         output_chunk_i = (
             output_chunk_count - 1 - chunk_i if FLIP_OUTPUT_180 else chunk_i
         )
-        out_name = f"rgb_{output_chunk_i:02d}_cfpeak_deskewed_jitter"
+        name_prefix = f"{capture_timestamp}_NECTA{output_chunk_i:04d}"
         # denoised_sampled = patch_denoise(raw_sampled)
         denoised_sampled = raw_sampled
         dng_sampled = denoised_sampled
         if FLIP_OUTPUT_180:
             dng_sampled = np.ascontiguousarray(dng_sampled[::-1, ::-1, :])
-        write_linear_dng(g / f"{out_name}_linear.dng", dng_sampled, white_balance)
+        _dng_path, dng_sha1 = write_hashed_linear_dng(
+            output_dir,
+            name_prefix,
+            dng_sampled,
+            white_balance,
+            capture_dir=g,
+        )
+        out_name = f"{name_prefix}_{dng_sha1}"
         # calibrate, clip, sharpen, tone-map
         rgb = apply_color_transform(denoised_sampled, white_balance)
         rgb = np.clip(rgb, 0, 65536)
@@ -3093,8 +3342,7 @@ def process_preview(
         rgb_u8 = rgb[:, :, ::-1].astype(np.uint8)
         if FLIP_OUTPUT_180:
             rgb_u8 = np.ascontiguousarray(rgb_u8[::-1, ::-1, :])
-        for ext in (".jpg", ".png"):
-            cv2.imwrite(str(g / (out_name + ext)), rgb_u8)
+        write_jpeg(output_dir / f"{out_name}.jpg", rgb_u8, jpeg_exif)
 
         rgb_float = rgb_u8.astype(np.float32)
         binned = np.stack(
@@ -3107,7 +3355,13 @@ def process_preview(
         if FLIP_OUTPUT_180:
             stacked_preview = stacked_preview[::-1]
         stacked = np.vstack(stacked_preview)
-        cv2.imwrite(str(g / "preview_stack.jpg"), stacked)
+        write_jpeg(
+            output_dir / f"{capture_timestamp}_stack.jpg",
+            stacked,
+            jpeg_exif,
+        )
+
+    return len(sample_positions)
 
 
 def _parse_args(argv=None):
@@ -3118,6 +3372,12 @@ def _parse_args(argv=None):
         "captures",
         nargs="*",
         help=(f"capture directories; relative names are resolved under {linescans}"),
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIR,
+        help=f"directory for final DNG and JPEG files (default: {DEFAULT_OUTPUT_DIR})",
     )
     parser.add_argument(
         "--jitter",
@@ -3158,6 +3418,7 @@ def main(argv=None):
     ENABLE_JITTER_DEBUG_PLOT = args.jitter_debug
     ENABLE_SKEW_DEBUG_OUTPUT = args.skew_debug
     FLIP_OUTPUT_180 = args.flip_output_180
+    output_dir = args.output_dir.expanduser()
 
     if args.captures:
         candidates = []
@@ -3180,16 +3441,25 @@ def main(argv=None):
             print("skipping directory", candidate)
 
     if len(dirs) == 1:
-        process_preview(dirs[0])
+        process_preview(dirs[0], output_dir=output_dir)
         return
 
     with ThreadPoolExecutor(max_workers=max(1, args.max_workers)) as executor:
-        future_map = {executor.submit(process_preview, g): g for g in dirs}
+        future_map = {
+            executor.submit(
+                process_preview,
+                g,
+                show_progress=False,
+                output_dir=output_dir,
+            ): g
+            for g in dirs
+        }
         try:
             for future in as_completed(future_map):
                 g = future_map[future]
                 try:
-                    future.result()
+                    final_width = future.result()
+                    print(f"{g} final_width={final_width}")
                 except Exception as e:
                     print(f"oh no! {g} {e}")
         except KeyboardInterrupt:
