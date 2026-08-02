@@ -207,8 +207,8 @@ their real edges; no vertical correction field crossed those surfaces.
 - preservation of a structure-masked scene feature;
 - rejection of neighbor interpolation inside an unsupported owner band;
 - rejection and endpoint clamping of direction-reversal aliases;
-- constant-speed fallback for catastrophic dynamic range while preserving a
-  supported moderate speed change.
+- preservation of supported large and moderate one-direction speed changes
+  without an arbitrary dynamic-range cap.
 
 `python -m py_compile` and `git diff --check` also pass. No source `.bin` file,
 capture setting, or C++ capture path was modified.

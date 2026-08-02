@@ -628,6 +628,60 @@ class ColumnJitterCorrectionTest(unittest.TestCase):
             delta=0.05,
         )
 
+    def test_static_background_produces_no_speed_samples(self):
+        height = 64
+        width = 512
+        # A real static background may vary vertically, but every captured
+        # column repeats it. There is no horizontal motion evidence to fit.
+        background = np.linspace(
+            2000.0,
+            50000.0,
+            height,
+            dtype=np.float32,
+        )[:, None]
+        background = np.repeat(background, width, axis=1)
+        structure_mask = np.zeros((height // 8, width // 8), dtype=bool)
+
+        sample_xs, displacements, weights = preview.windowed_cross_correlation(
+            background,
+            background.copy(),
+            window_step=16,
+            window_size=64,
+            corr_size=9,
+            structure_mask=structure_mask,
+            structure_mask_scale=8,
+            show_progress=False,
+        )
+
+        self.assertEqual(sample_xs.size, 0)
+        self.assertEqual(displacements.size, 0)
+        self.assertEqual(weights.size, 0)
+
+    def test_speed_sample_x_is_center_of_its_actual_source_window(self):
+        rng = np.random.default_rng(19)
+        height = 32
+        width = 512
+        scene = rng.normal(10000.0, 1000.0, (height, width)).astype(np.float32)
+        green2 = np.empty_like(scene)
+        green2[:, :2] = scene[:, :1]
+        green2[:, 2:] = scene[:, :-2]
+
+        sample_xs, displacements, _weights = preview.windowed_cross_correlation(
+            scene,
+            green2,
+            window_step=16,
+            window_size=64,
+            corr_size=9,
+            structure_mask=np.ones((height, width), dtype=bool),
+            show_progress=False,
+        )
+
+        self.assertGreater(sample_xs.size, 0)
+        # Four blocks beginning at x=16, 32, 48, and 64 cover [16, 80),
+        # whose actual center is x=48. The old implementation mislabeled it.
+        self.assertEqual(float(sample_xs[0]), 48.0)
+        self.assertAlmostEqual(float(np.median(displacements)), 2.0, delta=0.05)
+
     def test_geometry_sampling_bypasses_scene_relative_rendering_limit(self):
         class ArrayView:
             def __init__(self, values):
@@ -820,13 +874,13 @@ class ColumnJitterCorrectionTest(unittest.TestCase):
                 g=Path(output_dir),
             )
 
-        # The fallback clamps extrapolation to the supported interval, so the
-        # rejected opposite-direction aliases cannot reappear at either end.
+        # Direction-preserving extrapolation keeps the rejected
+        # opposite-direction aliases from reappearing at either end.
         fitted = spline(np.linspace(-100.0, 100.0, 1000))
         self.assertTrue(np.all(fitted < 0.0))
         np.testing.assert_allclose(fitted, -0.3, atol=1e-9, rtol=0.0)
 
-    def test_speed_fit_rejects_catastrophic_dynamic_range(self):
+    def test_speed_fit_smoothly_extrapolates_large_supported_change(self):
         x = np.arange(80, dtype=np.float64)
         y = np.linspace(-0.15, -0.45, len(x))
         weights = np.ones_like(x)
@@ -840,8 +894,13 @@ class ColumnJitterCorrectionTest(unittest.TestCase):
                 g=Path(output_dir),
             )
 
-        fitted = spline(np.linspace(-100.0, 200.0, 1000))
-        np.testing.assert_allclose(fitted, -0.3, atol=0.002, rtol=0.0)
+        fitted = spline(x)
+        self.assertLess(fitted[-1], fitted[0] - 0.25)
+        np.testing.assert_allclose(fitted, y, atol=0.002, rtol=0.0)
+        extrapolated = spline(np.array([-100.0, 200.0]))
+        self.assertTrue(np.all(extrapolated < 0.0))
+        self.assertNotAlmostEqual(extrapolated[0], fitted[0])
+        self.assertNotAlmostEqual(extrapolated[1], fitted[-1])
 
     def test_speed_fit_preserves_supported_moderate_change(self):
         x = np.arange(80, dtype=np.float64)

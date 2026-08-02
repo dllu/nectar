@@ -9,6 +9,7 @@ dependencies = [
     "numpy>=1.26",
     "opencv-python>=4.13",
     "pillow>=10",
+    "pyside6-essentials>=6.8",
     "scipy>=1.11",
     "tifffile>=2024.2",
     "tqdm>=4.66",
