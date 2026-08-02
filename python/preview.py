@@ -27,7 +27,7 @@ from numpy.lib.stride_tricks import sliding_window_view
 import numpy as np
 from PIL import ExifTags, Image, TiffImagePlugin
 from scipy.optimize import least_squares, minimize_scalar
-from scipy.interpolate import CubicSpline, UnivariateSpline
+from scipy.interpolate import CubicSpline
 from scipy.ndimage import gaussian_filter1d
 from tqdm import tqdm
 import itertools
@@ -88,13 +88,29 @@ JITTER_SCENE_PROTECTION_DILATE_COLUMNS = 256
 JITTER_SCENE_PROTECTION_FEATHER_COLUMNS = 3.0
 JITTER_SCENE_PROTECTION_FEATHER_BANDS = 0.75
 SPEED_CONSTRAINTS_JSON = "speed_constraints.json"
+SPEED_CORRELATION_KNOT_SPACING = 16384.0
+SPEED_CORRELATION_LOG_SIGMA = 0.03
+SPEED_CORRELATION_CURVATURE_LENGTH = 8192.0
+SPEED_CORRELATION_CURVATURE_SAMPLE_SPACING = 512.0
+SPEED_CORRELATION_CURVATURE_LOG_SIGMA = 0.05
+SPEED_CORRELATION_VERTICAL_HIGHPASS_SIGMA = 4.0
+SPEED_CORRELATION_BAND_MIN_PEAK = 0.8
+SPEED_CORRELATION_BAND_MIN_CONTRAST = 0.01
+SPEED_CORRELATION_BAND_TRIM_FRACTION = 0.15
+SPEED_CORRELATION_MIN_VALID_BANDS = 4
+SPEED_CORRELATION_ESTIMATOR_AGREEMENT = 0.2
 SPEED_CONSTRAINT_KNOT_SPACING = 8192.0
 SPEED_CONSTRAINT_PRIOR_LOG_SIGMA = 0.2
 SPEED_CONSTRAINT_CURVATURE_LENGTH = 8192.0
 SPEED_CONSTRAINT_CURVATURE_SAMPLE_SPACING = 512.0
 SPEED_CONSTRAINT_CURVATURE_LOG_SIGMA = 0.05
-SPEED_CIRCLE_LOG_SIGMA = 0.00003
-SPEED_EQUAL_WIDTH_LOG_SIGMA = 0.00003
+# Hand-placed bounds are not metrology. Even a careful one-pixel error on a
+# roughly 100-pixel feature is already a percent-level speed error, so manual
+# annotations guide the stiff fit instead of acting as exact interpolation
+# points.
+SPEED_CIRCLE_LOG_SIGMA = 0.01
+SPEED_EQUAL_WIDTH_LOG_SIGMA = 0.01
+SPEED_CIRCLE_DIMENSION_SIGMA_PIXELS = 1.5
 OUTPUT_CHUNK_TARGET = 32768
 MAX_CONCURRENT_RENDERS = 2
 JITTER_RED = 0
@@ -528,6 +544,16 @@ class CircleSpeedConstraint:
         # full-resolution output rows.  A corrected circle therefore requires
         # width / |speed| == 2 * height.
         return self.width / (2.0 * self.height)
+
+    @property
+    def log_speed_sigma(self) -> float:
+        """Propagate pixel-scale diameter uncertainty into the speed ratio."""
+        dimension_sigma = SPEED_CIRCLE_DIMENSION_SIGMA_PIXELS
+        annotation_sigma = math.hypot(
+            dimension_sigma / self.width,
+            dimension_sigma / self.height,
+        )
+        return max(SPEED_CIRCLE_LOG_SIGMA, annotation_sigma)
 
 
 @dataclass(frozen=True)
@@ -1003,19 +1029,22 @@ def windowed_cross_correlation(
     window_step: int = 256,
     window_size: int = 4096,
     corr_size: int = 15,
-    output_dir: Path = None,
+    output_dir: Path | None = None,
     jitter_models: ColumnJitterModel | None = None,
     structure_mask: np.ndarray | None = None,
     structure_mask_scale: int = 1,
     valid_x_range: tuple[float, float] | None = None,
     show_progress: bool = True,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Estimate green-plane displacement only where scene evidence exists.
 
     A fixed line-scan background is constant along capture x.  Its displacement
     is therefore undefined, rather than zero or whichever random lag happens to
     win.  Each result must contain at least one full-height-equivalent vertical
-    edge and an absolute, distinct normalized-correlation peak.
+    edge and an absolute, distinct normalized-correlation peak. When a scene
+    mask is available, normalized matches from its vertical bands are combined
+    robustly so one energetic patch cannot overrule motion seen across the
+    vehicle.
     """
     if green_1.shape != green_2.shape:
         raise ValueError("green channels must have the same shape")
@@ -1067,10 +1096,10 @@ def windowed_cross_correlation(
     ncc_green2_energy = np.empty_like(l1_profiles)
     green1_energy = np.empty(block_starts.size, dtype=np.float64)
     internal_structure = np.empty(block_starts.size, dtype=np.float64)
-    # Averaging small vertical bands suppresses the one-row Bayer offset and
-    # lets the fractional registration describe horizontal motion rather than
-    # the particular texture around an integer-lag peak. At production height
-    # this is 128 x width (about 82 MiB per green for a 160k-column capture).
+    # After the two greens are aligned below, averaging small vertical bands
+    # suppresses sensor noise and lets fractional registration use distributed
+    # scene evidence instead of one particular edge. At production height this
+    # is 128 x width (about 82 MiB per green for a 160k-column capture).
     compact_band_count = min(128, height)
     compact_rows = (height // compact_band_count) * compact_band_count
     compact_file = tempfile.TemporaryFile()
@@ -1083,13 +1112,57 @@ def windowed_cross_correlation(
     compact_features[:] = 0.0
     compact_green1 = compact_features[0]
     compact_green2 = compact_features[1]
+    compact_structure = None
+    if structure_mask is not None and structure_mask.size:
+        # Preserve the mask's inexpensive horizontal downsampling, but put its
+        # rows on the same vertical bands as the compact registration features.
+        # Area resampling gives each band the fraction covered by real scene
+        # edges; it does not spread those edges into neighboring x positions.
+        vertical_interpolation = (
+            cv2.INTER_AREA
+            if structure_mask.shape[0] >= compact_band_count
+            else cv2.INTER_NEAREST
+        )
+        compact_structure = cv2.resize(
+            structure_mask.astype(np.float32),
+            (structure_mask.shape[1], compact_band_count),
+            interpolation=vertical_interpolation,
+        )
 
     def compact_vertical(block: np.ndarray) -> np.ndarray:
-        return block[:compact_rows].reshape(
+        compact = block[:compact_rows].reshape(
             compact_band_count,
             compact_rows // compact_band_count,
             block.shape[1],
         ).mean(axis=1)
+        # A fixed line-scan background and residual line-wide exposure changes
+        # are vertically broad. They carry no vehicle-motion information but
+        # otherwise add a strong zero-lag component to fractional registration.
+        compact -= gaussian_filter1d(
+            compact,
+            sigma=SPEED_CORRELATION_VERTICAL_HIGHPASS_SIGMA,
+            axis=0,
+            mode="nearest",
+        )
+        return compact
+
+    def align_green_rows(block: np.ndarray, channel: int) -> np.ndarray:
+        """Put both Bayer greens on the plane halfway between their rows."""
+        # G1 is sampled at raw rows 1, 3, ... and G2 at rows 0, 2, .... Row
+        # averaging alone does not remove that one-raw-row parallax: a slanted
+        # edge then masquerades as horizontal motion. Interpolating both
+        # channels by half a raw row gives them matched vertical blur as well
+        # as a common sampling plane.
+        aligned = np.asarray(block, dtype=np.float32).copy()
+        if len(aligned) <= 1:
+            return aligned
+        if channel == JITTER_GREEN1:
+            aligned[1:] = 0.75 * block[1:] + 0.25 * block[:-1]
+        elif channel == JITTER_GREEN2:
+            aligned[:-1] = 0.75 * block[:-1] + 0.25 * block[1:]
+        else:
+            raise ValueError("green row alignment requires a green channel")
+        return aligned
 
     def vertical_energy(block: np.ndarray) -> np.ndarray:
         grad_y, grad_x = np.gradient(block)
@@ -1112,6 +1185,7 @@ def windowed_cross_correlation(
                 JITTER_GREEN1,
                 protect_scene=False,
             )
+        window_1 = align_green_rows(window_1, JITTER_GREEN1)
         compact_green1[:, int(x) : int(x) + window_step] = compact_vertical(
             window_1[:, 1 : window_step + 1]
         )
@@ -1129,6 +1203,7 @@ def windowed_cross_correlation(
                 JITTER_GREEN2,
                 protect_scene=False,
             )
+        window_2_base = align_green_rows(window_2_base, JITTER_GREEN2)
         compact_green2[
             :, green2_start : int(x) + window_step + margin
         ] = compact_vertical(window_2_base)
@@ -1183,6 +1258,7 @@ def windowed_cross_correlation(
     refined_ys = []
     absolute_weights = []
     diagnostic_profiles = []
+    band_consensus_count = 0
     for end_index in range(blocks_per_window - 1, block_starts.size):
         start_index = end_index - blocks_per_window + 1
         window_start = int(block_starts[start_index])
@@ -1225,32 +1301,15 @@ def windowed_cross_correlation(
             out=np.zeros_like(ncc_numerator),
             where=ncc_denominator > 0.0,
         )
-        l1_peak_idx = int(np.argmax(l1_profile))
-        ncc_peak_idx = int(np.argmax(ncc_profile))
-        if l1_peak_idx <= 0 or l1_peak_idx >= corr_size - 1:
-            continue
-        if abs(l1_peak_idx - ncc_peak_idx) > 1:
-            continue
-
-        peak_idx = l1_peak_idx
-        peak_correlation = float(ncc_profile[peak_idx])
-        peak_contrast = peak_correlation - float(np.median(ncc_profile))
-        # These are absolute correlation-quality tests, not capture-relative
-        # percentiles. Random background noise is not promoted merely because
-        # it is the least-bad window in an otherwise empty capture.
-        if peak_correlation < 0.02 or peak_contrast < 0.01:
-            continue
-
         feature_1 = compact_green1[:, window_start:window_stop].copy()
-        feature_1 -= np.mean(feature_1, axis=1, keepdims=True)
-        feature_1_energy = float(np.sum(np.square(feature_1)))
         feature_2_base = compact_green2[
             :, window_start - margin : window_stop + margin
         ]
-        if feature_1_energy <= 0.0:
-            continue
+        diagnostic_profile = ncc_profile
+        legacy_registration = None
+        used_band_consensus = compact_structure is not None
 
-        def fractional_registration_objective(displacement: float) -> float:
+        def interpolated_feature_2(displacement: float) -> np.ndarray | None:
             integer = math.floor(displacement)
             fraction = displacement - integer
             index = margin + integer
@@ -1259,24 +1318,238 @@ def windowed_cross_correlation(
             p2 = feature_2_base[:, index + 1 : index + 1 + window_size]
             p3 = feature_2_base[:, index + 2 : index + 2 + window_size]
             if min(p0.shape[1], p1.shape[1], p2.shape[1], p3.shape[1]) < window_size:
-                return 1.0
+                return None
             # Catmull-Rom interpolation preserves the sampled values at each
             # integer lag while providing a smooth one-dimensional objective.
-            feature_2 = 0.5 * (
+            return 0.5 * (
                 2.0 * p1
                 + (-p0 + p2) * fraction
                 + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * fraction**2
                 + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * fraction**3
             )
-            feature_2 = feature_2 - np.mean(feature_2, axis=1, keepdims=True)
-            denominator = math.sqrt(
-                feature_1_energy * float(np.sum(np.square(feature_2)))
-            )
-            if denominator <= 0.0:
-                return 1.0
-            return -float(np.sum(feature_1 * feature_2)) / denominator
 
-        coarse_displacement = peak_idx - corr_half
+        if compact_structure is None:
+            l1_peak_idx = int(np.argmax(l1_profile))
+            ncc_peak_idx = int(np.argmax(ncc_profile))
+            if l1_peak_idx <= 0 or l1_peak_idx >= corr_size - 1:
+                continue
+            if abs(l1_peak_idx - ncc_peak_idx) > 1:
+                continue
+
+            peak_idx = l1_peak_idx
+            coarse_displacement = peak_idx - corr_half
+            peak_correlation = float(ncc_profile[peak_idx])
+            peak_contrast = peak_correlation - float(np.median(ncc_profile))
+            # These are absolute correlation-quality tests, not capture-relative
+            # percentiles. Random background noise is not promoted merely because
+            # it is the least-bad window in an otherwise empty capture.
+            if peak_correlation < 0.02 or peak_contrast < 0.01:
+                continue
+
+            feature_1 -= np.mean(feature_1, axis=1, keepdims=True)
+            feature_1_energy = float(np.sum(np.square(feature_1)))
+            if feature_1_energy <= 0.0:
+                continue
+
+            def fractional_registration_objective(displacement: float) -> float:
+                feature_2 = interpolated_feature_2(displacement)
+                if feature_2 is None:
+                    return 1.0
+                feature_2 -= np.mean(feature_2, axis=1, keepdims=True)
+                denominator = math.sqrt(
+                    feature_1_energy * float(np.sum(np.square(feature_2)))
+                )
+                if denominator <= 0.0:
+                    return 1.0
+                return -float(np.sum(feature_1 * feature_2)) / denominator
+
+        else:
+            mask_columns = (
+                np.arange(window_start, window_stop, dtype=np.int64)
+                // structure_mask_scale
+            )
+            if mask_columns[-1] >= compact_structure.shape[1]:
+                continue
+            band_weights = compact_structure[:, mask_columns]
+            band_support = np.sum(band_weights, axis=1, dtype=np.float64)
+            min_band_support = max(4.0, window_size / 128.0)
+            supported_bands = band_support >= min_band_support
+            if np.count_nonzero(supported_bands) < SPEED_CORRELATION_MIN_VALID_BANDS:
+                continue
+
+            safe_support = np.maximum(band_support, 1.0)
+            feature_1_mean = np.sum(
+                band_weights * feature_1, axis=1, dtype=np.float64
+            ) / safe_support
+            feature_1 -= feature_1_mean[:, None]
+            weighted_feature_1 = band_weights * feature_1
+            feature_1_band_energy = np.sum(
+                weighted_feature_1 * feature_1, axis=1, dtype=np.float64
+            )
+            supported_bands &= feature_1_band_energy > 0.0
+
+            def band_correlations(feature_2: np.ndarray) -> np.ndarray:
+                feature_2 = np.asarray(feature_2, dtype=np.float32).copy()
+                feature_2_mean = np.sum(
+                    band_weights * feature_2, axis=1, dtype=np.float64
+                ) / safe_support
+                feature_2 -= feature_2_mean[:, None]
+                feature_2_band_energy = np.sum(
+                    band_weights * np.square(feature_2),
+                    axis=1,
+                    dtype=np.float64,
+                )
+                denominator = np.sqrt(
+                    feature_1_band_energy * feature_2_band_energy
+                )
+                numerator = np.sum(
+                    weighted_feature_1 * feature_2,
+                    axis=1,
+                    dtype=np.float64,
+                )
+                return np.divide(
+                    numerator,
+                    denominator,
+                    out=np.full(compact_band_count, np.nan, dtype=np.float64),
+                    where=denominator > 0.0,
+                )
+
+            candidate_displacements = np.arange(
+                -corr_half + 1,
+                corr_half,
+                dtype=np.int64,
+            )
+            band_profiles = np.column_stack(
+                [
+                    band_correlations(
+                        feature_2_base[
+                            :,
+                            margin + displacement : margin
+                            + displacement
+                            + window_size,
+                        ]
+                    )
+                    for displacement in candidate_displacements
+                ]
+            )
+            quality_profiles = np.nan_to_num(band_profiles, nan=-1.0)
+            band_peak = np.max(quality_profiles, axis=1)
+            band_contrast = band_peak - np.median(quality_profiles, axis=1)
+            valid_bands = (
+                supported_bands
+                & (band_peak >= SPEED_CORRELATION_BAND_MIN_PEAK)
+                & (band_contrast >= SPEED_CORRELATION_BAND_MIN_CONTRAST)
+            )
+            if np.count_nonzero(valid_bands) < SPEED_CORRELATION_MIN_VALID_BANDS:
+                continue
+
+            def trimmed_band_mean(correlations: np.ndarray) -> float:
+                values = correlations[valid_bands]
+                values = values[np.isfinite(values)]
+                if values.size < SPEED_CORRELATION_MIN_VALID_BANDS:
+                    return -1.0
+                values.sort()
+                trim = int(values.size * SPEED_CORRELATION_BAND_TRIM_FRACTION)
+                if trim:
+                    values = values[trim:-trim]
+                return float(np.mean(values))
+
+            consensus_profile = np.asarray(
+                [
+                    trimmed_band_mean(band_profiles[:, index].copy())
+                    for index in range(band_profiles.shape[1])
+                ],
+                dtype=np.float64,
+            )
+            consensus_peak_idx = int(np.argmax(consensus_profile))
+            if consensus_peak_idx in (0, len(consensus_profile) - 1):
+                continue
+            coarse_displacement = int(
+                candidate_displacements[consensus_peak_idx]
+            )
+            peak_correlation = float(consensus_profile[consensus_peak_idx])
+            peak_contrast = peak_correlation - float(
+                np.median(consensus_profile)
+            )
+            if peak_correlation < 0.02 or peak_contrast < 0.01:
+                continue
+
+            diagnostic_profile = np.full(corr_size, np.nan, dtype=np.float64)
+            diagnostic_profile[1:-1] = consensus_profile
+
+            def fractional_registration_objective(displacement: float) -> float:
+                feature_2 = interpolated_feature_2(displacement)
+                if feature_2 is None:
+                    return 1.0
+                return -trimmed_band_mean(band_correlations(feature_2))
+
+            # Retain the established whole-window estimate whenever its
+            # subpixel optimum is genuinely inside the interval around the
+            # integer peak. The band consensus is specifically the escape
+            # route for rejected samples, optima pinned to that artificial
+            # +/-0.75 search boundary, and material disagreement with the
+            # structure-masked consensus. It should not perturb already sound
+            # measurements merely because it is available.
+            legacy_l1_peak_idx = int(np.argmax(l1_profile))
+            legacy_ncc_peak_idx = int(np.argmax(ncc_profile))
+            if (
+                0 < legacy_l1_peak_idx < corr_size - 1
+                and abs(legacy_l1_peak_idx - legacy_ncc_peak_idx) <= 1
+            ):
+                legacy_coarse_displacement = legacy_l1_peak_idx - corr_half
+                legacy_peak_correlation = float(
+                    ncc_profile[legacy_l1_peak_idx]
+                )
+                legacy_peak_contrast = legacy_peak_correlation - float(
+                    np.median(ncc_profile)
+                )
+                global_feature_1 = feature_1 - np.mean(
+                    feature_1,
+                    axis=1,
+                    keepdims=True,
+                )
+                global_feature_1_energy = float(
+                    np.sum(np.square(global_feature_1))
+                )
+
+                def legacy_fractional_objective(displacement: float) -> float:
+                    feature_2 = interpolated_feature_2(displacement)
+                    if feature_2 is None:
+                        return 1.0
+                    feature_2 -= np.mean(feature_2, axis=1, keepdims=True)
+                    denominator = math.sqrt(
+                        global_feature_1_energy
+                        * float(np.sum(np.square(feature_2)))
+                    )
+                    if denominator <= 0.0:
+                        return 1.0
+                    return (
+                        -float(np.sum(global_feature_1 * feature_2))
+                        / denominator
+                    )
+
+                if (
+                    legacy_peak_correlation >= 0.02
+                    and legacy_peak_contrast >= 0.01
+                    and global_feature_1_energy > 0.0
+                ):
+                    legacy_lower = max(
+                        -corr_half + 1.0e-4,
+                        legacy_coarse_displacement - 0.75,
+                    )
+                    legacy_upper = min(
+                        corr_half - 1.0e-4,
+                        legacy_coarse_displacement + 0.75,
+                    )
+                    candidate = minimize_scalar(
+                        legacy_fractional_objective,
+                        bounds=(legacy_lower, legacy_upper),
+                        method="bounded",
+                        options={"xatol": 1.0e-4, "maxiter": 32},
+                    )
+                    if candidate.success and math.isfinite(candidate.x):
+                        legacy_registration = candidate
+
         lower = max(-corr_half + 1.0e-4, coarse_displacement - 0.75)
         upper = min(corr_half - 1.0e-4, coarse_displacement + 0.75)
         registration = minimize_scalar(
@@ -1287,13 +1560,31 @@ def windowed_cross_correlation(
         )
         if not registration.success or not math.isfinite(registration.x):
             continue
+        if legacy_registration is not None:
+            boundary_clearance = min(
+                float(legacy_registration.x) - legacy_lower,
+                legacy_upper - float(legacy_registration.x),
+            )
+            estimator_disagreement = abs(
+                float(legacy_registration.x) - float(registration.x)
+            )
+            if (
+                boundary_clearance >= 0.01
+                and estimator_disagreement < SPEED_CORRELATION_ESTIMATOR_AGREEMENT
+            ):
+                registration = legacy_registration
+                coarse_displacement = legacy_coarse_displacement
+                peak_correlation = legacy_peak_correlation
+                peak_contrast = legacy_peak_contrast
+                diagnostic_profile = ncc_profile
+                used_band_consensus = False
         refined_peak = float(registration.x)
         fractional_correlation = -float(registration.fun)
         if not math.isfinite(fractional_correlation) or fractional_correlation <= 0.0:
             continue
         center_x = 0.5 * (window_start + window_stop)
         good_xs.append(center_x)
-        raw_ys.append(peak_idx - corr_half)
+        raw_ys.append(coarse_displacement)
         refined_ys.append(refined_peak)
         absolute_weights.append(
             math.sqrt(edge_equivalents)
@@ -1301,7 +1592,8 @@ def windowed_cross_correlation(
             * peak_contrast
             * fractional_correlation
         )
-        diagnostic_profiles.append(ncc_profile.copy())
+        diagnostic_profiles.append(diagnostic_profile.copy())
+        band_consensus_count += int(used_band_consensus)
 
     good_xs = np.asarray(good_xs, dtype=np.float64)
     raw_ys = np.asarray(raw_ys, dtype=np.float64)
@@ -1309,6 +1601,11 @@ def windowed_cross_correlation(
     weights = np.asarray(absolute_weights, dtype=np.float64)
     if weights.size:
         weights /= np.max(weights)
+    if show_progress and compact_structure is not None and good_xs.size:
+        print(
+            "speed correlation: used vertical-band consensus for "
+            f"{band_consensus_count}/{good_xs.size} windows"
+        )
 
     compact_features.flush()
     compact_mapping = compact_features._mmap
@@ -1396,75 +1693,38 @@ def robust_bspline_fit(
     weights,
     smoothness,
     g: Path,
-    num_iter=10,
-    c=4.685,
+    c=2.5,
     visualize: bool = False,
     verbose: bool = True,
 ):
-    """
-    Fit a robust cubic B-spline to (x, y) data with given weights using iterative re-weighting.
+    """Fit a stiff, direction-preserving log-speed spline.
 
     Parameters:
       x          : 1D numpy array of independent variable values.
       y          : 1D numpy array of dependent values.
       weights    : 1D numpy array of initial weights (same shape as x and y).
-      smoothness : Smoothing factor (the s parameter in UnivariateSpline) that regularizes
-                   against rapid oscillations.
-      num_iter   : Maximum number of iterations for the IRLS procedure.
-      c          : Tuning constant for Tukey’s biweight (default ~4.685 for normal errors).
+      smoothness : Retained for command/API compatibility; the former
+                   scale-dependent smoothing factor is deliberately unused.
+      c          : Huber transition in robust standard deviations.
 
     Returns:
-      spline     : A UnivariateSpline object representing the robustly fitted cubic B-spline.
+      spline     : A callable representing the robustly fitted cubic spline.
 
     Also plots the data and the final spline fit.
     """
+    del smoothness
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
     weights = np.asarray(weights, dtype=np.float64)
     if x.ndim != 1 or y.shape != x.shape or weights.shape != x.shape:
         raise ValueError("x, y, and weights must be one-dimensional and equal length")
+    finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(weights)
+    finite &= (weights > 0.0) & (y != 0.0)
+    x = x[finite]
+    y = y[finite]
+    weights = weights[finite]
     if len(x) < 4:
         raise ValueError("At least four motion samples are required for a cubic spline")
-
-    def fit_irls(fit_x, fit_y, fit_weights):
-        current_weights = np.copy(fit_weights)
-        spline = None
-
-        for _ in range(num_iter):
-            # Use square-root weights as required by UnivariateSpline
-            # (least-squares weighting).
-            spline = UnivariateSpline(
-                fit_x,
-                fit_y,
-                w=np.sqrt(current_weights),
-                k=3,
-                s=smoothness,
-            )
-            residuals = fit_y - spline(fit_x)
-
-            # Robust scale estimate via median absolute deviation (MAD).
-            mad = np.median(np.abs(residuals - np.median(residuals)))
-            scale = mad / 0.6745 if mad > 1e-6 else 1.0
-
-            # Compute scaled residuals and Tukey biweight factors.
-            u = residuals / (c * scale)
-            robust_factor = np.square(1 - u**2)
-            robust_factor[np.abs(u) >= 1] = 0
-            new_weights = fit_weights * robust_factor
-
-            if np.linalg.norm(new_weights - current_weights) < 1e-3 * np.linalg.norm(
-                current_weights
-            ):
-                current_weights = new_weights
-                break
-            current_weights = new_weights
-
-        return spline, current_weights
-
-    def crosses_zero(spline, lower, upper):
-        dense_x = np.linspace(lower, upper, 500)
-        dense_y = spline(dense_x)
-        return (np.max(dense_y) > 0) != (np.min(dense_y) > 0)
 
     def weighted_median(values, sample_weights):
         order = np.argsort(values)
@@ -1473,40 +1733,108 @@ def robust_bspline_fit(
         return values[order[np.searchsorted(cumulative, midpoint)]]
 
     initial_weights = np.copy(weights)
-    fit_x = x
-    fit_y = y
-    fit_weights = weights
-    spline, current_weights = fit_irls(fit_x, fit_y, fit_weights)
-    used_direction_fallback = False
-
-    if crosses_zero(spline, np.min(x), np.max(x)):
-        # A single pass can contain weak periodic aliases on both sides of
-        # zero. Physical motion cannot reverse within one capture, so retry
-        # using the well-supported direction instead of allowing the spline
-        # to cross zero and catastrophically stretch the output.
-        dominant_motion = weighted_median(y, weights)
-        confidence_cutoff = 0.2 * np.max(weights)
-        fallback_mask = (y * dominant_motion > 0) & (weights >= confidence_cutoff)
-        if np.count_nonzero(fallback_mask) < 4:
-            raise ValueError("Oscillating spline found")
-
-        fit_x = x[fallback_mask]
-        fit_y = y[fallback_mask]
-        fit_weights = weights[fallback_mask]
-        spline, current_weights = fit_irls(fit_x, fit_y, fit_weights)
-        if crosses_zero(spline, np.min(fit_x), np.max(fit_x)):
-            raise ValueError("Oscillating spline found")
-
-        used_direction_fallback = True
-        if verbose:
-            print(
-                "speed fit: rejected reversal aliases; "
-                f"using {len(fit_x)}/{len(x)} high-confidence samples "
-                f"from {np.min(fit_x):g} to {np.max(fit_x):g}"
-            )
+    dominant_motion = weighted_median(y, weights)
+    direction_mask = y * dominant_motion > 0.0
+    if np.count_nonzero(direction_mask) < 4:
+        raise ValueError("Fewer than four samples agree on the motion direction")
+    fit_x = x[direction_mask]
+    fit_y = y[direction_mask]
+    fit_weights = weights[direction_mask]
+    used_direction_fallback = np.count_nonzero(~direction_mask) > 0
+    if used_direction_fallback and verbose:
+        print(
+            "speed fit: rejected reversal aliases; "
+            f"using {len(fit_x)}/{len(x)} direction-consistent samples "
+            f"from {np.min(fit_x):g} to {np.max(fit_x):g}"
+        )
 
     support_min = float(np.min(fit_x))
     support_max = float(np.max(fit_x))
+    span = support_max - support_min
+    knot_count = max(
+        4,
+        int(math.ceil(span / SPEED_CORRELATION_KNOT_SPACING)) + 1,
+    )
+    knots = np.linspace(support_min, support_max, knot_count, dtype=np.float64)
+    log_magnitude = np.log(np.abs(fit_y))
+    normalized_weights = fit_weights / np.max(fit_weights)
+    initial_coefficients = np.full(
+        knot_count,
+        math.log(abs(weighted_median(fit_y, fit_weights))),
+        dtype=np.float64,
+    )
+    curvature_count = max(
+        17,
+        int(math.ceil(span / SPEED_CORRELATION_CURVATURE_SAMPLE_SPACING)) + 1,
+    )
+    curvature_x = np.linspace(
+        support_min,
+        support_max,
+        curvature_count,
+        dtype=np.float64,
+    )
+
+    def model(coefficients):
+        return CubicSpline(knots, coefficients, bc_type="natural")
+
+    def huber_residual(values):
+        """Encode Huber cost while leaving curvature strictly quadratic."""
+        values = np.asarray(values, dtype=np.float64)
+        magnitude = np.abs(values)
+        outside = magnitude > c
+        result = values.copy()
+        result[outside] = np.sign(values[outside]) * np.sqrt(
+            2.0 * c * magnitude[outside] - c**2
+        )
+        return result
+
+    def residuals(coefficients):
+        speed_model = model(coefficients)
+        data_residual = (
+            (speed_model(fit_x) - log_magnitude)
+            * np.sqrt(normalized_weights)
+            / SPEED_CORRELATION_LOG_SIGMA
+        )
+        curvature_residual = (
+            speed_model(curvature_x, 2)
+            * SPEED_CORRELATION_CURVATURE_LENGTH**2
+            / SPEED_CORRELATION_CURVATURE_LOG_SIGMA
+        )
+        return np.concatenate(
+            (huber_residual(data_residual), curvature_residual)
+        )
+
+    solution = least_squares(
+        residuals,
+        initial_coefficients,
+        method="trf",
+        xtol=1.0e-10,
+        ftol=1.0e-10,
+        gtol=1.0e-10,
+        max_nfev=1000,
+    )
+    if not solution.success or not np.all(np.isfinite(solution.x)):
+        raise RuntimeError(f"speed correlation fit failed: {solution.message}")
+    log_spline = model(solution.x)
+    direction = math.copysign(1.0, dominant_motion)
+
+    def spline(values):
+        return direction * np.exp(log_spline(values))
+
+    spline.derivative = lambda: (
+        lambda values: spline(values) * log_spline(values, 1)
+    )
+    standardized_residual = (
+        (log_spline(fit_x) - log_magnitude)
+        * np.sqrt(normalized_weights)
+        / SPEED_CORRELATION_LOG_SIGMA
+    )
+    robust_factor = np.minimum(
+        1.0,
+        c / np.maximum(np.abs(standardized_residual), 1.0e-12),
+    )
+    current_weights = fit_weights * robust_factor
+
     extrapolated_spline = _smooth_speed_extrapolator(
         spline,
         support_min,
@@ -1525,7 +1853,7 @@ def robust_bspline_fit(
     ax1.plot(x, y, "bo", label="Data")
     x_dense = np.linspace(np.min(x), np.max(x), 500)
     y_dense = extrapolated_spline(x_dense)
-    ax1.plot(x_dense, y_dense, "r-", lw=2, label="Robust Cubic B-spline")
+    ax1.plot(x_dense, y_dense, "r-", lw=2, label="Stiff log-speed spline")
     if used_direction_fallback:
         ax1.plot(
             fit_x,
@@ -1535,7 +1863,7 @@ def robust_bspline_fit(
             label="Direction-consistent support",
         )
     ax1.plot(x, np.zeros_like(x), "k--")
-    ax1.set_title("Robust Cubic B-spline Fit")
+    ax1.set_title("Stiff Correlation Speed Fit")
     ax1.set_ylabel("y")
     ax1.legend()
 
@@ -1844,7 +2172,7 @@ def refine_speed_spline_with_constraints(
         )
         for circle, target in circle_data:
             speed = abs(evaluate(coefficients, circle.center_x))
-            result.append(math.log(speed / target) / SPEED_CIRCLE_LOG_SIGMA)
+            result.append(math.log(speed / target) / circle.log_speed_sigma)
         for _group, segment_grids in group_grids:
             lengths = []
             for _segment, xs in segment_grids:

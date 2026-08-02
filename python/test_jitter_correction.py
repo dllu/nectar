@@ -618,10 +618,14 @@ class ColumnJitterCorrectionTest(unittest.TestCase):
                 jitter_models=model,
             )
 
-        # The line-wide radiometric stripe is common at zero capture
-        # displacement and overwhelms the raw fit. Applying the model first
-        # recovers the actual two-column scene displacement.
-        self.assertLess(abs(float(np.median(raw_displacements))), 0.1)
+        # The vertical high-pass keeps the stripe from completely pinning the
+        # result to zero, but the uncorrected integer search remains badly
+        # biased. Applying the radiometric model first recovers the actual
+        # two-column scene displacement.
+        self.assertGreater(
+            abs(float(np.median(raw_displacements)) - true_displacement),
+            0.5,
+        )
         self.assertAlmostEqual(
             float(np.median(corrected_displacements)),
             true_displacement,
@@ -657,6 +661,43 @@ class ColumnJitterCorrectionTest(unittest.TestCase):
         self.assertEqual(displacements.size, 0)
         self.assertEqual(weights.size, 0)
 
+    def test_speed_correlation_aligns_the_two_bayer_green_rows(self):
+        height = 64
+        width = 256
+        displacement = 0.6
+        x = np.arange(width, dtype=np.float32)[None, :]
+        row = np.arange(height, dtype=np.float32)[:, None]
+
+        def continuous_scene(raw_y, raw_x):
+            return (
+                10000.0
+                + 2000.0 * np.sin(0.18 * raw_x + 0.15 * raw_y)
+                + 1200.0 * np.sin(0.071 * raw_x - 0.105 * raw_y + 1.2)
+                + 800.0 * np.cos(0.31 * raw_x + 0.045 * raw_y + 0.4)
+            )
+
+        # The physical green lines are one raw sensor row apart. G2 is also
+        # displaced horizontally; correlation must remove the known vertical
+        # parallax rather than letting diagonal texture bias that displacement.
+        green1 = continuous_scene(2.0 * row + 1.0, x).astype(np.float32)
+        green2 = continuous_scene(2.0 * row, x - displacement).astype(np.float32)
+        _sample_xs, measured, _weights = preview.windowed_cross_correlation(
+            green1,
+            green2,
+            window_step=16,
+            window_size=64,
+            corr_size=9,
+            structure_mask=np.ones((height, width), dtype=bool),
+            show_progress=False,
+        )
+
+        self.assertGreater(measured.size, 0)
+        self.assertAlmostEqual(
+            float(np.median(measured)),
+            displacement,
+            delta=0.02,
+        )
+
     def test_speed_sample_x_is_center_of_its_actual_source_window(self):
         rng = np.random.default_rng(19)
         height = 32
@@ -681,6 +722,128 @@ class ColumnJitterCorrectionTest(unittest.TestCase):
         # whose actual center is x=48. The old implementation mislabeled it.
         self.assertEqual(float(sample_xs[0]), 48.0)
         self.assertAlmostEqual(float(np.median(displacements)), 2.0, delta=0.05)
+
+    def test_speed_correlation_uses_consensus_across_vertical_bands(self):
+        rng = np.random.default_rng(23)
+        height = 128
+        width = 640
+        group_count = 16
+        signals = rng.normal(0.0, 1.0, (group_count, width)).astype(np.float32)
+        for _ in range(3):
+            signals = (
+                np.roll(signals, 1, axis=1)
+                + 2.0 * signals
+                + np.roll(signals, -1, axis=1)
+            ) / 4.0
+        scene = 20000.0 + 1200.0 * np.repeat(
+            signals,
+            height // group_count,
+            axis=0,
+        )
+
+        true_displacement = 2
+        green1 = scene.copy()
+        green2 = np.empty_like(scene)
+        green2[:, :true_displacement] = scene[:, :1]
+        green2[:, true_displacement:] = scene[:, :-true_displacement]
+
+        # A few bands contain a much stronger stationary alias. Summing pixel
+        # energy over the whole sensor lets this minority pin registration to
+        # zero; equal-band consensus must follow the broadly supported motion.
+        stationary = rng.normal(0.0, 1.0, width).astype(np.float32)
+        for _ in range(3):
+            stationary = (
+                np.roll(stationary, 1)
+                + 2.0 * stationary
+                + np.roll(stationary, -1)
+            ) / 4.0
+        green1[-12:] = 20000.0 + 20000.0 * stationary
+        green2[-12:] = green1[-12:]
+
+        _sample_xs, measured, _weights = preview.windowed_cross_correlation(
+            green1,
+            green2,
+            window_step=32,
+            window_size=128,
+            corr_size=9,
+            structure_mask=np.ones((height, width), dtype=bool),
+            show_progress=False,
+        )
+
+        self.assertGreater(measured.size, 0)
+        self.assertAlmostEqual(
+            float(np.median(measured)),
+            true_displacement,
+            delta=0.08,
+        )
+
+    def test_speed_correlation_applies_structure_mask_to_registration(self):
+        rng = np.random.default_rng(55)
+        height = 64
+        width = 384
+        signals = rng.normal(0.0, 1.0, (8, width)).astype(np.float32)
+        for _ in range(3):
+            signals = (
+                np.roll(signals, 1, axis=1)
+                + 2.0 * signals
+                + np.roll(signals, -1, axis=1)
+            ) / 4.0
+        scene = 20000.0 + 1200.0 * np.repeat(signals, 8, axis=0)
+        true_displacement = 1.2
+        source_x = np.arange(width, dtype=np.float32)
+        green1 = scene.copy()
+        green2 = np.vstack(
+            [
+                np.interp(
+                    source_x - true_displacement,
+                    source_x,
+                    row,
+                )
+                for row in scene
+            ]
+        ).astype(np.float32)
+
+        stationary = rng.normal(0.0, 1.0, width).astype(np.float32)
+        for _ in range(3):
+            stationary = (
+                np.roll(stationary, 1)
+                + 2.0 * stationary
+                + np.roll(stationary, -1)
+            ) / 4.0
+        green1[-24:] = 20000.0 + 20000.0 * stationary
+        green2[-24:] = green1[-24:]
+        structure_mask = np.ones((height, width), dtype=bool)
+        structure_mask[-24:] = False
+
+        _sample_xs, masked, _weights = preview.windowed_cross_correlation(
+            green1,
+            green2,
+            window_step=32,
+            window_size=128,
+            corr_size=9,
+            structure_mask=structure_mask,
+            show_progress=False,
+        )
+        _sample_xs, unmasked, _weights = preview.windowed_cross_correlation(
+            green1,
+            green2,
+            window_step=32,
+            window_size=128,
+            corr_size=9,
+            structure_mask=np.ones_like(structure_mask),
+            show_progress=False,
+        )
+
+        self.assertGreater(masked.size, 0)
+        self.assertAlmostEqual(
+            float(np.median(masked)),
+            true_displacement,
+            delta=0.06,
+        )
+        self.assertGreater(
+            float(np.median(masked) - np.median(unmasked)),
+            0.25,
+        )
 
     def test_geometry_sampling_bypasses_scene_relative_rendering_limit(self):
         class ArrayView:
@@ -881,7 +1044,7 @@ class ColumnJitterCorrectionTest(unittest.TestCase):
         np.testing.assert_allclose(fitted, -0.3, atol=1e-9, rtol=0.0)
 
     def test_speed_fit_smoothly_extrapolates_large_supported_change(self):
-        x = np.arange(80, dtype=np.float64)
+        x = np.arange(80, dtype=np.float64) * 2048.0
         y = np.linspace(-0.15, -0.45, len(x))
         weights = np.ones_like(x)
 
@@ -897,13 +1060,13 @@ class ColumnJitterCorrectionTest(unittest.TestCase):
         fitted = spline(x)
         self.assertLess(fitted[-1], fitted[0] - 0.25)
         np.testing.assert_allclose(fitted, y, atol=0.002, rtol=0.0)
-        extrapolated = spline(np.array([-100.0, 200.0]))
+        extrapolated = spline(np.array([-20000.0, 180000.0]))
         self.assertTrue(np.all(extrapolated < 0.0))
         self.assertNotAlmostEqual(extrapolated[0], fitted[0])
         self.assertNotAlmostEqual(extrapolated[1], fitted[-1])
 
     def test_speed_fit_preserves_supported_moderate_change(self):
-        x = np.arange(80, dtype=np.float64)
+        x = np.arange(80, dtype=np.float64) * 2048.0
         y = np.linspace(-1.0, -1.2, len(x))
         weights = np.ones_like(x)
 
@@ -918,6 +1081,28 @@ class ColumnJitterCorrectionTest(unittest.TestCase):
 
         fitted = spline(x)
         self.assertLess(fitted[-1], fitted[0] - 0.15)
+
+    def test_speed_fit_preserves_a_coherent_tail_change(self):
+        x = np.linspace(0.0, 160000.0, 589)
+        y = np.full_like(x, -0.9)
+        tail = x > 145000.0
+        y[tail] -= 0.3 * (x[tail] - 145000.0) / 15000.0
+        y += 0.005 * np.sin(x / 1200.0)
+        weights = np.full_like(x, 0.4)
+        weights[tail] = 0.3
+
+        with TemporaryDirectory() as output_dir:
+            spline = preview.robust_bspline_fit(
+                x,
+                y,
+                weights,
+                smoothness=80000,
+                g=Path(output_dir),
+            )
+
+        # A sustained run is motion evidence, not a collection of outliers.
+        self.assertLess(float(spline(160000.0)), -1.15)
+        self.assertTrue(np.all(spline.correlation_weights[tail] > 0.0))
 
 
 if __name__ == "__main__":

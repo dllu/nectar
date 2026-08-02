@@ -22,6 +22,17 @@ class PreviewSpeedConstraintsTest(unittest.TestCase):
         self.assertAlmostEqual(circle.center_x, 100.0)
         self.assertAlmostEqual(circle.speed_magnitude, 0.6)
 
+    def test_circle_uncertainty_accounts_for_pixel_sized_handles(self):
+        small = preview.CircleSpeedConstraint(
+            "small", x=0.0, y=0.0, width=45.0, height=75.0
+        )
+        large = preview.CircleSpeedConstraint(
+            "large", x=0.0, y=0.0, width=1000.0, height=500.0
+        )
+
+        self.assertGreater(small.log_speed_sigma, 0.02)
+        self.assertEqual(large.log_speed_sigma, preview.SPEED_CIRCLE_LOG_SIGMA)
+
     def test_refinement_preserves_direction_and_reduces_manual_residuals(self):
         def correlation_spline(values):
             values = np.asarray(values, dtype=np.float64)
@@ -141,7 +152,7 @@ class PreviewSpeedConstraintsTest(unittest.TestCase):
 
         self.assertLess(float(refined(circle.center_x)), -0.01)
 
-    def test_manual_width_constraints_are_fit_to_sub_tenth_percent(self):
+    def test_manual_constraints_improve_without_exact_interpolation(self):
         starts = np.asarray(
             [4000.0, 5500.0, 7000.0, 8500.0, 10000.0, 11500.0]
         )
@@ -197,8 +208,11 @@ class PreviewSpeedConstraintsTest(unittest.TestCase):
             for entry in group_diagnostics[0]["segments"]
         ]
 
-        self.assertLess(max(circle_residuals), 0.001)
-        self.assertLess(max(width_residuals), 0.001)
+        self.assertLess(max(circle_residuals), 0.03)
+        self.assertLess(max(width_residuals), 0.03)
+        # Manual endpoints are only pixel-accurate. The fit should not spend
+        # curvature to reproduce them to parts per million.
+        self.assertGreater(max(circle_residuals + width_residuals), 0.001)
 
     def test_speed_extrapolation_has_no_endpoint_clamp_kink(self):
         core = preview.CubicSpline(
