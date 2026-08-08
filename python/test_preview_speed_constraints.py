@@ -22,16 +22,25 @@ class PreviewSpeedConstraintsTest(unittest.TestCase):
         self.assertAlmostEqual(circle.center_x, 100.0)
         self.assertAlmostEqual(circle.speed_magnitude, 0.6)
 
-    def test_circle_uncertainty_accounts_for_pixel_sized_handles(self):
+    def test_annotation_uncertainty_is_fixed_in_pixels(self):
         small = preview.CircleSpeedConstraint(
             "small", x=0.0, y=0.0, width=45.0, height=75.0
         )
         large = preview.CircleSpeedConstraint(
             "large", x=0.0, y=0.0, width=1000.0, height=500.0
         )
+        short_segment = preview.EqualWidthSegment("short", 0.0, 100.0)
+        long_segment = preview.EqualWidthSegment("long", 0.0, 1000.0)
 
-        self.assertGreater(small.log_speed_sigma, 0.02)
-        self.assertEqual(large.log_speed_sigma, preview.SPEED_CIRCLE_LOG_SIGMA)
+        sigma = preview.SPEED_ANNOTATION_DIMENSION_SIGMA_PIXELS
+        self.assertAlmostEqual(
+            small.log_speed_sigma,
+            np.hypot(sigma / small.width, sigma / small.height),
+        )
+        self.assertLess(large.log_speed_sigma, small.log_speed_sigma)
+        self.assertAlmostEqual(short_segment.log_width_sigma, sigma / 100.0)
+        self.assertAlmostEqual(long_segment.log_width_sigma, sigma / 1000.0)
+        self.assertLess(long_segment.log_width_sigma, short_segment.log_width_sigma)
 
     def test_refinement_preserves_direction_and_reduces_manual_residuals(self):
         def correlation_spline(values):
@@ -97,6 +106,60 @@ class PreviewSpeedConstraintsTest(unittest.TestCase):
         self.assertLess(
             np.ptp(np.log(after_widths)),
             np.ptp(np.log(before_widths)),
+        )
+
+    def test_group_width_is_jointly_optimized_with_a_fixed_spline_basis(self):
+        def correlation_spline(values):
+            values = np.asarray(values, dtype=np.float64)
+            return np.full_like(values, -0.5)
+
+        group = preview.EqualWidthGroup(
+            "cars",
+            "Cars",
+            (
+                preview.EqualWidthSegment("long", 100.0, 700.0),
+                preview.EqualWidthSegment("short", 1200.0, 1500.0),
+            ),
+        )
+        constraints = preview.ManualSpeedConstraints(
+            Path("constraints.json"), (), (group,), ()
+        )
+
+        with patch.object(
+            preview,
+            "least_squares",
+            wraps=preview.least_squares,
+        ) as optimizer:
+            refined = preview.refine_speed_spline_with_constraints(
+                correlation_spline,
+                constraints,
+                x_min=0.0,
+                x_max=2000.0,
+                verbose=False,
+            )
+
+        expected_speed_coefficients = max(
+            4,
+            int(np.ceil(2000.0 / preview.SPEED_CONSTRAINT_KNOT_SPACING)) + 1,
+        )
+        initial_parameters = optimizer.call_args.args[1]
+        # One additional optimization variable is the group's common log width.
+        self.assertEqual(len(initial_parameters), expected_speed_coefficients + 1)
+
+        lengths = np.asarray(
+            [
+                preview.corrected_interval_length(refined, segment.x1, segment.x2)
+                for segment in group.segments
+            ]
+        )
+        weights = np.asarray(
+            [1.0 / segment.log_width_sigma**2 for segment in group.segments]
+        )
+        fitted_group_width = refined.equal_width_group_widths[group.identifier]
+        self.assertAlmostEqual(
+            np.log(fitted_group_width),
+            np.average(np.log(lengths), weights=weights),
+            places=7,
         )
 
     def test_refinement_is_not_capped_at_twenty_five_percent(self):
@@ -321,6 +384,45 @@ class PreviewSpeedConstraintsTest(unittest.TestCase):
             preview._parse_args(["--equal-length-chunks"]).equal_length_chunks
         )
 
+    def test_equal_width_padding_option_is_off_by_default(self):
+        self.assertFalse(preview._parse_args([]).pad_output_to_equal_widths)
+        self.assertTrue(
+            preview._parse_args(
+                ["--pad-output-to-equal-widths"]
+            ).pad_output_to_equal_widths
+        )
+
+    def test_padded_cut_ranges_center_neighbor_content(self):
+        ranges, width = preview.build_padded_cut_output_ranges(
+            [(0, 8), (8, 12), (12, 22), (22, 28)]
+        )
+
+        self.assertEqual(width, 10)
+        self.assertEqual(ranges, [(0, 8), (5, 15), (12, 22), (22, 28)])
+
+    def test_outer_padding_draws_columns_from_the_requested_edge(self):
+        data = np.broadcast_to(
+            np.arange(200, dtype=np.float32)[None, :, None],
+            (2, 200, 3),
+        ).copy()
+        left = preview.pad_random_edge_columns(
+            data,
+            215,
+            prepend=True,
+            rng=np.random.default_rng(4),
+        )
+        right = preview.pad_random_edge_columns(
+            data,
+            215,
+            prepend=False,
+            rng=np.random.default_rng(5),
+        )
+
+        np.testing.assert_array_equal(left[:, 15:], data)
+        np.testing.assert_array_equal(right[:, :200], data)
+        self.assertTrue(np.all(left[:, :15] < 128))
+        self.assertTrue(np.all(right[:, 200:] >= 72))
+
     def test_sampling_uses_full_domain_refined_spline(self):
         def spline(values):
             return 0.2 + 0.01 * np.asarray(values, dtype=np.float64)
@@ -356,10 +458,70 @@ class PreviewSpeedConstraintsTest(unittest.TestCase):
             starts,
             widths,
             (12.0, 28.0),
-            padding=1,
+            padding_columns=10,
         )
 
         self.assertEqual(selected, [0, 1, 2, 3])
+
+    def test_processing_bounds_are_column_aligned_not_file_aligned(self):
+        bounds = preview.aligned_processing_column_bounds(
+            8192,
+            2300.0 - 512,
+            5100.0 + 512,
+        )
+
+        self.assertEqual(bounds, (1784, 5616))
+        self.assertEqual(bounds[0] % preview.STRUCTURE_MASK_DOWNSAMPLE, 0)
+        self.assertEqual(bounds[1] % preview.STRUCTURE_MASK_DOWNSAMPLE, 0)
+
+    def test_exact_processing_view_is_independent_of_backing_slice(self):
+        class ArrayView:
+            def __init__(self, values):
+                self.values = values
+                self.height, self.width = values.shape
+
+            def __getitem__(self, key):
+                return self.values[key]
+
+        values = np.arange(3 * 32, dtype=np.float32).reshape(3, 32)
+        whole = preview.ColumnSliceView(ArrayView(values), 7, 25)
+        partition_like = preview.ColumnSliceView(ArrayView(values[:, 4:29]), 3, 21)
+
+        np.testing.assert_array_equal(whole[:, :], partition_like[:, :])
+
+    def test_white_balance_sample_span_is_independent_of_raw_file_width(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            narrow = root / "narrow"
+            wide = root / "wide"
+            narrow.mkdir()
+            wide.mkdir()
+            raw = np.zeros((4096, 32), dtype=np.uint16)
+            raw[0::2, 1::2] = 1000
+            raw[1::2, 1::2] = 2000
+            raw[1::2, 0::2] = 4000
+
+            for index, start in enumerate(range(0, 32, 8)):
+                np.asarray(raw[:, start : start + 8].T, dtype="<u2").tofile(
+                    narrow / f"im{index:06d}.bin"
+                )
+            for index, start in enumerate(range(0, 32, 16)):
+                np.asarray(raw[:, start : start + 16].T, dtype="<u2").tofile(
+                    wide / f"im{index:06d}.bin"
+                )
+
+            narrow_balance = preview.estimate_white_balance(
+                sorted(narrow.glob("*.bin")),
+                max_sample_columns=8,
+                show_progress=False,
+            )
+            wide_balance = preview.estimate_white_balance(
+                sorted(wide.glob("*.bin")),
+                max_sample_columns=8,
+                show_progress=False,
+            )
+
+            np.testing.assert_allclose(narrow_balance, wide_balance)
 
     def test_skew_truncation_reports_the_matching_step_scale_slice(self):
         positions = list(np.arange(10.0, 91.0, 10.0))
@@ -450,7 +612,7 @@ class PreviewSpeedConstraintsTest(unittest.TestCase):
                 with self.assertRaises(ReachedStructureMask):
                     preview.process_preview(
                         capture,
-                        padding=0,
+                        padding_columns=0,
                         show_progress=False,
                         output_dir=output,
                     )

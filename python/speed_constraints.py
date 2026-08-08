@@ -17,7 +17,6 @@ import os
 import re
 import sys
 import tempfile
-from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -79,12 +78,14 @@ from PySide6.QtWidgets import (
 SCHEMA_VERSION = 1
 DEFAULT_JSON_NAME = "speed_constraints.json"
 DEFAULT_FRAME_ROWS = 4096
-DEFAULT_WINDOW_SIZE = 16
+DEFAULT_WINDOW_COLUMNS = 4096
+DEFAULT_WINDOW_STEP_COLUMNS = 256
 BAYER_BIN = 2
 MIN_ELLIPSE_SIZE = 3.0
 MIN_SEGMENT_WIDTH = 1.0
 NAVIGATOR_PREFERRED_HEIGHT = 96
 NAVIGATOR_MAX_BYTES = 32 * 1024 * 1024
+DISPLAY_STATISTICS_MAX_PIXELS = 4 * 1024 * 1024
 
 CIRCLE_COLOR = QColor("#00ff00")
 CUT_COLOR = QColor("#ffcf33")
@@ -213,11 +214,11 @@ class CaptureSequence:
         index = bisect.bisect_right(self.frame_ends, x)
         return min(max(index, 0), len(self.frames) - 1)
 
-    def window_bounds(self, start: int, count: int) -> tuple[int, int, int, int]:
-        count = min(max(1, count), len(self.frames))
-        start = min(max(0, start), len(self.frames) - count)
-        stop = start + count
-        return start, stop, self.frames[start].x_start, self.frames[stop - 1].x_end
+    def column_window_bounds(self, start: int, width: int) -> tuple[int, int]:
+        """Clamp a display window expressed entirely in global image columns."""
+        width = min(max(1, int(width)), self.total_width)
+        start = min(max(0, int(start)), self.total_width - width)
+        return start, start + width
 
     def source_json(self) -> dict[str, object]:
         return {
@@ -265,91 +266,12 @@ def decode_raw_frame(
     return rgb
 
 
-def decode_raw_frame_thumbnail(
-    frame: FrameInfo,
-    frame_rows: int,
-    target_height: int,
-    target_width: int,
-    *,
-    temporal_samples: int = 2,
-) -> np.ndarray:
-    """Read a sparse, vertically area-averaged navigator thumbnail.
-
-    Only a few Bayer time-column pairs are touched for each output column, so
-    building the overview does not need to stream every byte of every chunk.
-    """
-    channel_height = frame_rows // BAYER_BIN
-    channel_width = frame.raw_columns // BAYER_BIN
-    temporal_samples = max(1, temporal_samples)
-    bin_edges = np.linspace(0, channel_width, target_width + 1)
-    positions = np.empty((target_width, temporal_samples), dtype=np.intp)
-    sample_fractions = (
-        np.arange(temporal_samples, dtype=np.float64) + 0.5
-    ) / temporal_samples
-    for column in range(target_width):
-        left = bin_edges[column]
-        right = bin_edges[column + 1]
-        positions[column] = np.clip(
-            (left + sample_fractions * (right - left)).astype(np.intp),
-            0,
-            channel_width - 1,
-        )
-
-    even_time = (positions.ravel() * BAYER_BIN).astype(np.intp, copy=False)
-    odd_time = even_time + 1
-    raw_by_time = np.memmap(
-        frame.path,
-        dtype="<u2",
-        mode="r",
-        shape=(frame.raw_columns, frame_rows),
-    )
-
-    def channel(time_indices: np.ndarray, sensor_offset: int) -> np.ndarray:
-        sampled = np.right_shift(
-            raw_by_time[time_indices, sensor_offset::BAYER_BIN],
-            8,
-        ).astype(np.uint16)
-        sampled = sampled.reshape(
-            target_width,
-            temporal_samples,
-            channel_height,
-        )
-        summed = sampled.sum(axis=1, dtype=np.uint32)
-        summed //= temporal_samples
-        return summed.T.astype(np.uint16)
-
-    red = channel(odd_time, 0)
-    green_1 = channel(odd_time, 1)
-    green_2 = channel(even_time, 0)
-    blue = channel(even_time, 1)
-
-    narrow_rgb = np.empty((channel_height, target_width, 3), dtype=np.uint8)
-    narrow_rgb[:, :, 0] = red
-    green_1 += green_2
-    green_1 //= 2
-    narrow_rgb[:, :, 1] = green_1
-    narrow_rgb[:, :, 2] = blue
-    del red, green_1, green_2, blue
-
-    if target_height == channel_height:
-        thumbnail = narrow_rgb
-    else:
-        thumbnail = cv2.resize(
-            narrow_rgb,
-            (target_width, target_height),
-            interpolation=cv2.INTER_AREA,
-        )
-        del narrow_rgb
-    return thumbnail
-
-
 @dataclass
 class NavigatorData:
-    """Memory-bounded, low-resolution strip spanning the entire capture."""
+    """Memory-bounded, uniformly scaled strip spanning the entire capture."""
 
     rgb: np.ndarray
-    frame_starts: tuple[int, ...]
-    frame_widths: tuple[int, ...]
+    source_width: int
     thumbnail_height: int
 
     @property
@@ -361,84 +283,120 @@ class NavigatorData:
         return self.rgb.nbytes
 
 
+@dataclass
+class LoadedCapture:
+    """The complete Bayer-binned display image and its small navigator."""
+
+    rgb: np.ndarray
+    navigator: NavigatorData
+
+    @property
+    def memory_bytes(self) -> int:
+        return self.rgb.nbytes + self.navigator.memory_bytes
+
+
 def navigator_thumbnail_geometry(
     capture: CaptureSequence,
     *,
     preferred_height: int = NAVIGATOR_PREFERRED_HEIGHT,
     max_bytes: int = NAVIGATOR_MAX_BYTES,
-) -> tuple[int, tuple[int, ...]]:
-    """Choose aspect-preserving thumbnail sizes within a fixed RGB budget."""
+) -> tuple[int, int]:
+    """Choose one global aspect-preserving thumbnail within an RGB budget."""
     height = min(max(1, preferred_height), capture.image_height)
     max_pixels = max(1, max_bytes // 3)
 
     while True:
-        widths = tuple(
-            max(
-                1,
-                round(frame.display_columns * height / capture.image_height),
-            )
-            for frame in capture.frames
+        width = max(
+            1,
+            round(capture.total_width * height / capture.image_height),
         )
-        pixels = sum(widths) * height
-        if pixels <= max_pixels or height == 1:
-            return height, widths
+        pixels = width * height
+        if pixels <= max_pixels:
+            return height, width
+        if height == 1:
+            return 1, max_pixels
         scale = math.sqrt(max_pixels / pixels)
         height = max(1, min(height - 1, int(height * scale)))
 
 
 def build_navigator_data(
     capture: CaptureSequence,
+    rgb: np.ndarray,
     *,
     preferred_height: int = NAVIGATOR_PREFERRED_HEIGHT,
     max_bytes: int = NAVIGATOR_MAX_BYTES,
-    progress: Callable[[int, int], None] | None = None,
-    cancelled: Callable[[], bool] | None = None,
-) -> NavigatorData | None:
-    """Decode one frame at a time into a bounded low-resolution overview."""
-    thumbnail_height, frame_widths = navigator_thumbnail_geometry(
+) -> NavigatorData:
+    """Downsample the already-loaded capture without regard to file boundaries."""
+    if rgb.shape != (capture.image_height, capture.total_width, 3):
+        raise ValueError("loaded RGB image does not match the capture geometry")
+    thumbnail_height, thumbnail_width = navigator_thumbnail_geometry(
         capture,
         preferred_height=preferred_height,
         max_bytes=max_bytes,
     )
-    starts: list[int] = []
-    total_width = 0
-    for width in frame_widths:
-        starts.append(total_width)
-        total_width += width
+    strip = cv2.resize(
+        rgb,
+        (thumbnail_width, thumbnail_height),
+        interpolation=cv2.INTER_AREA,
+    )
+    return NavigatorData(
+        rgb=strip,
+        source_width=capture.total_width,
+        thumbnail_height=thumbnail_height,
+    )
 
-    strip = np.empty((thumbnail_height, total_width, 3), dtype=np.uint8)
+
+def load_capture_data(
+    capture: CaptureSequence,
+    *,
+    progress: Callable[[int, int], None] | None = None,
+    status: Callable[[str], None] | None = None,
+    cancelled: Callable[[], bool] | None = None,
+) -> LoadedCapture | None:
+    """Read every raw file once and retain the complete binned display image."""
+    rgb = np.empty(
+        (capture.image_height, capture.total_width, 3),
+        dtype=np.uint8,
+    )
     total_frames = len(capture.frames)
     progress_stride = max(1, total_frames // 500)
-    for index, (frame, start, width) in enumerate(
-        zip(capture.frames, starts, frame_widths, strict=True)
-    ):
+    for index, frame in enumerate(capture.frames):
         if cancelled is not None and cancelled():
             return None
-        thumbnail = decode_raw_frame_thumbnail(
-            frame,
-            capture.frame_rows,
-            thumbnail_height,
-            width,
-        )
-        strip[:, start : start + width] = thumbnail
-        del thumbnail
+        frame_rgb = decode_raw_frame(frame, capture.frame_rows)
+        rgb[:, frame.x_start : frame.x_end] = frame_rgb
+        del frame_rgb
         completed = index + 1
         if progress is not None and (
             completed == total_frames or completed % progress_stride == 0
         ):
             progress(completed, total_frames)
 
-    return NavigatorData(
-        rgb=auto_tone_map_to_uint8(strip),
-        frame_starts=tuple(starts),
-        frame_widths=frame_widths,
-        thumbnail_height=thumbnail_height,
+    if cancelled is not None and cancelled():
+        return None
+    if status is not None:
+        status("Applying display tone map…")
+    pixel_count = capture.image_height * capture.total_width
+    statistics_stride = max(
+        1,
+        math.ceil(math.sqrt(pixel_count / DISPLAY_STATISTICS_MAX_PIXELS)),
     )
+    statistics = rgb[::statistics_stride, ::statistics_stride]
+    toned_rgb = auto_tone_map_to_uint8(rgb, statistics=statistics)
+    del statistics, rgb
+
+    if cancelled is not None and cancelled():
+        return None
+    if status is not None:
+        status("Building low-resolution navigator…")
+    navigator = build_navigator_data(capture, toned_rgb)
+    return LoadedCapture(toned_rgb, navigator)
 
 
-class NavigatorLoader(QThread):
+class CaptureLoader(QThread):
     progress_changed = Signal(int, int)
-    navigator_ready = Signal(object)
+    status_changed = Signal(str)
+    capture_ready = Signal(object)
     loading_failed = Signal(str)
 
     def __init__(
@@ -451,17 +409,17 @@ class NavigatorLoader(QThread):
 
     def run(self) -> None:
         try:
-            data = build_navigator_data(
+            data = load_capture_data(
                 self.capture,
                 progress=self.progress_changed.emit,
+                status=self.status_changed.emit,
                 cancelled=self.isInterruptionRequested,
             )
-        # A navigator failure is non-fatal; the detailed annotation GUI remains usable.
         except Exception as exc:  # noqa: BLE001
             self.loading_failed.emit(str(exc))
             return
         if data is not None and not self.isInterruptionRequested():
-            self.navigator_ready.emit(data)
+            self.capture_ready.emit(data)
 
 
 @dataclass
@@ -1264,8 +1222,6 @@ class AnnotationView(QGraphicsView):
 
 @dataclass(frozen=True)
 class NavigatorRow:
-    first_frame: int
-    stop_frame: int
     strip_start: int
     strip_end: int
 
@@ -1296,7 +1252,7 @@ class CaptureNavigator(QWidget):
         self.setMinimumWidth(1)
         self.setMouseTracking(True)
         self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.setToolTip("Click to center the detailed frame window")
+        self.setToolTip("Click to center the detailed column window")
 
     def set_data(self, data: NavigatorData) -> None:
         self.data = data
@@ -1329,30 +1285,13 @@ class CaptureNavigator(QWidget):
         if self.data is None:
             return
         available_width = max(1, self.width() - 2 * self.MARGIN)
-        rows: list[NavigatorRow] = []
-        first_frame = 0
-        row_width = 0
-        for index, width in enumerate(self.data.frame_widths):
-            if index > first_frame and row_width + width > available_width:
-                rows.append(
-                    NavigatorRow(
-                        first_frame=first_frame,
-                        stop_frame=index,
-                        strip_start=self.data.frame_starts[first_frame],
-                        strip_end=self.data.frame_starts[index],
-                    )
-                )
-                first_frame = index
-                row_width = 0
-            row_width += width
-        rows.append(
+        rows = [
             NavigatorRow(
-                first_frame=first_frame,
-                stop_frame=len(self.data.frame_widths),
-                strip_start=self.data.frame_starts[first_frame],
-                strip_end=self.data.total_width,
+                strip_start,
+                min(strip_start + available_width, self.data.total_width),
             )
-        )
+            for strip_start in range(0, self.data.total_width, available_width)
+        ]
         rows_changed = rows != self.rows
         self.rows = rows
         required_height = (
@@ -1372,34 +1311,13 @@ class CaptureNavigator(QWidget):
 
     def _strip_x_from_global(self, global_x: float) -> float:
         assert self.data is not None
-        frame_index = self.capture.frame_index_at_x(global_x)
-        frame = self.capture.frames[frame_index]
-        fraction = (global_x - frame.x_start) / frame.display_columns
-        fraction = min(max(fraction, 0.0), 1.0)
-        return (
-            self.data.frame_starts[frame_index]
-            + fraction * self.data.frame_widths[frame_index]
-        )
+        fraction = min(max(global_x / self.data.source_width, 0.0), 1.0)
+        return fraction * self.data.total_width
 
     def _global_x_from_strip(self, strip_x: float) -> float:
         assert self.data is not None
-        frame_ends = [
-            start + width
-            for start, width in zip(
-                self.data.frame_starts,
-                self.data.frame_widths,
-                strict=True,
-            )
-        ]
-        frame_index = min(
-            bisect.bisect_right(frame_ends, strip_x),
-            len(self.capture.frames) - 1,
-        )
-        start = self.data.frame_starts[frame_index]
-        width = self.data.frame_widths[frame_index]
-        fraction = min(max((strip_x - start) / width, 0.0), 1.0)
-        frame = self.capture.frames[frame_index]
-        return frame.x_start + fraction * frame.display_columns
+        fraction = min(max(strip_x / self.data.total_width, 0.0), 1.0)
+        return fraction * self.data.source_width
 
     def widget_position_for_global_x(self, global_x: float) -> QPointF | None:
         if self.data is None:
@@ -1457,7 +1375,9 @@ class CaptureNavigator(QWidget):
             painter.setPen(_cosmetic_pen(QColor("#454d5a")))
             painter.drawRect(target.adjusted(0.5, 0.5, -0.5, -0.5))
 
-            label = f"{row.first_frame + 1}–{row.stop_frame}"
+            global_start = self._global_x_from_strip(row.strip_start)
+            global_end = self._global_x_from_strip(row.strip_end)
+            label = f"x {global_start:,.0f}–{global_end:,.0f}"
             label_width = painter.fontMetrics().horizontalAdvance(label) + 10
             label_rect = QRectF(
                 self.MARGIN + 3,
@@ -1518,38 +1438,6 @@ class CaptureNavigator(QWidget):
         super().mousePressEvent(event)
 
 
-class FramePixmapCache:
-    def __init__(
-        self,
-        capture: CaptureSequence,
-        capacity: int = 24,
-    ):
-        self.capture = capture
-        self.capacity = max(1, capacity)
-        self._pixmaps: OrderedDict[int, QPixmap] = OrderedDict()
-
-    def get(self, index: int) -> QPixmap:
-        if index in self._pixmaps:
-            self._pixmaps.move_to_end(index)
-            return self._pixmaps[index]
-        frame = self.capture.frames[index]
-        rgb = auto_tone_map_to_uint8(
-            decode_raw_frame(frame, self.capture.frame_rows)
-        )
-        image = QImage(
-            rgb.data,
-            rgb.shape[1],
-            rgb.shape[0],
-            rgb.strides[0],
-            QImage.Format.Format_RGB888,
-        ).copy()
-        pixmap = QPixmap.fromImage(image)
-        self._pixmaps[index] = pixmap
-        while len(self._pixmaps) > self.capacity:
-            self._pixmaps.popitem(last=False)
-        return pixmap
-
-
 class SpeedConstraintWindow(QMainWindow):
     def __init__(
         self,
@@ -1557,15 +1445,16 @@ class SpeedConstraintWindow(QMainWindow):
         document: AnnotationDocument,
         json_path: Path,
         *,
-        window_size: int = DEFAULT_WINDOW_SIZE,
-        cache_frames: int = 24,
+        window_columns: int = DEFAULT_WINDOW_COLUMNS,
+        window_step_columns: int = DEFAULT_WINDOW_STEP_COLUMNS,
     ):
         super().__init__()
         self.capture = capture
         self.document = document
         self.json_path = json_path
-        self.window_size = min(max(1, window_size), len(capture.frames))
-        self.window_start = 0
+        self.window_columns = min(max(1, window_columns), capture.total_width)
+        self.window_step_columns = max(1, window_step_columns)
+        self.window_start_x = 0
         self._window_x_left = 0.0
         self.rotated_180 = capture_defaults_to_rotated_180(capture.directory)
         self._dirty = False
@@ -1575,12 +1464,12 @@ class SpeedConstraintWindow(QMainWindow):
         )
         self.scene = QGraphicsScene(self)
         self.view = AnnotationView(self.scene, capture.image_height)
-        self.pixmap_cache = FramePixmapCache(capture, cache_frames)
-        self.frame_items: list[QGraphicsItem] = []
+        self.loaded_capture: LoadedCapture | None = None
+        self.image_item: QGraphicsPixmapItem | None = None
         self.circle_items: dict[str, EllipseGraphicsItem] = {}
         self.segment_items: dict[str, WidthGraphicsItem] = {}
         self.cut_items: dict[str, CutGraphicsItem] = {}
-        self.navigator_loader: NavigatorLoader | None = None
+        self.capture_loader: CaptureLoader | None = None
 
         self.setWindowTitle(f"Nectar speed constraints — {capture.directory.name}")
         screen = QApplication.primaryScreen()
@@ -1613,7 +1502,7 @@ class SpeedConstraintWindow(QMainWindow):
                 lambda: QMessageBox.warning(self, "Raw frames changed", warning),
             )
         QTimer.singleShot(0, self.view.fit_window)
-        QTimer.singleShot(0, self._start_navigator_loading)
+        QTimer.singleShot(0, self._start_capture_loading)
 
     def _build_toolbar(self) -> None:
         toolbar = QToolBar("Navigation", self)
@@ -1621,7 +1510,9 @@ class SpeedConstraintWindow(QMainWindow):
         self.addToolBar(toolbar)
 
         self.previous_action = QAction("◀ Previous", self)
-        self.previous_action.setToolTip("Move the frame window left (Left arrow)")
+        self.previous_action.setToolTip(
+            f"Move left {self.window_step_columns} columns (Left arrow)"
+        )
         self.previous_action.triggered.connect(self.previous_window)
         toolbar.addAction(self.previous_action)
 
@@ -1631,18 +1522,24 @@ class SpeedConstraintWindow(QMainWindow):
         toolbar.addWidget(self.window_label)
 
         self.next_action = QAction("Next ▶", self)
-        self.next_action.setToolTip("Move the frame window right (Right arrow)")
+        self.next_action.setToolTip(
+            f"Move right {self.window_step_columns} columns (Right arrow)"
+        )
         self.next_action.triggered.connect(self.next_window)
         toolbar.addAction(self.next_action)
         toolbar.addSeparator()
 
-        toolbar.addWidget(QLabel(" Frames "))
-        self.window_size_spin = QSpinBox()
-        self.window_size_spin.setRange(1, len(self.capture.frames))
-        self.window_size_spin.setValue(self.window_size)
-        self.window_size_spin.setToolTip("Number of consecutive raw chunks to display")
-        self.window_size_spin.valueChanged.connect(self._set_window_size)
-        toolbar.addWidget(self.window_size_spin)
+        toolbar.addWidget(QLabel(" Columns "))
+        self.window_columns_spin = QSpinBox()
+        self.window_columns_spin.setRange(1, self.capture.total_width)
+        self.window_columns_spin.setSingleStep(self.window_step_columns)
+        self.window_columns_spin.setValue(self.window_columns)
+        self.window_columns_spin.setKeyboardTracking(False)
+        self.window_columns_spin.setToolTip(
+            "Width of the detailed view in half-resolution capture columns"
+        )
+        self.window_columns_spin.valueChanged.connect(self._set_window_columns)
+        toolbar.addWidget(self.window_columns_spin)
         toolbar.addSeparator()
 
         self.fit_action = QAction("Fit", self)
@@ -1664,7 +1561,8 @@ class SpeedConstraintWindow(QMainWindow):
         self.rotate_checkbox = QCheckBox("Rotate 180°")
         self.rotate_checkbox.setChecked(self.rotated_180)
         self.rotate_checkbox.setToolTip(
-            "Rotate the detailed image and navigator without changing annotation coordinates"
+            "Rotate the detailed image and navigator without changing "
+            "annotation coordinates"
         )
         self.rotate_checkbox.toggled.connect(self._set_rotated_180)
         toolbar.addWidget(self.rotate_checkbox)
@@ -1716,7 +1614,7 @@ class SpeedConstraintWindow(QMainWindow):
         navigator_header = QHBoxLayout()
         navigator_header.setContentsMargins(8, 4, 8, 2)
         self.navigator_status = QLabel(
-            f"Navigator: preparing {len(self.capture.frames)} chunks…"
+            f"Loading {len(self.capture.frames)} raw files into memory…"
         )
         self.navigator_status.setObjectName("muted")
         navigator_header.addWidget(self.navigator_status, 1)
@@ -1759,47 +1657,47 @@ class SpeedConstraintWindow(QMainWindow):
         if hasattr(self, "navigator"):
             self.navigator.set_rotated_180(self.rotated_180)
 
-    def _start_navigator_loading(self) -> None:
-        if self.navigator_loader is not None:
+    def _start_capture_loading(self) -> None:
+        if self.capture_loader is not None:
             return
-        loader = NavigatorLoader(self.capture, self)
-        loader.progress_changed.connect(self._navigator_loading_progress)
-        loader.navigator_ready.connect(self._navigator_loaded)
-        loader.loading_failed.connect(self._navigator_loading_failed)
-        self.navigator_loader = loader
+        loader = CaptureLoader(self.capture, self)
+        loader.progress_changed.connect(self._capture_loading_progress)
+        loader.status_changed.connect(self.navigator_status.setText)
+        loader.capture_ready.connect(self._capture_loaded)
+        loader.loading_failed.connect(self._capture_loading_failed)
+        self.capture_loader = loader
         loader.start()
 
-    def _navigator_loading_progress(self, completed: int, total: int) -> None:
+    def _capture_loading_progress(self, completed: int, total: int) -> None:
         self.navigator_progress.setRange(0, total)
         self.navigator_progress.setValue(completed)
         self.navigator_status.setText(
-            f"Navigator: loading chunk {completed} / {total} one at a time…"
+            f"Loading raw file {completed} / {total} into memory…"
         )
 
-    def _navigator_loaded(self, data: NavigatorData) -> None:
-        self.navigator.set_data(data)
-        _start, _stop, x_left, x_right = self.capture.window_bounds(
-            self.window_start, self.window_size
-        )
+    def _capture_loaded(self, data: LoadedCapture) -> None:
+        self.loaded_capture = data
+        self.navigator.set_data(data.navigator)
+        x_left, x_right = self._window_bounds()
         self.navigator.set_window_range(float(x_left), float(x_right))
         self.navigator_progress.hide()
         self.navigator_status.setText(
-            f"Navigator: {len(self.capture.frames)} chunks · "
-            f"{data.thumbnail_height}px thumbnails · "
-            f"{data.memory_bytes / (1024 * 1024):.1f} MiB retained · "
+            f"Capture: {self.capture.total_width:,} columns · "
+            f"{data.navigator.thumbnail_height}px navigator · "
+            f"{data.memory_bytes / (1024**3):.2f} GiB retained · "
             "click to center"
         )
+        self._load_window(initial=True)
         QTimer.singleShot(0, self._ensure_navigator_window_visible)
 
-    def _navigator_loading_failed(self, message: str) -> None:
+    def _capture_loading_failed(self, message: str) -> None:
         self.navigator_progress.hide()
-        self.navigator_status.setText(f"Navigator unavailable: {message}")
+        self.navigator_status.setText(f"Could not load capture: {message}")
+        QMessageBox.critical(self, "Could not load raw capture", message)
 
     def _navigator_position_selected(self, global_x: float) -> None:
-        frame_index = self.capture.frame_index_at_x(global_x)
-        self.window_start = min(
-            max(0, frame_index - self.window_size // 2),
-            len(self.capture.frames) - self.window_size,
+        self.window_start_x = self._aligned_window_start(
+            global_x - self.window_columns / 2
         )
         self._load_window(center_x=global_x)
 
@@ -1807,9 +1705,7 @@ class SpeedConstraintWindow(QMainWindow):
         QTimer.singleShot(0, self._ensure_navigator_window_visible)
 
     def _ensure_navigator_window_visible(self) -> None:
-        _start, _stop, x_left, x_right = self.capture.window_bounds(
-            self.window_start, self.window_size
-        )
+        x_left, x_right = self._window_bounds()
         position = self.navigator.widget_position_for_global_x((x_left + x_right) / 2)
         if position is not None:
             self.navigator_scroll.ensureVisible(
@@ -1974,44 +1870,47 @@ class SpeedConstraintWindow(QMainWindow):
             suffix = ""
         self.statusBar().showMessage(f"Tool: {mode}{suffix}")
 
+    def _window_bounds(self) -> tuple[int, int]:
+        return self.capture.column_window_bounds(
+            self.window_start_x,
+            self.window_columns,
+        )
+
+    def _aligned_window_start(self, start: float) -> int:
+        aligned = round(float(start) / self.window_step_columns)
+        aligned *= self.window_step_columns
+        return self.capture.column_window_bounds(
+            aligned,
+            self.window_columns,
+        )[0]
+
     def _load_window(
         self, *, initial: bool = False, center_x: float | None = None
     ) -> None:
         old_center = self.view.mapToScene(self.view.viewport().rect().center())
         old_left = self._window_x_left
-        start, stop, x_left, x_right = self.capture.window_bounds(
-            self.window_start, self.window_size
-        )
-        self.window_start = start
+        x_left, x_right = self._window_bounds()
+        self.window_start_x = x_left
         self._window_x_left = float(x_left)
 
-        for item in self.frame_items:
-            self.scene.removeItem(item)
-        self.frame_items.clear()
-
-        QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
-        try:
-            for index in range(start, stop):
-                frame = self.capture.frames[index]
-                pixmap_item = QGraphicsPixmapItem(self.pixmap_cache.get(index))
-                pixmap_item.setPos(frame.x_start, 0.0)
-                pixmap_item.setZValue(-100)
-                self.scene.addItem(pixmap_item)
-                self.frame_items.append(pixmap_item)
-
-                if index > start:
-                    boundary = QGraphicsLineItem(
-                        frame.x_start,
-                        0.0,
-                        frame.x_start,
-                        self.capture.image_height,
-                    )
-                    boundary.setPen(_cosmetic_pen(QColor(255, 255, 255, 55)))
-                    boundary.setZValue(-50)
-                    self.scene.addItem(boundary)
-                    self.frame_items.append(boundary)
-        finally:
-            QApplication.restoreOverrideCursor()
+        if self.image_item is not None:
+            self.scene.removeItem(self.image_item)
+            self.image_item = None
+        if self.loaded_capture is not None:
+            rgb = np.ascontiguousarray(
+                self.loaded_capture.rgb[:, x_left:x_right]
+            )
+            image = QImage(
+                rgb.data,
+                rgb.shape[1],
+                rgb.shape[0],
+                rgb.strides[0],
+                QImage.Format.Format_RGB888,
+            ).copy()
+            self.image_item = QGraphicsPixmapItem(QPixmap.fromImage(image))
+            self.image_item.setPos(float(x_left), 0.0)
+            self.image_item.setZValue(-100)
+            self.scene.addItem(self.image_item)
 
         rect = QRectF(
             float(x_left),
@@ -2031,14 +1930,11 @@ class SpeedConstraintWindow(QMainWindow):
                 min(max(old_center.y(), rect.top()), rect.bottom()),
             )
 
-        first_name = self.capture.frames[start].path.stem
-        last_name = self.capture.frames[stop - 1].path.stem
-        names = first_name if first_name == last_name else f"{first_name} – {last_name}"
         self.window_label.setText(
-            f"{start + 1}–{stop} / {len(self.capture.frames)}   {names}"
+            f"x {x_left:,}–{x_right:,} / {self.capture.total_width:,}"
         )
-        self.previous_action.setEnabled(start > 0)
-        self.next_action.setEnabled(stop < len(self.capture.frames))
+        self.previous_action.setEnabled(x_left > 0)
+        self.next_action.setEnabled(x_right < self.capture.total_width)
         self.navigator.set_window_range(float(x_left), float(x_right))
         if not initial and self.navigator.data is not None:
             QTimer.singleShot(0, self._ensure_navigator_window_visible)
@@ -2061,27 +1957,35 @@ class SpeedConstraintWindow(QMainWindow):
                 item.setVisible(x_left <= cut.x <= x_right)
 
     def previous_window(self) -> None:
-        if self.window_start > 0:
-            self.window_start -= 1
+        if self.window_start_x > 0:
+            self.window_start_x = max(
+                0,
+                self.window_start_x - self.window_step_columns,
+            )
             self._load_window()
 
     def next_window(self) -> None:
-        if self.window_start + self.window_size < len(self.capture.frames):
-            self.window_start += 1
+        _x_left, x_right = self._window_bounds()
+        if x_right < self.capture.total_width:
+            self.window_start_x = min(
+                self.capture.total_width - self.window_columns,
+                self.window_start_x + self.window_step_columns,
+            )
             self._load_window()
 
-    def _set_window_size(self, value: int) -> None:
-        self.window_size = value
-        self._load_window()
+    def _set_window_columns(self, value: int) -> None:
+        old_left, old_right = self._window_bounds()
+        self.window_columns = min(max(1, value), self.capture.total_width)
+        self.window_start_x = self._aligned_window_start(
+            (old_left + old_right - self.window_columns) / 2
+        )
+        self._load_window(center_x=(old_left + old_right) / 2)
 
     def _ensure_x_visible(self, x: float, y: float | None = None) -> None:
-        frame_index = self.capture.frame_index_at_x(x)
-        if not (
-            self.window_start <= frame_index < self.window_start + self.window_size
-        ):
-            self.window_start = min(
-                max(0, frame_index - self.window_size // 2),
-                len(self.capture.frames) - self.window_size,
+        x_left, x_right = self._window_bounds()
+        if not x_left <= x <= x_right:
+            self.window_start_x = self._aligned_window_start(
+                x - self.window_columns / 2
             )
             self._load_window(center_x=x)
         if not self.view.fit_mode:
@@ -2131,9 +2035,7 @@ class SpeedConstraintWindow(QMainWindow):
             )
             self.scene.addItem(item)
             self.cut_items[cut.id] = item
-        _start, _stop, x_left, x_right = self.capture.window_bounds(
-            self.window_start, self.window_size
-        )
+        x_left, x_right = self._window_bounds()
         self._update_annotation_visibility(float(x_left), float(x_right))
 
     def _populate_lists(self, selected_key: tuple[str, str] | None = None) -> None:
@@ -2509,9 +2411,7 @@ class SpeedConstraintWindow(QMainWindow):
         self._mark_changed()
 
     def _mark_changed(self) -> None:
-        _start, _stop, x_left, x_right = self.capture.window_bounds(
-            self.window_start, self.window_size
-        )
+        x_left, x_right = self._window_bounds()
         self._update_annotation_visibility(float(x_left), float(x_right))
         self._dirty = True
         self.save()
@@ -2557,9 +2457,9 @@ class SpeedConstraintWindow(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
-        if self.navigator_loader is not None and self.navigator_loader.isRunning():
-            self.navigator_loader.requestInterruption()
-            self.navigator_loader.wait()
+        if self.capture_loader is not None and self.capture_loader.isRunning():
+            self.capture_loader.requestInterruption()
+            self.capture_loader.wait()
         event.accept()
 
 
@@ -2632,10 +2532,22 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"JSON filename inside the capture directory (default: {DEFAULT_JSON_NAME})",
     )
     parser.add_argument(
-        "--window-size",
+        "--window-columns",
         type=int,
-        default=DEFAULT_WINDOW_SIZE,
-        help=f"number of consecutive chunks to show (default: {DEFAULT_WINDOW_SIZE})",
+        default=DEFAULT_WINDOW_COLUMNS,
+        help=(
+            "width of the detailed half-resolution view in columns "
+            f"(default: {DEFAULT_WINDOW_COLUMNS})"
+        ),
+    )
+    parser.add_argument(
+        "--window-step-columns",
+        type=int,
+        default=DEFAULT_WINDOW_STEP_COLUMNS,
+        help=(
+            "columns moved by the left/right keys "
+            f"(default: {DEFAULT_WINDOW_STEP_COLUMNS})"
+        ),
     )
     parser.add_argument(
         "--frame-rows",
@@ -2643,20 +2555,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_FRAME_ROWS,
         help=f"raw sensor row count (default: {DEFAULT_FRAME_ROWS})",
     )
-    parser.add_argument(
-        "--cache-frames",
-        type=int,
-        default=24,
-        help="decoded frame pixmaps retained in memory (default: 24)",
-    )
     args = parser.parse_args(argv)
     json_name = Path(args.json_name)
     if json_name.name != args.json_name or json_name.suffix.lower() != ".json":
         parser.error("--json-name must be a .json filename without a directory")
-    if args.window_size < 1:
-        parser.error("--window-size must be positive")
-    if args.cache_frames < 1:
-        parser.error("--cache-frames must be positive")
+    if args.window_columns < 1:
+        parser.error("--window-columns must be positive")
+    if args.window_step_columns < 1:
+        parser.error("--window-step-columns must be positive")
     return args
 
 
@@ -2678,8 +2584,8 @@ def main(argv: list[str] | None = None) -> int:
         capture,
         document,
         json_path,
-        window_size=args.window_size,
-        cache_frames=args.cache_frames,
+        window_columns=args.window_columns,
+        window_step_columns=args.window_step_columns,
     )
     window.show()
     return app.exec()

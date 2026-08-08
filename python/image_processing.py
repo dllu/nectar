@@ -56,13 +56,32 @@ def auto_tone_map_to_uint8(
     low_percentile: float = 0.5,
     high_percentile: float = 99.5,
     gamma: float = 2.2,
+    statistics: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Apply a simple display-only percentile stretch and gamma curve."""
+    """Apply a simple display-only percentile stretch and gamma curve.
+
+    ``statistics`` may be a representative RGB subset when scanning all of a
+    very large image merely to choose two display points would be wasteful.
+    The returned image always contains every pixel from ``rgb``.
+    """
     rgb = np.asarray(rgb)
     if rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2] != 3:
         raise ValueError("automatic tone mapping expects an HxWx3 uint8 image")
+    if statistics is None:
+        statistics = rgb
+    else:
+        statistics = np.asarray(statistics)
+        if (
+            statistics.dtype != np.uint8
+            or statistics.ndim != 3
+            or statistics.shape[2] != 3
+            or statistics.size == 0
+        ):
+            raise ValueError(
+                "tone-map statistics must be a non-empty HxWx3 uint8 image"
+            )
     black_point, white_point = np.percentile(
-        rgb,
+        statistics,
         (low_percentile, high_percentile),
     )
     if white_point <= black_point:

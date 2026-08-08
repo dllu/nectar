@@ -17,22 +17,23 @@ Some simple programs for capturing images from Alkeria Necta line scan camera.
 
 ## Speed-constraint annotations
 
-The raw speed-constraint editor displays consecutive Bayer-binned capture
-chunks and autosaves circle, equal-width, and sequence-cut annotations beside
-the raw data:
+The raw speed-constraint editor displays the Bayer-binned capture and autosaves
+circle, equal-width, and sequence-cut annotations beside the raw data:
 
 ```sh
 uv run python python/speed_constraints.py /path/to/capture
 ```
 
-It opens 16 chunks at a time by default. A bounded-memory navigator is built
-at the bottom by sampling each raw chunk one at a time; click it to center the
-detailed sliding window. The navigator wraps into multiple rows as needed, and
-its divider can be dragged vertically. Use Left/Right to slide by one chunk,
-Ctrl+mouse-wheel to zoom, F to enable persistent fitting, F8 to hide the
-navigator, and F9 to hide the annotation panel. Fit mode is enabled initially
-and refits whenever the window is resized; manual zoom or 100% mode disables
-it. The **Rotate 180°** checkbox rotates both detailed and
+At startup it reads every raw file once and retains the complete uint8 display
+image in memory. The detailed window is 4096 half-resolution columns wide by
+default, independent of the raw file sizes. A uniformly scaled navigator is
+built from that image at the bottom; click it to center the detailed window.
+The navigator wraps into multiple rows as needed, and its divider can be
+dragged vertically. Use Left/Right to slide by 256 columns, Ctrl+mouse-wheel to
+zoom, F to enable persistent fitting, F8 to hide the navigator, and F9 to hide
+the annotation panel. Fit mode is enabled initially and refits whenever the
+window is resized; manual zoom or 100% mode disables it. The **Rotate 180°**
+checkbox rotates both detailed and
 navigator views without changing saved coordinates; it starts checked for
 pre-2026 captures and unchecked for 2026-and-later captures so both camera
 mounting eras appear upright. The default output is `speed_constraints.json`
@@ -40,7 +41,10 @@ in the capture directory; an existing file is loaded when the tool starts.
 
 `preview.py` loads that file automatically. Circle and equal-width annotations
 refine the correlation-derived speed spline without changing its direction,
-and sequence positions replace motion-region detection and define one output
+using a fixed, uniformly spaced spline basis. Each equal-width group has a
+jointly fitted common output width; all manual dimensions use a fixed 2.5-pixel
+annotation uncertainty, so longer annotations carry tighter relative weight.
+Sequence positions replace motion-region detection and define one output
 DNG/JPEG per adjacent pair. The first and last positions also bound speed
 fitting: only complete correlation windows inside those bounds are eligible.
 Featureless background windows are rejected as undefined unless they contain
@@ -50,7 +54,8 @@ to render with the legacy automatic behavior for comparison. Pass
 `--equal-length-chunks` to use only the first
 and last annotated positions and split that corrected output range into nearly
 equal chunks smaller than `OUTPUT_CHUNK_TARGET`, ignoring intermediate cut
-positions.
+positions. Pass `--pad-output-to-equal-widths` instead to retain every annotated
+cut and pad the resulting slices to the width of the widest one.
 
 Output orientation follows the camera mounting date: captures before 2026 are
 not rotated, while captures from 2026 onward are rotated 180 degrees. Override

@@ -22,7 +22,11 @@ class MemoryEfficientHelpersTest(unittest.TestCase):
                 raw.tofile(capture / f"{index:04d}.bin")
 
             with (
-                patch.object(preview.np, "percentile", side_effect=(1.0, 2.0)),
+                patch.object(
+                    preview,
+                    "moving_region_block_scores",
+                    return_value=[(0, 8, 1.0), (8, 16, 2.0)],
+                ),
                 patch.object(
                     preview,
                     "estimate_white_balance",
@@ -39,7 +43,7 @@ class MemoryEfficientHelpersTest(unittest.TestCase):
                 with self.assertRaises(ReachedStructureMask):
                     preview.process_preview(
                         capture,
-                        padding=0,
+                        padding_columns=0,
                         show_progress=False,
                         output_dir=output,
                     )

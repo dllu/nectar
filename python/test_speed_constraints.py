@@ -10,14 +10,15 @@ from speed_constraints import (
     CaptureSequence,
     CircleConstraint,
     CutPosition,
-    DEFAULT_WINDOW_SIZE,
+    DEFAULT_WINDOW_COLUMNS,
+    DEFAULT_WINDOW_STEP_COLUMNS,
     FrameInfo,
     WidthGroup,
     WidthSegment,
     build_navigator_data,
     capture_defaults_to_rotated_180,
     decode_raw_frame,
-    decode_raw_frame_thumbnail,
+    load_capture_data,
     navigator_thumbnail_geometry,
 )
 
@@ -32,8 +33,10 @@ class SpeedConstraintsTest(unittest.TestCase):
     def make_raw_frame(self, raw_columns: int = 4) -> np.ndarray:
         return np.zeros((self.FRAME_ROWS, raw_columns), dtype=np.uint16)
 
-    def test_default_window_shows_sixteen_chunks(self):
-        self.assertEqual(DEFAULT_WINDOW_SIZE, 16)
+    def test_default_window_is_a_fixed_power_of_two_column_span(self):
+        self.assertEqual(DEFAULT_WINDOW_COLUMNS, 4096)
+        self.assertEqual(DEFAULT_WINDOW_STEP_COLUMNS, 256)
+        self.assertEqual(DEFAULT_WINDOW_COLUMNS % DEFAULT_WINDOW_STEP_COLUMNS, 0)
 
     def test_discovers_frames_in_natural_order_and_builds_global_x(self):
         with TemporaryDirectory() as directory:
@@ -50,6 +53,24 @@ class SpeedConstraintsTest(unittest.TestCase):
             self.assertEqual([frame.x_start for frame in capture.frames], [0, 2])
             self.assertEqual(capture.image_height, 2)
             self.assertEqual(capture.total_width, 4)
+
+    def test_column_window_does_not_depend_on_frame_partitioning(self):
+        narrow_frames = [
+            FrameInfo(Path(f"n{index}.bin"), raw_columns=512, x_start=index * 256)
+            for index in range(32)
+        ]
+        wide_frames = [
+            FrameInfo(Path(f"w{index}.bin"), raw_columns=2048, x_start=index * 1024)
+            for index in range(8)
+        ]
+        narrow = CaptureSequence(Path("."), 4096, narrow_frames)
+        wide = CaptureSequence(Path("."), 4096, wide_frames)
+
+        self.assertEqual(narrow.total_width, wide.total_width)
+        self.assertEqual(
+            narrow.column_window_bounds(2300, DEFAULT_WINDOW_COLUMNS),
+            wide.column_window_bounds(2300, DEFAULT_WINDOW_COLUMNS),
+        )
 
     def test_decodes_the_preview_bayer_layout_without_color_correction(self):
         with TemporaryDirectory() as directory:
@@ -73,13 +94,6 @@ class SpeedConstraintsTest(unittest.TestCase):
             np.testing.assert_array_equal(rgb[:, :, 0], red)
             np.testing.assert_array_equal(rgb[:, :, 1], (green_1 + green_2) // 2)
             np.testing.assert_array_equal(rgb[:, :, 2], blue)
-            thumbnail = decode_raw_frame_thumbnail(
-                capture.frames[0],
-                self.FRAME_ROWS,
-                target_height=2,
-                target_width=2,
-            )
-            np.testing.assert_array_equal(thumbnail, rgb)
 
     def test_auto_tone_map_stretches_contrast_and_applies_gamma(self):
         rgb = np.array([[[32, 96, 160]]], dtype=np.uint8)
@@ -94,6 +108,23 @@ class SpeedConstraintsTest(unittest.TestCase):
         np.testing.assert_array_equal(
             corrected,
             np.array([[[0, 180, 255]]], dtype=np.uint8),
+        )
+
+    def test_auto_tone_map_can_choose_points_from_a_small_reference(self):
+        rgb = np.array([[[32, 96, 160], [255, 255, 255]]], dtype=np.uint8)
+        statistics = rgb[:, :1]
+
+        corrected = auto_tone_map_to_uint8(
+            rgb,
+            low_percentile=0,
+            high_percentile=100,
+            gamma=2.0,
+            statistics=statistics,
+        )
+
+        np.testing.assert_array_equal(
+            corrected,
+            np.array([[[0, 180, 255], [255, 255, 255]]], dtype=np.uint8),
         )
 
     def test_json_round_trip_preserves_constraints_and_assigns_cut_roles(self):
@@ -138,27 +169,63 @@ class SpeedConstraintsTest(unittest.TestCase):
             self.assertIsNone(loaded.source_warning(capture))
             self.assertEqual(list(root.glob(".speed_constraints.json.*.tmp")), [])
 
-    def test_builds_a_single_bounded_thumbnail_strip_for_all_frames(self):
+    def test_loads_every_frame_once_into_one_contiguous_display_image(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
-            self.write_frame(root / "im000000.bin", self.make_raw_frame())
-            self.write_frame(root / "im000001.bin", self.make_raw_frame())
+            first = self.make_raw_frame()
+            second = self.make_raw_frame()
+            first[0::2, 1::2] = 32 << 8
+            second[0::2, 1::2] = 224 << 8
+            self.write_frame(root / "im000000.bin", first)
+            self.write_frame(root / "im000001.bin", second)
             capture = CaptureSequence.discover(root, frame_rows=self.FRAME_ROWS)
             progress = []
+            statuses = []
 
-            navigator = build_navigator_data(
+            loaded = load_capture_data(
                 capture,
-                preferred_height=2,
-                max_bytes=1024,
                 progress=lambda completed, total: progress.append((completed, total)),
+                status=statuses.append,
             )
 
-            self.assertIsNotNone(navigator)
-            assert navigator is not None
-            self.assertEqual(navigator.rgb.shape, (2, 4, 3))
-            self.assertEqual(navigator.frame_starts, (0, 2))
-            self.assertEqual(navigator.frame_widths, (2, 2))
+            self.assertIsNotNone(loaded)
+            assert loaded is not None
+            self.assertEqual(loaded.rgb.shape, (2, 4, 3))
+            self.assertGreater(
+                loaded.rgb[:, 2:, 0].mean(),
+                loaded.rgb[:, :2, 0].mean(),
+            )
+            self.assertEqual(loaded.navigator.source_width, 4)
             self.assertEqual(progress[-1], (2, 2))
+            self.assertEqual(
+                statuses,
+                [
+                    "Applying display tone map…",
+                    "Building low-resolution navigator…",
+                ],
+            )
+
+    def test_builds_one_uniform_navigator_for_the_global_image(self):
+        capture = CaptureSequence(
+            directory=Path("."),
+            frame_rows=4,
+            frames=[
+                FrameInfo(Path("a.bin"), raw_columns=4, x_start=0),
+                FrameInfo(Path("b.bin"), raw_columns=4, x_start=2),
+            ],
+        )
+        rgb = np.arange(24, dtype=np.uint8).reshape(2, 4, 3)
+
+        navigator = build_navigator_data(
+            capture,
+            rgb,
+            preferred_height=2,
+            max_bytes=1024,
+        )
+
+        self.assertEqual(navigator.rgb.shape, (2, 4, 3))
+        self.assertEqual(navigator.source_width, 4)
+        np.testing.assert_array_equal(navigator.rgb, rgb)
 
     def test_navigator_geometry_reduces_resolution_to_honor_memory_budget(self):
         frame_path = Path("unused.bin")
@@ -171,15 +238,22 @@ class SpeedConstraintsTest(unittest.TestCase):
             ],
         )
 
-        height, widths = navigator_thumbnail_geometry(
+        height, width = navigator_thumbnail_geometry(
             capture,
             preferred_height=2,
             max_bytes=300,
         )
 
-        self.assertLessEqual(height * sum(widths) * 3, 300)
+        self.assertLessEqual(height * width * 3, 300)
         self.assertEqual(height, 1)
-        self.assertEqual(set(widths), {1})
+        self.assertEqual(width, 50)
+
+        tiny_height, tiny_width = navigator_thumbnail_geometry(
+            capture,
+            preferred_height=2,
+            max_bytes=30,
+        )
+        self.assertEqual((tiny_height, tiny_width), (1, 10))
 
     def test_rejects_a_raw_file_with_an_incomplete_sensor_column(self):
         with TemporaryDirectory() as directory:

@@ -46,13 +46,16 @@ CAPTURE_DATETIME_FORMAT = "%Y-%m-%d-%H-%M-%S"
 DNG_DATETIME_FORMAT = "%Y:%m:%d %H:%M:%S"
 SHUTTER_TICKS_PER_SECOND = 10_000_000  # Capture UI stores shutter in 100 ns ticks.
 ENABLE_COLUMN_JITTER_CORRECTION = True
-FORCE_CONTIGUOUS_SELECTION = True
 # None selects the hardware-era default from the capture timestamp: the camera
 # was mounted upright through 2025 and upside down from 2026 onward.
 FLIP_OUTPUT_180: bool | None = None
 STRUCTURE_MASK_DOWNSAMPLE = 8
 STRUCTURE_MASK_THRESHOLD = 0.05
 STRUCTURE_MASK_DILATE_PX = 0
+PROCESSING_PADDING_COLUMNS = 4096
+MOVING_REGION_BLOCK_COLUMNS = 4096
+STRUCTURE_MASK_BLOCK_COLUMNS = 4096
+WHITE_BALANCE_SAMPLE_COLUMNS = 8192
 ENABLE_JITTER_DEBUG_PLOT = False
 ENABLE_SKEW_DEBUG_OUTPUT = False
 JITTER_DEBUG_ROW = 2000
@@ -104,14 +107,12 @@ SPEED_CONSTRAINT_PRIOR_LOG_SIGMA = 0.2
 SPEED_CONSTRAINT_CURVATURE_LENGTH = 8192.0
 SPEED_CONSTRAINT_CURVATURE_SAMPLE_SPACING = 512.0
 SPEED_CONSTRAINT_CURVATURE_LOG_SIGMA = 0.05
-# Hand-placed bounds are not metrology. Even a careful one-pixel error on a
-# roughly 100-pixel feature is already a percent-level speed error, so manual
-# annotations guide the stiff fit instead of acting as exact interpolation
-# points.
-SPEED_CIRCLE_LOG_SIGMA = 0.01
-SPEED_EQUAL_WIDTH_LOG_SIGMA = 0.01
-SPEED_CIRCLE_DIMENSION_SIGMA_PIXELS = 1.5
+# Circle diameters and equal-width spans are both dimensions placed manually in
+# the Bayer-binned annotation image. Model their uncertainty in those pixels so
+# longer dimensions supply proportionally tighter relative constraints.
+SPEED_ANNOTATION_DIMENSION_SIGMA_PIXELS = 2.5
 OUTPUT_CHUNK_TARGET = 32768
+EDGE_PADDING_SAMPLE_COLUMNS = 128
 MAX_CONCURRENT_RENDERS = 2
 JITTER_RED = 0
 JITTER_GREEN1 = 1
@@ -548,12 +549,11 @@ class CircleSpeedConstraint:
     @property
     def log_speed_sigma(self) -> float:
         """Propagate pixel-scale diameter uncertainty into the speed ratio."""
-        dimension_sigma = SPEED_CIRCLE_DIMENSION_SIGMA_PIXELS
-        annotation_sigma = math.hypot(
+        dimension_sigma = SPEED_ANNOTATION_DIMENSION_SIGMA_PIXELS
+        return math.hypot(
             dimension_sigma / self.width,
             dimension_sigma / self.height,
         )
-        return max(SPEED_CIRCLE_LOG_SIGMA, annotation_sigma)
 
 
 @dataclass(frozen=True)
@@ -561,6 +561,15 @@ class EqualWidthSegment:
     identifier: str
     x1: float
     x2: float
+
+    @property
+    def width(self) -> float:
+        return self.x2 - self.x1
+
+    @property
+    def log_width_sigma(self) -> float:
+        """Propagate fixed annotation-pixel uncertainty into relative width."""
+        return SPEED_ANNOTATION_DIMENSION_SIGMA_PIXELS / self.width
 
 
 @dataclass(frozen=True)
@@ -821,22 +830,46 @@ def select_frames_for_cut_region(
     frame_widths: np.ndarray,
     cut_positions: tuple[float, ...],
     *,
-    padding: int,
+    padding_columns: int,
 ) -> list[int]:
     """Select frames intersecting the manual ROI plus processing-only padding."""
     if len(cut_positions) < 2:
         raise ValueError("at least a start and end cut position are required")
-    if padding < 0:
-        raise ValueError("padding must be non-negative")
+    if padding_columns < 0:
+        raise ValueError("padding_columns must be non-negative")
+    padded_start, padded_end = aligned_processing_column_bounds(
+        int(frame_starts[-1]),
+        cut_positions[0] - padding_columns,
+        cut_positions[-1] + padding_columns,
+    )
     frame_ends = frame_starts[:-1] + frame_widths
     intersecting = np.flatnonzero(
-        (frame_ends > cut_positions[0]) & (frame_starts[:-1] < cut_positions[-1])
+        (frame_ends > padded_start) & (frame_starts[:-1] < padded_end)
     )
     if not len(intersecting):
         raise ValueError("annotated cut region does not intersect any raw frames")
-    first = max(0, int(intersecting[0]) - padding)
-    last = min(len(frame_widths) - 1, int(intersecting[-1]) + padding)
-    return list(range(first, last + 1))
+    return list(range(int(intersecting[0]), int(intersecting[-1]) + 1))
+
+
+def aligned_processing_column_bounds(
+    capture_width: int,
+    start: float,
+    stop: float,
+    *,
+    alignment: int = STRUCTURE_MASK_DOWNSAMPLE,
+) -> tuple[int, int]:
+    """Clamp and outward-align an analysis interval independently of raw files."""
+    if capture_width < alignment or alignment < 1:
+        raise ValueError("capture width and alignment must be positive")
+    aligned_capture_width = capture_width - capture_width % alignment
+    aligned_start = max(0, math.floor(start / alignment) * alignment)
+    aligned_stop = min(
+        aligned_capture_width,
+        math.ceil(stop / alignment) * alignment,
+    )
+    if aligned_stop <= aligned_start:
+        raise ValueError("processing column interval is empty")
+    return aligned_start, aligned_stop
 
 
 def format_contiguous_segments(indices):
@@ -1021,6 +1054,43 @@ class ChannelView:
             abs_col = self.col_offset + idx * self.col_step
         # fetch from parent cache
         return self.cache[abs_row, abs_col]
+
+
+class ColumnSliceView:
+    """A zero-copy coordinate view over an exact contiguous column interval."""
+
+    def __init__(self, source, start: int, stop: int):
+        if not 0 <= start < stop <= source.width:
+            raise ValueError("column slice lies outside its source")
+        self.source = source
+        self.start = int(start)
+        self.stop = int(stop)
+        self.height = source.height
+        self.width = self.stop - self.start
+
+    @property
+    def shape(self):
+        return (self.height, self.width)
+
+    def __getitem__(self, key):
+        if not isinstance(key, tuple) or len(key) != 2:
+            raise IndexError("ColumnSliceView requires 2D indexing")
+        row_key, col_key = key
+        if isinstance(col_key, slice):
+            start, stop, step = col_key.indices(self.width)
+            if step < 1:
+                raise IndexError("negative column strides are not supported")
+            source_columns = slice(
+                self.start + start,
+                self.start + stop,
+                step,
+            )
+        else:
+            index = col_key if col_key >= 0 else self.width + col_key
+            if not 0 <= index < self.width:
+                raise IndexError("column index is out of range")
+            source_columns = self.start + index
+        return self.source[row_key, source_columns]
 
 
 def windowed_cross_correlation(
@@ -1908,11 +1978,37 @@ def corrected_interval_length(
     return float(np.trapezoid(1.0 / speed, xs))
 
 
+def _best_fit_equal_width(
+    lengths: np.ndarray,
+    segments: tuple[EqualWidthSegment, ...],
+) -> float:
+    """Return the fixed-spline optimum for a group's latent output width."""
+    lengths = np.asarray(lengths, dtype=np.float64)
+    if lengths.shape != (len(segments),):
+        raise ValueError("equal-width lengths and segments must match")
+    if not np.all(np.isfinite(lengths)) or np.any(lengths <= 0.0):
+        raise ValueError("equal-width lengths must be finite and positive")
+    log_sigmas = np.asarray(
+        [segment.log_width_sigma for segment in segments],
+        dtype=np.float64,
+    )
+    weights = 1.0 / np.square(log_sigmas)
+    return float(np.exp(np.average(np.log(lengths), weights=weights)))
+
+
 def _speed_constraint_diagnostics(
     base_spline,
     refined_spline,
     constraints: ManualSpeedConstraints,
+    *,
+    refined_group_widths: dict[str, float] | None = None,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    if refined_group_widths is None:
+        refined_group_widths = getattr(
+            refined_spline,
+            "equal_width_group_widths",
+            {},
+        )
     circles = []
     for circle in constraints.circles:
         base_speed = float(abs(base_spline(circle.center_x)))
@@ -1948,8 +2044,14 @@ def _speed_constraint_diagnostics(
             ],
             dtype=np.float64,
         )
-        base_target = float(np.exp(np.mean(np.log(base_lengths))))
-        refined_target = float(np.exp(np.mean(np.log(refined_lengths))))
+        base_target = _best_fit_equal_width(base_lengths, group.segments)
+        refined_target = refined_group_widths.get(group.identifier)
+        if refined_target is None:
+            refined_target = _best_fit_equal_width(refined_lengths, group.segments)
+        if not math.isfinite(refined_target) or refined_target <= 0.0:
+            raise ValueError(
+                f"equal-width group {group.identifier} has an invalid fitted width"
+            )
         segments = []
         for segment, base_length, refined_length in zip(
             group.segments, base_lengths, refined_lengths
@@ -1959,6 +2061,10 @@ def _speed_constraint_diagnostics(
                     "id": segment.identifier,
                     "x1": segment.x1,
                     "x2": segment.x2,
+                    "annotation_width_pixels": segment.width,
+                    "annotation_sigma_pixels": (
+                        SPEED_ANNOTATION_DIMENSION_SIGMA_PIXELS
+                    ),
                     "correlation_output_length": float(base_length),
                     "refined_output_length": float(refined_length),
                     "correlation_relative_residual": float(
@@ -1966,6 +2072,12 @@ def _speed_constraint_diagnostics(
                     ),
                     "refined_relative_residual": float(
                         refined_length / refined_target - 1.0
+                    ),
+                    "correlation_annotation_residual_pixels": float(
+                        math.log(base_length / base_target) * segment.width
+                    ),
+                    "refined_annotation_residual_pixels": float(
+                        math.log(refined_length / refined_target) * segment.width
                     ),
                 }
             )
@@ -1999,8 +2111,9 @@ def refine_speed_spline_with_constraints(
     background correlation outside them is excluded entirely.  The optimized
     log-speed spline itself is physically stiff, so endpoint behavior or local
     errors in the correlation curve cannot be baked into the manual
-    refinement.  Circle annotations set absolute scale; equal-width groups
-    constrain the integral of reciprocal speed over each annotated interval.
+    refinement. Circle annotations set absolute scale. Each equal-width group
+    gets a jointly fitted common output width, and its annotated intervals
+    constrain their integrals of reciprocal speed to that width.
     """
     active_groups = tuple(
         group for group in constraints.width_groups if len(group.segments) >= 2
@@ -2065,25 +2178,43 @@ def refine_speed_spline_with_constraints(
         4,
         int(math.ceil(span / SPEED_CONSTRAINT_KNOT_SPACING)) + 1,
     )
-    # Keep the coarse 8192-pixel basis, adding representation points only at
-    # actual human annotations.  Stiffness is imposed below on physical
-    # second derivative, independently of how many annotations were supplied.
-    knot_locations = list(
-        np.linspace(fit_x_min, fit_x_max, coarse_knot_count, dtype=np.float64)
+    # Keep the representation independent of annotation locations. Adding a
+    # knot at every annotation gives the fit a local degree of freedom that can
+    # bend toward a constraint and immediately return to the correlation prior.
+    # A fixed coarse basis makes every constraint adjust the shared smooth
+    # speed field instead.
+    knots = np.linspace(
+        fit_x_min,
+        fit_x_max,
+        coarse_knot_count,
+        dtype=np.float64,
     )
-    knot_locations.extend(circle.center_x for circle, _target in circle_data)
-    knot_locations.extend(
-        (segment.x1 + segment.x2) / 2.0
-        for _group, segment_grids in group_grids
-        for segment, _xs in segment_grids
-    )
-    knots = np.unique(np.asarray(knot_locations, dtype=np.float64))
     initial_magnitude = np.abs(np.asarray(base_spline(knots), dtype=np.float64))
     if not np.all(np.isfinite(initial_magnitude)) or np.any(
         initial_magnitude <= 0.0
     ):
         raise ValueError("correlation spline cannot initialize the speed fit")
-    initial = np.log(initial_magnitude)
+    initial_speed_coefficients = np.log(initial_magnitude)
+    speed_coefficient_count = len(initial_speed_coefficients)
+    initial_group_log_widths = []
+    for _group, segment_grids in group_grids:
+        segments = tuple(segment for segment, _xs in segment_grids)
+        base_lengths = np.asarray(
+            [
+                corrected_interval_length(base_spline, segment.x1, segment.x2)
+                for segment in segments
+            ],
+            dtype=np.float64,
+        )
+        initial_group_log_widths.append(
+            math.log(_best_fit_equal_width(base_lengths, segments))
+        )
+    initial = np.concatenate(
+        (
+            initial_speed_coefficients,
+            np.asarray(initial_group_log_widths, dtype=np.float64),
+        )
+    )
 
     correlation_x = np.asarray(
         getattr(base_spline, "correlation_x", knots), dtype=np.float64
@@ -2153,7 +2284,9 @@ def refine_speed_spline_with_constraints(
             return float(result)
         return result
 
-    def residuals(coefficients):
+    def residuals(parameters):
+        coefficients = parameters[:speed_coefficient_count]
+        group_log_widths = parameters[speed_coefficient_count:]
         result = list(
             (
                 speed_log_spline(coefficients)(correlation_x)
@@ -2173,15 +2306,17 @@ def refine_speed_spline_with_constraints(
         for circle, target in circle_data:
             speed = abs(evaluate(coefficients, circle.center_x))
             result.append(math.log(speed / target) / circle.log_speed_sigma)
-        for _group, segment_grids in group_grids:
+        for group_index, (_group, segment_grids) in enumerate(group_grids):
             lengths = []
-            for _segment, xs in segment_grids:
+            log_sigmas = []
+            for segment, xs in segment_grids:
                 speed = np.abs(evaluate(coefficients, xs))
                 lengths.append(float(np.trapezoid(1.0 / speed, xs)))
+                log_sigmas.append(segment.log_width_sigma)
             log_lengths = np.log(np.asarray(lengths, dtype=np.float64))
             result.extend(
-                (log_lengths - np.mean(log_lengths))
-                / SPEED_EQUAL_WIDTH_LOG_SIGMA
+                (log_lengths - group_log_widths[group_index])
+                / np.asarray(log_sigmas, dtype=np.float64)
             )
         return np.asarray(result, dtype=np.float64)
 
@@ -2197,10 +2332,20 @@ def refine_speed_spline_with_constraints(
     if not solution.success or not np.all(np.isfinite(solution.x)):
         raise RuntimeError(f"manual speed-constraint fit failed: {solution.message}")
 
-    coefficients = solution.x.copy()
+    coefficients = solution.x[:speed_coefficient_count].copy()
+    group_log_widths = solution.x[speed_coefficient_count:].copy()
+    equal_width_group_widths = {
+        group.identifier: float(math.exp(log_width))
+        for (group, _segment_grids), log_width in zip(
+            group_grids,
+            group_log_widths,
+        )
+    }
 
     def refined_spline(values):
         return evaluate(coefficients, values)
+
+    refined_spline.equal_width_group_widths = equal_width_group_widths
 
     circle_diagnostics, group_diagnostics = _speed_constraint_diagnostics(
         base_spline,
@@ -2218,6 +2363,7 @@ def refine_speed_spline_with_constraints(
             ),
             constraints.cut_positions,
         ),
+        refined_group_widths=equal_width_group_widths,
     )
 
     if verbose:
@@ -2244,16 +2390,16 @@ def refine_speed_spline_with_constraints(
             )
         for group in group_diagnostics:
             before = [
-                abs(float(segment["correlation_relative_residual"]))
+                abs(float(segment["correlation_annotation_residual_pixels"]))
                 for segment in group["segments"]
             ]
             after = [
-                abs(float(segment["refined_relative_residual"]))
+                abs(float(segment["refined_annotation_residual_pixels"]))
                 for segment in group["segments"]
             ]
             print(
-                f"equal-width group {group['name']!r} max residual: "
-                f"{100 * max(before):.3f}% -> {100 * max(after):.3f}%"
+                f"equal-width group {group['name']!r} max annotation residual: "
+                f"{max(before):.3f}px -> {max(after):.3f}px"
             )
 
     if diagnostic_dir is not None:
@@ -2262,6 +2408,9 @@ def refine_speed_spline_with_constraints(
         payload = {
             "source": str(constraints.path),
             "motion_direction": int(direction),
+            "annotation_dimension_sigma_pixels": (
+                SPEED_ANNOTATION_DIMENSION_SIGMA_PIXELS
+            ),
             "optimizer": {
                 "success": bool(solution.success),
                 "message": str(solution.message),
@@ -2540,24 +2689,92 @@ def bin2to1_rgb_u8(data: np.ndarray) -> np.ndarray:
     return summed.astype(np.uint8)
 
 
+def moving_region_block_scores(
+    green_view,
+    max_green: float,
+    *,
+    block_columns: int = MOVING_REGION_BLOCK_COLUMNS,
+    show_progress: bool = True,
+) -> list[tuple[int, int, float]]:
+    """Score motion-bearing structure in fixed global-column windows."""
+    if block_columns < 2 or block_columns % 2:
+        raise ValueError("block_columns must be a positive even number")
+    results = []
+    starts = range(0, green_view.width, block_columns)
+    total_blocks = math.ceil(green_view.width / block_columns)
+    overlap = 4
+    signal_floor = max(0.1 * float(max_green), np.finfo(np.float32).eps)
+    for start in progress(
+        starts,
+        total=total_blocks,
+        desc="finding moving region",
+        show=show_progress,
+    ):
+        stop = min(start + block_columns, green_view.width)
+        read_start = max(0, start - overlap)
+        read_stop = min(green_view.width, stop + overlap)
+        raw_green = bin2to1(green_view[:, slice(read_start, read_stop)])
+
+        grad_y, grad_x = np.gradient(raw_green)
+        magnitude = np.square(grad_x)
+        magnitude += np.square(grad_y)
+        np.sqrt(magnitude, out=magnitude)
+        magnitude += signal_floor
+        np.abs(grad_x, out=grad_x)
+        grad_x /= magnitude
+        core_start = (start - read_start) // 2
+        core_width = (stop - start) // 2
+        score = float(
+            np.percentile(
+                grad_x[:, core_start : core_start + core_width],
+                99,
+            )
+        )
+        results.append((start, stop, score))
+    return results
+
+
 def estimate_white_balance(
     bin_paths,
-    max_samples: int = 8,
+    max_sample_columns: int = WHITE_BALANCE_SAMPLE_COLUMNS,
     *,
     show_progress: bool = True,
 ) -> np.ndarray:
     if not bin_paths:
         return np.ones(3, dtype=np.float32)
+    if max_sample_columns < 1:
+        raise ValueError("max_sample_columns must be positive")
+
+    sample_plan = []
+    remaining_columns = max_sample_columns
+    bytes_per_raw_column = 4096 * np.dtype(np.uint16).itemsize
+    for bin_path in bin_paths:
+        raw_columns = bin_path.stat().st_size // bytes_per_raw_column
+        display_columns = raw_columns // 2
+        take_columns = min(display_columns, remaining_columns)
+        # The final 2x2 average needs an even count in Bayer-channel space.
+        take_columns -= take_columns % 2
+        if take_columns:
+            sample_plan.append((bin_path, take_columns))
+            remaining_columns -= take_columns
+        if remaining_columns < 2:
+            break
 
     channel_sum = np.zeros(3, dtype=np.float64)
     total_pixels = 0
 
-    for bin_path in progress(
-        bin_paths[:max_samples],
+    for bin_path, display_columns in progress(
+        sample_plan,
         desc="white balance",
+        total=len(sample_plan),
         show=show_progress,
     ):
-        dat1 = np.fromfile(bin_path, dtype=np.uint16).astype(np.float32)
+        sample_count = display_columns * 2 * 4096
+        dat1 = np.fromfile(
+            bin_path,
+            dtype=np.uint16,
+            count=sample_count,
+        ).astype(np.float32)
         dat1_reshaped = np.reshape(dat1, (-1, 4096)).T
         raw_red = bin2to1(dat1_reshaped[0::2, 1::2])
         raw_green = bin2to1(dat1_reshaped[1::2, 1::2])
@@ -2630,25 +2847,36 @@ def autoexposure(selected_bins, white_balance, *, show_progress: bool = True):
 
 
 def build_structure_mask(
-    selected_bins,
-    cache,
     green_view,
     *,
     downsample_steps: int,
     max_green_down: float,
+    block_columns: int = STRUCTURE_MASK_BLOCK_COLUMNS,
     show_progress: bool = True,
 ) -> np.ndarray:
-    """Build only the boolean jitter mask, releasing per-bin floats on return."""
-    mask_bins = []
-    for i, _bin_path in progress(
-        enumerate(selected_bins),
-        total=len(selected_bins),
+    """Build the jitter mask in fixed global-column blocks.
+
+    The overlap supplies gradient context at analysis-block edges. Neither the
+    mask values nor their boundaries depend on how the raw capture was split
+    into files.
+    """
+    downsample = 2**downsample_steps
+    if block_columns < downsample or block_columns % downsample:
+        raise ValueError("block_columns must be divisible by the downsample factor")
+    mask_blocks = []
+    starts = range(0, green_view.width, block_columns)
+    total_blocks = math.ceil(green_view.width / block_columns)
+    overlap = 2 * downsample
+    for start in progress(
+        starts,
+        total=total_blocks,
         desc="stripe mask",
         show=show_progress,
     ):
-        start = cache.cum_cols[i] // green_view.col_step
-        stop = cache.cum_cols[i + 1] // green_view.col_step
-        raw_green = green_view[:, slice(start, stop)]
+        stop = min(start + block_columns, green_view.width)
+        read_start = max(0, start - overlap)
+        read_stop = min(green_view.width, stop + overlap)
+        raw_green = green_view[:, slice(read_start, read_stop)]
         for _ in range(downsample_steps):
             raw_green = bin2to1(raw_green)
 
@@ -2659,11 +2887,16 @@ def build_structure_mask(
         magnitude += 0.1 * max_green_down
         np.abs(grad_x, out=grad_x)
         grad_x /= magnitude
-        mask_bins.append(grad_x > STRUCTURE_MASK_THRESHOLD)
+        core_start = (start - read_start) // downsample
+        core_width = (stop - start) // downsample
+        mask_blocks.append(
+            grad_x[:, core_start : core_start + core_width]
+            > STRUCTURE_MASK_THRESHOLD
+        )
 
-    if not mask_bins:
+    if not mask_blocks:
         return np.empty((0, 0), dtype=bool)
-    return np.hstack(mask_bins)
+    return np.hstack(mask_blocks)
 
 
 class ColumnJitterModel:
@@ -4077,6 +4310,62 @@ def build_equal_output_chunk_ranges(
     return ranges
 
 
+def build_padded_cut_output_ranges(
+    chunk_ranges: list[tuple[int, int]],
+) -> tuple[list[tuple[int, int]], int]:
+    """Extend interior cut slices into their neighbors to match the widest."""
+    widths = [stop - start for start, stop in chunk_ranges]
+    if not widths or min(widths) < 1:
+        raise ValueError("cut output ranges must be non-empty")
+    if any(
+        left[1] != right[0]
+        for left, right in zip(chunk_ranges, chunk_ranges[1:])
+    ):
+        raise ValueError("cut output ranges must be contiguous")
+
+    widest = max(widths)
+    padded = list(chunk_ranges)
+    for index in range(1, len(padded) - 1):
+        start, stop = padded[index]
+        left = (widest - widths[index]) // 2
+        right = widest - widths[index] - left
+        if left > widths[index - 1] or right > widths[index + 1]:
+            raise ValueError("adjacent cut slices are too narrow for centered padding")
+        padded[index] = (start - left, stop + right)
+    return padded, widest
+
+
+def pad_random_edge_columns(
+    data: np.ndarray,
+    output_width: int,
+    *,
+    prepend: bool,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Pad one outer slice with random columns from its outward 128 columns."""
+    missing = output_width - data.shape[1]
+    if missing < 0 or data.shape[1] < 1:
+        raise ValueError("output width must not be narrower than the input")
+    if not missing:
+        return data
+
+    padded = np.empty((data.shape[0], output_width, *data.shape[2:]), data.dtype)
+    data_start = missing if prepend else 0
+    padded[:, data_start : data_start + data.shape[1]] = data
+    edge = (
+        data[:, :EDGE_PADDING_SAMPLE_COLUMNS]
+        if prepend
+        else data[:, -EDGE_PADDING_SAMPLE_COLUMNS:]
+    )
+    padding_start = 0 if prepend else data.shape[1]
+    for start in range(0, missing, EDGE_PADDING_SAMPLE_COLUMNS):
+        count = min(EDGE_PADDING_SAMPLE_COLUMNS, missing - start)
+        padded[:, padding_start + start : padding_start + start + count] = edge[
+            :, rng.integers(edge.shape[1], size=count)
+        ]
+    return padded
+
+
 def sample_motion_corrected_chunks(
     red_view,
     green1,
@@ -4093,6 +4382,7 @@ def sample_motion_corrected_chunks(
     jitter_protect_scene: bool = True,
     step_scales=None,
     chunk_ranges=None,
+    outer_padding_width: int | None = None,
     show_progress: bool = True,
 ):
     if stride_x < 1 or stride_y < 1 or max_pix < 1:
@@ -4104,6 +4394,9 @@ def sample_motion_corrected_chunks(
         step_scales = np.ones(len(sample_positions), dtype=np.float32)
     if len(step_scales) != len(sample_positions):
         raise ValueError("step_scales must match sample_positions")
+    if outer_padding_width is not None and outer_padding_width < 1:
+        raise ValueError("outer padding width must be positive")
+    padding_rng = np.random.default_rng() if outer_padding_width is not None else None
 
     if chunk_ranges is None:
         batches = [
@@ -4114,17 +4407,17 @@ def sample_motion_corrected_chunks(
         if stride_x != 1:
             raise ValueError("explicit chunk ranges require stride_x=1")
         batches = []
-        previous_stop = -1
+        previous_start = -1
         for range_index, chunk_range in enumerate(chunk_ranges):
             if len(chunk_range) != 2:
                 raise ValueError(f"chunk_ranges[{range_index}] must be (start, stop)")
             start, stop = map(int, chunk_range)
             if not 0 <= start < stop <= len(sample_positions):
                 raise ValueError(f"chunk_ranges[{range_index}] is out of bounds")
-            if start < previous_stop:
-                raise ValueError("chunk ranges must be ordered and non-overlapping")
+            if start < previous_start:
+                raise ValueError("chunk ranges must be ordered")
             batches.append(list(range(start, stop)))
-            previous_stop = stop
+            previous_start = start
 
     out_height = green1.height * 2
     center_y = (out_height - 1) / 2.0
@@ -4243,6 +4536,23 @@ def sample_motion_corrected_chunks(
             raw_sampled = raw_sampled[:, 1:, :]
         if stride_y > 1:
             raw_sampled = raw_sampled[::stride_y, :, :]
+        if outer_padding_width is not None:
+            if chunk_i == 0:
+                raw_sampled = pad_random_edge_columns(
+                    raw_sampled,
+                    outer_padding_width,
+                    prepend=True,
+                    rng=padding_rng,
+                )
+            elif chunk_i == len(batches) - 1:
+                raw_sampled = pad_random_edge_columns(
+                    raw_sampled,
+                    outer_padding_width,
+                    prepend=False,
+                    rng=padding_rng,
+                )
+            if raw_sampled.shape[1] != outer_padding_width:
+                raise RuntimeError("equal-width padding produced an invalid width")
 
         yield chunk_i, raw_sampled
         # The consumer drops its reference before requesting the next chunk;
@@ -4644,17 +4954,20 @@ def render_output_chunk(
 
 def process_preview(
     g: Path,
-    padding: int = 10,
+    padding_columns: int = PROCESSING_PADDING_COLUMNS,
     *,
     show_progress: bool = True,
     output_dir: Path = DEFAULT_OUTPUT_DIR,
     use_speed_constraints: bool = True,
     equal_length_chunks: bool = False,
+    pad_output_to_equal_widths: bool = False,
     flip_output_180: bool | None = FLIP_OUTPUT_180,
 ) -> int:
     bins = sorted(list(g.glob("*.bin")))
     if not bins:
         raise ValueError(f"no .bin frames found in {g}")
+    if padding_columns < 0:
+        raise ValueError("padding_columns must be non-negative")
     capture_timestamp = g.name
     flip_output_180 = resolve_flip_output_180(g, flip_output_180)
     output_dir = Path(output_dir).expanduser()
@@ -4665,14 +4978,25 @@ def process_preview(
     )
 
     frame_starts, frame_widths = bayer_channel_frame_geometry(bins)
+    capture_width = int(frame_starts[-1])
     constraints = (
         load_manual_speed_constraints(g, bins) if use_speed_constraints else None
     )
+    if equal_length_chunks and pad_output_to_equal_widths:
+        raise ValueError(
+            "equal-length chunks and cut-based padding are mutually exclusive"
+        )
     if equal_length_chunks and (
         constraints is None or not constraints.has_cut_regions
     ):
         raise ValueError(
             "equal-length chunks require annotated start and end cut positions"
+        )
+    if pad_output_to_equal_widths and (
+        constraints is None or not constraints.has_cut_regions
+    ):
+        raise ValueError(
+            "equal-width output padding requires annotated cut positions"
         )
     if constraints is not None and show_progress:
         print(
@@ -4682,14 +5006,21 @@ def process_preview(
         )
 
     if constraints is not None and constraints.has_cut_regions:
+        processing_x_start, processing_x_stop = aligned_processing_column_bounds(
+            capture_width,
+            constraints.cut_positions[0] - padding_columns,
+            constraints.cut_positions[-1] + padding_columns,
+        )
         selected = select_frames_for_cut_region(
             frame_starts,
             frame_widths,
             constraints.cut_positions,
-            padding=padding,
+            padding_columns=padding_columns,
         )
         scan_bins = [bins[index] for index in selected]
     else:
+        processing_x_start = None
+        processing_x_stop = None
         selected = None
         scan_bins = bins
 
@@ -4736,41 +5067,43 @@ def process_preview(
         del raw_green_down, raw_green, dat1_reshaped, dat1
 
     if selected is None:
-        scores = []
-        for i, bin in progress(
-            enumerate(bins),
-            total=len(bins),
-            desc="finding moving region",
-            show=show_progress,
-        ):
-            dat1 = np.fromfile(bin, dtype=np.uint16).astype(np.float32)
-            dat1_reshaped = np.reshape(dat1, (-1, 4096)).T
+        motion_cache = FileDataCache(bins, dtype=np.uint16, rows=4096)
+        motion_green = ChannelView(motion_cache, row_offset=1, col_offset=1)
+        scored_blocks = moving_region_block_scores(
+            motion_green,
+            max_green,
+            show_progress=show_progress,
+        )
+        del motion_green, motion_cache
 
-            raw_green = dat1_reshaped[1::2, 1::2]
-            raw_green = bin2to1(raw_green)
-
-            grad_y, grad_x = np.gradient(raw_green)
-            magnitude = np.square(grad_x)
-            magnitude += np.square(grad_y)
-            np.sqrt(magnitude, out=magnitude)
-            magnitude += 0.1 * max_green
-            np.abs(grad_x, out=grad_x)
-            grad_x /= magnitude
-            # cv2.imwrite(str(g / f"score_{i:05d}.png"), energy * 255)
-            score = np.percentile(grad_x, 99)
-            scores.append(score)
-            del magnitude, grad_x, grad_y, raw_green, dat1_reshaped, dat1
-
-        min_score = min(scores)
-        selected_set = set()
-        for i, score in enumerate(scores):
-            if score > min_score * 1.3:
-                for pi in range(-padding, padding + 1):
-                    if i + pi >= 0 and i + pi < len(bins):
-                        selected_set.add(i + pi)
-        selected = sorted(list(selected_set))
-        if FORCE_CONTIGUOUS_SELECTION and selected:
-            selected = list(range(selected[0], selected[-1] + 1))
+        min_score = min(score for _start, _stop, score in scored_blocks)
+        frame_ends = frame_starts[:-1] + frame_widths
+        relative_threshold = min_score * 1.3 if len(scored_blocks) > 1 else 0.0
+        score_threshold = max(STRUCTURE_MASK_THRESHOLD, relative_threshold)
+        interesting_ranges = [
+            (start - padding_columns, stop + padding_columns)
+            for start, stop, score in scored_blocks
+            if score > score_threshold
+        ]
+        # If meaningful structure fills every fixed block, there may be no
+        # low-scoring background from which to form a 1.3x relative contrast.
+        if not interesting_ranges:
+            interesting_ranges = [
+                (start - padding_columns, stop + padding_columns)
+                for start, stop, score in scored_blocks
+                if score > STRUCTURE_MASK_THRESHOLD
+            ]
+        if not interesting_ranges:
+            raise ValueError("motion detector did not find a moving image region")
+        processing_x_start, processing_x_stop = aligned_processing_column_bounds(
+            capture_width,
+            min(start for start, _stop in interesting_ranges),
+            max(stop for _start, stop in interesting_ranges),
+        )
+        selected = np.flatnonzero(
+            (frame_ends > processing_x_start)
+            & (frame_starts[:-1] < processing_x_stop)
+        ).tolist()
     if show_progress:
         selection_source = (
             "manual cut ROI" if constraints is not None and constraints.has_cut_regions
@@ -4800,11 +5133,19 @@ def process_preview(
     cache = FileDataCache(selected_bins, dtype=np.uint16, rows=4096)
     data = cache
 
-    red_view = ChannelView(data, row_offset=0, col_offset=1)
-    blue_view = ChannelView(data, row_offset=1, col_offset=0)
-    green1 = ChannelView(data, row_offset=1, col_offset=1)
-    green2 = ChannelView(data, row_offset=0, col_offset=0)
-    selected_global_x0 = float(frame_starts[selected[0]])
+    base_red = ChannelView(data, row_offset=0, col_offset=1)
+    base_blue = ChannelView(data, row_offset=1, col_offset=0)
+    base_green1 = ChannelView(data, row_offset=1, col_offset=1)
+    base_green2 = ChannelView(data, row_offset=0, col_offset=0)
+    assert processing_x_start is not None and processing_x_stop is not None
+    selected_file_x0 = int(frame_starts[selected[0]])
+    local_x_start = int(processing_x_start - selected_file_x0)
+    local_x_stop = int(processing_x_stop - selected_file_x0)
+    red_view = ColumnSliceView(base_red, local_x_start, local_x_stop)
+    blue_view = ColumnSliceView(base_blue, local_x_start, local_x_stop)
+    green1 = ColumnSliceView(base_green1, local_x_start, local_x_stop)
+    green2 = ColumnSliceView(base_green2, local_x_start, local_x_stop)
+    selected_global_x0 = float(processing_x_start)
     local_constraints = None
     if constraints is not None:
         if selected != list(range(selected[0], selected[-1] + 1)):
@@ -4817,8 +5158,6 @@ def process_preview(
         )
 
     mask_full = build_structure_mask(
-        selected_bins,
-        cache,
         green1,
         downsample_steps=downsample_steps,
         max_green_down=max_green_down,
@@ -5041,6 +5380,7 @@ def process_preview(
         return 0
     chunk_ranges = None
     stack_chunk_widths = None
+    padded_output_width = None
     if local_constraints is not None and local_constraints.has_cut_regions:
         if equal_length_chunks:
             outer_range = build_cut_aligned_output_ranges(
@@ -5056,9 +5396,17 @@ def process_preview(
                 sample_positions,
                 local_constraints.cut_positions,
             )
+        unpadded_widths = [stop - start for start, stop in chunk_ranges]
+        if pad_output_to_equal_widths:
+            chunk_ranges, padded_output_width = build_padded_cut_output_ranges(
+                chunk_ranges
+            )
         output_chunk_count = len(chunk_ranges)
         generator_binned_widths = np.asarray(
-            [(stop - start) // 2 for start, stop in chunk_ranges],
+            [
+                (padded_output_width or stop - start) // 2
+                for start, stop in chunk_ranges
+            ],
             dtype=np.int64,
         )
         if np.any(generator_binned_widths < 1):
@@ -5069,18 +5417,27 @@ def process_preview(
             else generator_binned_widths
         )
         chunk_size = OUTPUT_CHUNK_TARGET  # Ignored for explicit cut ranges.
-        rendered_sample_count = sum(stop - start for start, stop in chunk_ranges)
+        rendered_sample_count = (
+            padded_output_width * output_chunk_count
+            if padded_output_width is not None
+            else sum(stop - start for start, stop in chunk_ranges)
+        )
         if show_progress:
-            range_description = (
-                "equal-length output widths"
-                if equal_length_chunks
-                else "cut-aligned output widths"
-            )
-            print(
-                range_description,
-                [stop - start for start, stop in chunk_ranges],
-                "(sampling order)",
-            )
+            if padded_output_width is not None:
+                print(
+                    "padded cut-aligned output widths",
+                    unpadded_widths,
+                    "->",
+                    padded_output_width,
+                    "(sampling order)",
+                )
+            else:
+                range_description = (
+                    "equal-length output widths"
+                    if equal_length_chunks
+                    else "cut-aligned output widths"
+                )
+                print(range_description, unpadded_widths, "(sampling order)")
     else:
         target = OUTPUT_CHUNK_TARGET
         n_chunks = max(1, int(math.ceil(n / target)))
@@ -5116,6 +5473,7 @@ def process_preview(
                 jitter_models=jitter_models,
                 step_scales=step_scales,
                 chunk_ranges=chunk_ranges,
+                outer_padding_width=padded_output_width,
                 show_progress=show_progress,
             ):
                 output_chunk_i = (
@@ -5195,6 +5553,14 @@ def _parse_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--pad-output-to-equal-widths",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "keep annotated cuts and pad their corrected slices to the widest one"
+        ),
+    )
+    parser.add_argument(
         "--jitter-debug",
         action="store_true",
         default=ENABLE_JITTER_DEBUG_PLOT,
@@ -5247,6 +5613,8 @@ def main(argv=None):
             process_kwargs["use_speed_constraints"] = False
         if args.equal_length_chunks:
             process_kwargs["equal_length_chunks"] = True
+        if args.pad_output_to_equal_widths:
+            process_kwargs["pad_output_to_equal_widths"] = True
         if args.flip_output_180 is not None:
             process_kwargs["flip_output_180"] = args.flip_output_180
         process_preview(dirs[0], **process_kwargs)
@@ -5260,6 +5628,8 @@ def main(argv=None):
         process_kwargs["use_speed_constraints"] = False
     if args.equal_length_chunks:
         process_kwargs["equal_length_chunks"] = True
+    if args.pad_output_to_equal_widths:
+        process_kwargs["pad_output_to_equal_widths"] = True
     if args.flip_output_180 is not None:
         process_kwargs["flip_output_180"] = args.flip_output_180
     with ThreadPoolExecutor(max_workers=max(1, args.max_workers)) as executor:
