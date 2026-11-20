@@ -24,6 +24,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from image_processing import auto_tone_map_to_uint8
+from raw_io import load_raw_frame
 from PySide6.QtCore import QPointF, QRectF, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
@@ -241,13 +242,11 @@ def decode_raw_frame(
     frame_rows: int,
 ) -> np.ndarray:
     """Return one Bayer-binned frame as an RGB uint8 display image."""
-    raw_by_time = np.memmap(
+    raw = load_raw_frame(
         frame.path,
-        dtype="<u2",
-        mode="r",
-        shape=(frame.raw_columns, frame_rows),
+        rows=frame_rows,
+        columns=frame.raw_columns,
     )
-    raw = raw_by_time.T
     height = frame_rows // BAYER_BIN
     width = frame.raw_columns // BAYER_BIN
     rgb = np.empty((height, width, 3), dtype=np.uint8)
@@ -262,7 +261,7 @@ def decode_raw_frame(
     np.right_shift(green_1, 1, out=green_1)
     rgb[:, :, 1] = green_1
     np.right_shift(raw[1::2, 0::2], 8, out=rgb[:, :, 2], casting="unsafe")
-    del raw, raw_by_time
+    del raw
     return rgb
 
 

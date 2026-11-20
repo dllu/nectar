@@ -39,6 +39,7 @@ from image_processing import (
     RAW_COLOR_CORRECTION,
     apply_color_transform,
 )
+from raw_io import load_raw_frame
 
 CAMERA_MAKE = "Alkeria"
 CAMERA_MODEL_NAME = "Alkeria Necta N4K2-7C"
@@ -929,12 +930,12 @@ class FileDataCache:
         if idx in self.cache:
             self.cache.move_to_end(idx)
         else:
-            # load and reshape file idx
-            data1d = np.fromfile(self.bin_paths[idx], dtype=self.dtype).astype(
-                np.float32
+            data2d = load_raw_frame(
+                self.bin_paths[idx],
+                rows=self.height,
+                dtype=self.dtype,
+                output_dtype=np.float32,
             )
-            # reshape to (rows, cols) then transpose to (height, cols)
-            data2d = data1d.reshape(-1, self.height).T
             self.cache[idx] = data2d
             self.cached_bytes += data2d.nbytes
             while self.cached_bytes > self.max_cache_bytes and len(self.cache) > 1:
@@ -2769,13 +2770,12 @@ def estimate_white_balance(
         total=len(sample_plan),
         show=show_progress,
     ):
-        sample_count = display_columns * 2 * 4096
-        dat1 = np.fromfile(
+        dat1_reshaped = load_raw_frame(
             bin_path,
-            dtype=np.uint16,
-            count=sample_count,
-        ).astype(np.float32)
-        dat1_reshaped = np.reshape(dat1, (-1, 4096)).T
+            rows=4096,
+            columns=display_columns * 2,
+            output_dtype=np.float32,
+        )
         raw_red = bin2to1(dat1_reshaped[0::2, 1::2])
         raw_green = bin2to1(dat1_reshaped[1::2, 1::2])
         raw_blue = bin2to1(dat1_reshaped[1::2, 0::2])
@@ -2823,8 +2823,11 @@ def autoexposure(selected_bins, white_balance, *, show_progress: bool = True):
         desc="autoexposure",
         show=show_progress,
     ):
-        dat1 = np.fromfile(bin, dtype=np.uint16).astype(np.float32)
-        dat1_reshaped = np.reshape(dat1, (-1, 4096)).T
+        dat1_reshaped = load_raw_frame(
+            bin,
+            rows=4096,
+            output_dtype=np.float32,
+        )
         raw_red = dat1_reshaped[0::2, 1::2]
         raw_red = bin2to1(raw_red)
 
@@ -5038,8 +5041,11 @@ def process_preview(
         desc="scanning raw frames",
         show=show_progress,
     ):
-        dat1 = np.fromfile(bin, dtype=np.uint16).astype(np.float32)
-        dat1_reshaped = np.reshape(dat1, (-1, 4096)).T
+        dat1_reshaped = load_raw_frame(
+            bin,
+            rows=4096,
+            output_dtype=np.float32,
+        )
         raw_green = dat1_reshaped[1::2, 1::2]
         max_green = max(max_green, np.max(raw_green))
         if ENABLE_COLUMN_JITTER_CORRECTION:
@@ -5064,7 +5070,7 @@ def process_preview(
         max_green_down = max(max_green_down, np.max(raw_green_down))
         if ENABLE_COLUMN_JITTER_CORRECTION:
             del raw_channels, raw_channel
-        del raw_green_down, raw_green, dat1_reshaped, dat1
+        del raw_green_down, raw_green, dat1_reshaped
 
     if selected is None:
         motion_cache = FileDataCache(bins, dtype=np.uint16, rows=4096)
