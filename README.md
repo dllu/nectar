@@ -60,3 +60,11 @@ cut and pad the resulting slices to the width of the widest one.
 Output orientation follows the camera mounting date: captures before 2026 are
 not rotated, while captures from 2026 onward are rotated 180 degrees. Override
 the automatic choice with `--flip-output-180` or `--no-flip-output-180`.
+
+Each capture is rendered into a temporary staging directory. Only after the
+complete DNG/JPEG set and stack preview succeed does `preview.py` replace that
+capture's prior outputs, including chunks that no longer exist. Existing
+Darktable `.dng.xmp` sidecars are carried forward by `NECTA` chunk number and
+renamed for the new DNG hash; if several sidecars exist for one chunk, the most
+recently modified one is used. Choose a separate `--output-dir` when an older
+render needs to be preserved.

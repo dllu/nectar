@@ -6,6 +6,8 @@ import hashlib
 import json
 import math
 import mmap
+import re
+import shutil
 import tempfile
 import threading
 import time
@@ -520,6 +522,181 @@ def write_hashed_linear_dng(
         raise
 
     return dng_path, dng_sha1
+
+
+def _capture_output_match(
+    path: Path,
+    capture_timestamp: str,
+) -> re.Match[str] | None:
+    return re.fullmatch(
+        rf"{re.escape(capture_timestamp)}_NECTA(?P<chunk>\d{{4,}})_"
+        r"(?P<digest>[0-9a-f]{40})"
+        r"(?P<suffix>\.dng(?:\.xmp)?|\.jpg)",
+        path.name,
+        flags=re.IGNORECASE,
+    )
+
+
+def _capture_output_files(output_dir: Path, capture_timestamp: str) -> list[Path]:
+    if not output_dir.is_dir():
+        return []
+    stack_name = f"{capture_timestamp}_stack.jpg".casefold()
+    return [
+        path
+        for path in output_dir.iterdir()
+        if path.is_file()
+        and (
+            path.name.casefold() == stack_name
+            or _capture_output_match(path, capture_timestamp) is not None
+        )
+    ]
+
+
+def _validated_staged_capture_outputs(
+    staging_dir: Path,
+    capture_timestamp: str,
+) -> dict[int, tuple[Path, Path, str]]:
+    dngs: dict[int, tuple[Path, str]] = {}
+    jpegs: dict[int, tuple[Path, str]] = {}
+    for path in staging_dir.iterdir():
+        match = _capture_output_match(path, capture_timestamp)
+        if match is None:
+            continue
+        chunk = int(match.group("chunk"))
+        digest = match.group("digest").lower()
+        suffix = match.group("suffix").lower()
+        if suffix == ".dng":
+            collection = dngs
+        elif suffix == ".jpg":
+            collection = jpegs
+        else:
+            continue
+        if chunk in collection:
+            raise RuntimeError(f"multiple staged outputs for NECTA{chunk:04d}")
+        collection[chunk] = (path, digest)
+
+    if not dngs:
+        raise RuntimeError("render produced no DNG files")
+    if dngs.keys() != jpegs.keys():
+        missing_jpegs = sorted(dngs.keys() - jpegs.keys())
+        missing_dngs = sorted(jpegs.keys() - dngs.keys())
+        details = []
+        if missing_jpegs:
+            details.append(f"missing JPEGs for chunks {missing_jpegs}")
+        if missing_dngs:
+            details.append(f"missing DNGs for chunks {missing_dngs}")
+        raise RuntimeError("incomplete rendered output: " + "; ".join(details))
+
+    pairs: dict[int, tuple[Path, Path, str]] = {}
+    for chunk, (dng_path, dng_digest) in dngs.items():
+        jpeg_path, jpeg_digest = jpegs[chunk]
+        if jpeg_digest != dng_digest:
+            raise RuntimeError(
+                f"DNG/JPEG hash mismatch for NECTA{chunk:04d}: "
+                f"{dng_digest} != {jpeg_digest}"
+            )
+        pairs[chunk] = (dng_path, jpeg_path, dng_digest)
+
+    stack_path = staging_dir / f"{capture_timestamp}_stack.jpg"
+    if not stack_path.is_file():
+        raise RuntimeError("render produced no stack JPEG")
+    return pairs
+
+
+def _stage_existing_xmp_sidecars(
+    output_dir: Path,
+    staging_dir: Path,
+    capture_timestamp: str,
+    new_outputs: dict[int, tuple[Path, Path, str]],
+) -> int:
+    candidates: dict[int, list[tuple[int, str, Path, str]]] = {}
+    for path in _capture_output_files(output_dir, capture_timestamp):
+        match = _capture_output_match(path, capture_timestamp)
+        if match is None or match.group("suffix").lower() != ".dng.xmp":
+            continue
+        chunk = int(match.group("chunk"))
+        candidates.setdefault(chunk, []).append(
+            (
+                path.stat().st_mtime_ns,
+                path.name,
+                path,
+                match.group("digest").lower(),
+            )
+        )
+
+    migrated = 0
+    for chunk, sidecars in candidates.items():
+        if chunk not in new_outputs:
+            continue
+        _mtime, _name, source_path, old_digest = max(sidecars)
+        if len(sidecars) > 1:
+            print(
+                f"multiple XMP sidecars for NECTA{chunk:04d}; "
+                f"carrying forward newest {source_path.name}"
+            )
+        new_dng_path, _jpeg_path, new_digest = new_outputs[chunk]
+        destination_path = staging_dir / f"{new_dng_path.name}.xmp"
+        shutil.copy2(source_path, destination_path)
+
+        contents = destination_path.read_bytes()
+        old_dng_name = source_path.name[: -len(".xmp")]
+        updated = contents.replace(
+            old_dng_name.encode("utf-8"),
+            new_dng_path.name.encode("utf-8"),
+        )
+        if updated == contents and old_digest != new_digest:
+            updated = contents.replace(
+                old_digest.encode("ascii"),
+                new_digest.encode("ascii"),
+            )
+        if updated != contents:
+            destination_path.write_bytes(updated)
+        migrated += 1
+    return migrated
+
+
+def replace_capture_outputs(
+    output_dir: Path,
+    staging_dir: Path,
+    capture_timestamp: str,
+) -> tuple[int, int]:
+    """Publish one complete render and discard the prior output generation."""
+    output_dir = Path(output_dir)
+    staging_dir = Path(staging_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    new_outputs = _validated_staged_capture_outputs(
+        staging_dir,
+        capture_timestamp,
+    )
+    old_paths = set(_capture_output_files(output_dir, capture_timestamp))
+    migrated_xmps = _stage_existing_xmp_sidecars(
+        output_dir,
+        staging_dir,
+        capture_timestamp,
+        new_outputs,
+    )
+
+    stack_name = f"{capture_timestamp}_stack.jpg"
+    staged_paths = [
+        path
+        for path in staging_dir.iterdir()
+        if path.is_file()
+        and (
+            path.name == stack_name
+            or _capture_output_match(path, capture_timestamp) is not None
+        )
+    ]
+    # Publish the stack last so its replacement is the final visible indication
+    # that the complete output generation has changed.
+    staged_paths.sort(key=lambda path: (path.name == stack_name, path.name))
+    published_names = {path.name for path in staged_paths}
+    for staged_path in staged_paths:
+        staged_path.replace(output_dir / staged_path.name)
+
+    stale_paths = [path for path in old_paths if path.name not in published_names]
+    for stale_path in stale_paths:
+        stale_path.unlink()
+    return len(stale_paths), migrated_xmps
 
 
 # linescans = Path("/home/dllu/pictures/linescan")
@@ -4965,7 +5142,12 @@ def render_output_chunk(
     del rgb
     if flip_output_180:
         rgb_u8 = np.ascontiguousarray(rgb_u8[::-1, ::-1, :])
-    write_jpeg(output_dir / f"{out_name}.jpg", rgb_u8, jpeg_exif)
+    try:
+        write_jpeg(output_dir / f"{out_name}.jpg", rgb_u8, jpeg_exif)
+    except Exception as e:
+        print(f'oh no when writing jpeg {e}')
+        raise
+
     return bin2to1_rgb_u8(rgb_u8)
 
 
@@ -4987,6 +5169,7 @@ def process_preview(
     if padding_columns < 0:
         raise ValueError("padding_columns must be non-negative")
     skew_min, skew_max = validate_skew_hough_extents(skew_hough_extents)
+    capture_timestamp = g.name
     flip_output_180 = resolve_flip_output_180(g, flip_output_180)
     output_dir = Path(output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -5476,54 +5659,71 @@ def process_preview(
     # Analysis stays parallel, but cap the image-sized render working sets.
     # Each 32768-column raw RGB chunk is 1.5 GiB before its DNG/JPEG
     # temporaries, so six simultaneous renderers remain unnecessarily risky.
+    output_dir.mkdir(parents=True, exist_ok=True)
     with _render_slots:
-        with DiskBackedStackPreview(
-            output_dir,
-            output_chunk_count,
-            chunk_widths=stack_chunk_widths,
-        ) as stacked_preview:
-            for chunk_i, raw_sampled in sample_motion_corrected_chunks(
-                red_view,
-                green1,
-                green2,
-                blue_view,
-                sample_positions,
-                widths,
-                stride_x=1,
-                stride_y=1,
-                skew=skew,
-                max_pix=chunk_size,
-                jitter_models=jitter_models,
-                step_scales=step_scales,
-                chunk_ranges=chunk_ranges,
-                outer_padding_width=padded_output_width,
-                show_progress=show_progress,
-            ):
-                output_chunk_i = (
-                    output_chunk_count - 1 - chunk_i
-                    if flip_output_180
-                    else chunk_i
-                )
-                name_prefix = f"{capture_timestamp}_NECTA{output_chunk_i:04d}"
-                binned = render_output_chunk(
-                    raw_sampled,
-                    output_dir=output_dir,
-                    name_prefix=name_prefix,
-                    white_balance=white_balance,
-                    p2=p2,
-                    p98=p98,
-                    capture_dir=g,
-                    jpeg_exif=jpeg_exif,
-                    flip_output_180=flip_output_180,
-                )
-                del raw_sampled
-                stacked_preview.add_chunk(output_chunk_i, binned)
-                del binned
+        with tempfile.TemporaryDirectory(
+            dir=output_dir,
+            prefix=f".{capture_timestamp}_render_",
+        ) as staging_name:
+            staging_dir = Path(staging_name)
+            with DiskBackedStackPreview(
+                staging_dir,
+                output_chunk_count,
+                chunk_widths=stack_chunk_widths,
+            ) as stacked_preview:
+                for chunk_i, raw_sampled in sample_motion_corrected_chunks(
+                    red_view,
+                    green1,
+                    green2,
+                    blue_view,
+                    sample_positions,
+                    widths,
+                    stride_x=1,
+                    stride_y=1,
+                    skew=skew,
+                    max_pix=chunk_size,
+                    jitter_models=jitter_models,
+                    step_scales=step_scales,
+                    chunk_ranges=chunk_ranges,
+                    outer_padding_width=padded_output_width,
+                    show_progress=show_progress,
+                ):
+                    output_chunk_i = (
+                        output_chunk_count - 1 - chunk_i
+                        if flip_output_180
+                        else chunk_i
+                    )
+                    name_prefix = f"{capture_timestamp}_NECTA{output_chunk_i:04d}"
+                    binned = render_output_chunk(
+                        raw_sampled,
+                        output_dir=staging_dir,
+                        name_prefix=name_prefix,
+                        white_balance=white_balance,
+                        p2=p2,
+                        p98=p98,
+                        capture_dir=g,
+                        jpeg_exif=jpeg_exif,
+                        flip_output_180=flip_output_180,
+                    )
+                    del raw_sampled
+                    stacked_preview.add_chunk(output_chunk_i, binned)
+                    del binned
 
-            stacked_preview.write(
-                output_dir / f"{capture_timestamp}_stack.jpg",
-                jpeg_exif,
+                stacked_preview.write(
+                    staging_dir / f"{capture_timestamp}_stack.jpg",
+                    jpeg_exif,
+                )
+
+            removed_count, migrated_xmps = replace_capture_outputs(
+                output_dir,
+                staging_dir,
+                capture_timestamp,
             )
+            if show_progress and (removed_count or migrated_xmps):
+                print(
+                    f"replaced {removed_count} stale output files; "
+                    f"carried forward {migrated_xmps} XMP sidecars"
+                )
 
     return rendered_sample_count
 
