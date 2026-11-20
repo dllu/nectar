@@ -59,6 +59,7 @@ STRUCTURE_MASK_BLOCK_COLUMNS = 4096
 WHITE_BALANCE_SAMPLE_COLUMNS = 8192
 ENABLE_JITTER_DEBUG_PLOT = False
 ENABLE_SKEW_DEBUG_OUTPUT = False
+DEFAULT_SKEW_HOUGH_EXTENTS = (-0.05, 0.05)
 JITTER_DEBUG_ROW = 2000
 JITTER_VERTICAL_BANDS = 256
 JITTER_FINE_TEMPORAL_WINDOW = 31
@@ -4909,6 +4910,19 @@ def estimate_skew_hough(
     return float(skews[int(np.argmax(scores))])
 
 
+def validate_skew_hough_extents(extents) -> tuple[float, float]:
+    """Return finite, increasing lower and upper skew-search bounds."""
+    try:
+        skew_min, skew_max = (float(value) for value in extents)
+    except (TypeError, ValueError):
+        raise ValueError("skew Hough extents must contain exactly two numbers") from None
+    if not math.isfinite(skew_min) or not math.isfinite(skew_max):
+        raise ValueError("skew Hough extents must be finite")
+    if skew_min >= skew_max:
+        raise ValueError("skew Hough minimum must be less than its maximum")
+    return skew_min, skew_max
+
+
 def render_output_chunk(
     raw_sampled: np.ndarray,
     *,
@@ -4965,13 +4979,14 @@ def process_preview(
     equal_length_chunks: bool = False,
     pad_output_to_equal_widths: bool = False,
     flip_output_180: bool | None = FLIP_OUTPUT_180,
+    skew_hough_extents: tuple[float, float] = DEFAULT_SKEW_HOUGH_EXTENTS,
 ) -> int:
     bins = sorted(list(g.glob("*.bin")))
     if not bins:
         raise ValueError(f"no .bin frames found in {g}")
     if padding_columns < 0:
         raise ValueError("padding_columns must be non-negative")
-    capture_timestamp = g.name
+    skew_min, skew_max = validate_skew_hough_extents(skew_hough_extents)
     flip_output_180 = resolve_flip_output_180(g, flip_output_180)
     output_dir = Path(output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -5288,6 +5303,8 @@ def process_preview(
         g=g,
         stride_x=hough_stride,
         stride_y=hough_stride,
+        skew_min=skew_min,
+        skew_max=skew_max,
         write_debug=ENABLE_SKEW_DEBUG_OUTPUT,
         show_progress=show_progress,
     )
@@ -5578,8 +5595,27 @@ def _parse_args(argv=None):
         default=ENABLE_SKEW_DEBUG_OUTPUT,
         help="write per-chunk skew energy, mask, histogram, and response plots",
     )
+    parser.add_argument(
+        "--skew-hough-extents",
+        nargs=2,
+        type=float,
+        metavar=("MIN", "MAX"),
+        help=(
+            "minimum and maximum skew slopes searched by the Hough transform "
+            f"(default: {DEFAULT_SKEW_HOUGH_EXTENTS[0]} "
+            f"{DEFAULT_SKEW_HOUGH_EXTENTS[1]})"
+        ),
+    )
     parser.add_argument("--max-workers", type=int, default=6)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.skew_hough_extents is not None:
+        try:
+            args.skew_hough_extents = validate_skew_hough_extents(
+                args.skew_hough_extents
+            )
+        except ValueError as error:
+            parser.error(str(error))
+    return args
 
 
 def main(argv=None):
@@ -5623,6 +5659,8 @@ def main(argv=None):
             process_kwargs["pad_output_to_equal_widths"] = True
         if args.flip_output_180 is not None:
             process_kwargs["flip_output_180"] = args.flip_output_180
+        if args.skew_hough_extents is not None:
+            process_kwargs["skew_hough_extents"] = args.skew_hough_extents
         process_preview(dirs[0], **process_kwargs)
         return
 
@@ -5638,6 +5676,8 @@ def main(argv=None):
         process_kwargs["pad_output_to_equal_widths"] = True
     if args.flip_output_180 is not None:
         process_kwargs["flip_output_180"] = args.flip_output_180
+    if args.skew_hough_extents is not None:
+        process_kwargs["skew_hough_extents"] = args.skew_hough_extents
     with ThreadPoolExecutor(max_workers=max(1, args.max_workers)) as executor:
         future_map = {
             executor.submit(

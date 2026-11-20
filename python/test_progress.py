@@ -1,6 +1,6 @@
 import io
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import call, patch
@@ -132,6 +132,37 @@ class ProgressTest(unittest.TestCase):
         self.assertFalse(
             preview._parse_args(["--no-flip-output-180"]).flip_output_180
         )
+
+    def test_skew_hough_extents_are_configurable(self):
+        args = preview._parse_args(["--skew-hough-extents", "0.2", "0.5"])
+        self.assertEqual(args.skew_hough_extents, (0.2, 0.5))
+
+    def test_skew_hough_extents_must_increase(self):
+        stderr = io.StringIO()
+        with redirect_stderr(stderr), self.assertRaises(SystemExit):
+            preview._parse_args(["--skew-hough-extents", "0.5", "0.2"])
+        self.assertIn("minimum must be less", stderr.getvalue())
+
+    def test_main_passes_skew_hough_extents_to_preview(self):
+        with TemporaryDirectory() as root:
+            capture = Path(root) / "capture"
+            capture.mkdir()
+
+            with patch.object(preview, "process_preview") as process_preview:
+                preview.main(
+                    [
+                        "--skew-hough-extents",
+                        "0.2",
+                        "0.5",
+                        str(capture),
+                    ]
+                )
+
+            process_preview.assert_called_once_with(
+                capture,
+                output_dir=preview.DEFAULT_OUTPUT_DIR,
+                skew_hough_extents=(0.2, 0.5),
+            )
 
 
 if __name__ == "__main__":
