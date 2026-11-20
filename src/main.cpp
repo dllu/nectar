@@ -753,19 +753,24 @@ int main(int argc, char* argv[]) {
                 event.window.event == SDL_WINDOWEVENT_CLOSE &&
                 event.window.windowID == SDL_GetWindowID(sdl_gl_gui.window))
                 request_quit_popup = true;
-            if (event.type == SDL_KEYDOWN && event.key.repeat == 0 &&
-                (event.key.keysym.sym == SDLK_SPACE ||
-                 event.key.keysym.sym == SDLK_b)) {
-                if (ui_mode == UiMode::Capture) {
-                    if (nc.save.load()) {
-                        if (allow_save_toggle()) {
+            if (ui_mode == UiMode::Capture && event.type == SDL_KEYDOWN &&
+                event.key.repeat == 0) {
+                switch (event.key.keysym.sym) {
+                    case SDLK_b:
+                        start_capture_session();
+                        break;
+                    case SDLK_a:
+                    case SDLK_c:
+                        stop_capture_session();
+                        break;
+                    case SDLK_SPACE:
+                        if (!allow_save_toggle()) break;
+                        if (nc.save.load()) {
                             stop_capture_session();
-                        }
-                    } else {
-                        if (allow_save_toggle()) {
+                        } else {
                             start_capture_session();
                         }
-                    }
+                        break;
                 }
             }
         }
@@ -864,12 +869,14 @@ int main(int argc, char* argv[]) {
                 static_cast<float>(nc.get_preview_width());
             const float handle_width = slider_width * handle_ratio;
             const int max_crop_offset = nc.get_max_crop_offset();
-            const int crop_offset = nc.get_crop_offset();
+            // The preview is rendered with a horizontal flip.
+            const int display_crop_offset =
+                max_crop_offset - nc.get_crop_offset();
             const float slider_travel =
                 std::max(slider_width - handle_width, 0.0f);
             const float normalized =
                 max_crop_offset > 0
-                    ? static_cast<float>(crop_offset) / max_crop_offset
+                    ? static_cast<float>(display_crop_offset) / max_crop_offset
                     : 0.0f;
             ImVec2 slider_pos = ImGui::GetCursorScreenPos();
             const float handle_x =
@@ -900,9 +907,9 @@ int main(int argc, char* argv[]) {
                 new_pos = std::clamp(new_pos, 0.0f, slider_travel);
                 const float denom = slider_travel > 0 ? slider_travel : 1.0f;
                 const float new_norm = new_pos / denom;
-                const int new_offset =
+                const int display_offset =
                     static_cast<int>(std::round(new_norm * max_crop_offset));
-                nc.set_crop_offset(new_offset);
+                nc.set_crop_offset(max_crop_offset - display_offset);
             }
             ImGui::Dummy(ImVec2(0.0f, 10.0f));
 
