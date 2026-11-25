@@ -15,6 +15,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import NamedTuple
 
 import bottleneck as bn
 import cv2
@@ -41,7 +42,7 @@ from image_processing import (
     RAW_COLOR_CORRECTION,
     apply_color_transform,
 )
-from raw_io import load_raw_frame
+from raw_io import RawFrameStore, annotation_column_stride, load_raw_frame
 from vibration import (
     DEFAULT_GROUND_ROWS,
     MIN_GROUND_ROWS,
@@ -719,6 +720,7 @@ class CircleSpeedConstraint:
     y: float
     width: float
     height: float
+    column_stride: int = 1
 
     @property
     def center_x(self) -> float:
@@ -738,7 +740,7 @@ class CircleSpeedConstraint:
         """Propagate pixel-scale diameter uncertainty into the speed ratio."""
         dimension_sigma = SPEED_ANNOTATION_DIMENSION_SIGMA_PIXELS
         return math.hypot(
-            dimension_sigma / self.width,
+            dimension_sigma * self.column_stride / self.width,
             dimension_sigma / self.height,
         )
 
@@ -748,6 +750,7 @@ class EqualWidthSegment:
     identifier: str
     x1: float
     x2: float
+    column_stride: int = 1
 
     @property
     def width(self) -> float:
@@ -756,7 +759,7 @@ class EqualWidthSegment:
     @property
     def log_width_sigma(self) -> float:
         """Propagate fixed annotation-pixel uncertainty into relative width."""
-        return SPEED_ANNOTATION_DIMENSION_SIGMA_PIXELS / self.width
+        return SPEED_ANNOTATION_DIMENSION_SIGMA_PIXELS * self.column_stride / self.width
 
 
 @dataclass(frozen=True)
@@ -772,6 +775,7 @@ class ManualSpeedConstraints:
     circles: tuple[CircleSpeedConstraint, ...]
     width_groups: tuple[EqualWidthGroup, ...]
     cut_positions: tuple[float, ...]
+    cut_strides: tuple[int, ...] = ()
 
     @property
     def has_speed_constraints(self) -> bool:
@@ -792,6 +796,7 @@ class ManualSpeedConstraints:
                 circle.y,
                 circle.width,
                 circle.height,
+                circle.column_stride,
             )
             for circle in self.circles
             if 0.0 <= circle.center_x - x_offset <= local_width - 1
@@ -803,6 +808,7 @@ class ManualSpeedConstraints:
                     segment.identifier,
                     segment.x1 - x_offset,
                     segment.x2 - x_offset,
+                    segment.column_stride,
                 )
                 for segment in group.segments
                 if 0.0 <= segment.x1 - x_offset
@@ -822,6 +828,7 @@ class ManualSpeedConstraints:
             circles,
             tuple(width_groups),
             cuts,
+            self.cut_strides,
         )
 
 
@@ -908,7 +915,11 @@ def load_manual_speed_constraints(
         )
         if width <= 0.0 or height <= 0.0:
             raise ValueError(f"circles[{index}] width and height must be positive")
-        circles.append(CircleSpeedConstraint(identifier, x, y, width, height))
+        circles.append(
+            CircleSpeedConstraint(
+                identifier, x, y, width, height, annotation_column_stride(entry)
+            )
+        )
 
     width_groups = []
     group_ids = set()
@@ -939,11 +950,16 @@ def load_manual_speed_constraints(
             if x1 == x2:
                 raise ValueError(f"{description} must have non-zero width")
             segments.append(
-                EqualWidthSegment(segment_id, min(x1, x2), max(x1, x2))
+                EqualWidthSegment(
+                    segment_id,
+                    min(x1, x2),
+                    max(x1, x2),
+                    annotation_column_stride(segment),
+                )
             )
         width_groups.append(EqualWidthGroup(identifier, name, tuple(segments)))
 
-    cut_positions = []
+    cuts = []
     cut_ids = set()
     for index, entry in enumerate(payload.get("cut_positions", [])):
         if not isinstance(entry, dict):
@@ -952,10 +968,10 @@ def load_manual_speed_constraints(
         if not identifier or identifier in cut_ids:
             raise ValueError(f"cut_positions[{index}] has a missing or duplicate id")
         cut_ids.add(identifier)
-        cut_positions.append(
-            _finite_constraint_number(entry.get("x"), f"cut_positions[{index}].x")
-        )
-    cut_positions.sort()
+        x = _finite_constraint_number(entry.get("x"), f"cut_positions[{index}].x")
+        cuts.append((x, annotation_column_stride(entry)))
+    cuts.sort()
+    cut_positions = [x for x, stride in cuts]
     if len(cut_positions) >= 2 and np.any(np.diff(cut_positions) <= 0.0):
         raise ValueError("annotated cut positions must be strictly increasing")
 
@@ -1009,6 +1025,7 @@ def load_manual_speed_constraints(
         tuple(circles),
         tuple(width_groups),
         tuple(cut_positions),
+        tuple(stride for x, stride in cuts),
     )
 
 
@@ -1080,6 +1097,38 @@ def format_contiguous_segments(indices):
     )
 
 
+def default_raw_cache_bytes() -> int:
+    """Leave half the available RAM for analysis, rendering, and other work."""
+    try:
+        available_kib = next(
+            int(line.split()[1])
+            for line in Path("/proc/meminfo").read_text().splitlines()
+            if line.startswith("MemAvailable:")
+        )
+    except (OSError, StopIteration):
+        return 0
+    available = 1024 * available_kib
+    # MemAvailable describes the whole host even inside a memory-limited job.
+    root = Path("/sys/fs/cgroup")
+    try:
+        group = next(
+            line[3:]
+            for line in Path("/proc/self/cgroup").read_text().splitlines()
+            if line.startswith("0::")
+        )
+        current = root / group.lstrip("/")
+        for directory in (current, *current.parents):
+            limit = directory / "memory.max"
+            if limit.exists() and (value := limit.read_text().strip()) != "max":
+                used = int((directory / "memory.current").read_text())
+                available = min(available, int(value) - used)
+            if directory == root:
+                break
+    except (OSError, StopIteration):
+        pass
+    return max(0, available // 2)
+
+
 class FileDataCache:
     def __init__(
         self,
@@ -1087,10 +1136,13 @@ class FileDataCache:
         dtype,
         rows,
         max_cache_bytes: int = 512 * 1024 * 1024,
+        *,
+        read_frame=load_raw_frame,
     ):
         self.bin_paths = bin_paths
         self.dtype = dtype
         self.rows = rows
+        self.read_frame = read_frame
         self.max_cache_bytes = max(1, max_cache_bytes)
         self.cached_bytes = 0
         # determine columns per file
@@ -1116,11 +1168,10 @@ class FileDataCache:
         if idx in self.cache:
             self.cache.move_to_end(idx)
         else:
-            data2d = load_raw_frame(
+            data2d = self.read_frame(
                 self.bin_paths[idx],
                 rows=self.height,
                 dtype=self.dtype,
-                output_dtype=np.float32,
             )
             self.cache[idx] = data2d
             self.cached_bytes += data2d.nbytes
@@ -1135,53 +1186,37 @@ class FileDataCache:
             raise IndexError("Invalid index for FileDataCache")
         row_idx, col_idx = key
         # handle integer column indexing
-        if isinstance(col_idx, int):
+        if isinstance(col_idx, (int, np.integer)):
             ci = col_idx if col_idx >= 0 else self.total_cols + col_idx
             # find file containing this column
             file_idx = np.searchsorted(self.cum_cols, ci, side="right") - 1
             local = ci - self.cum_cols[file_idx]
             arr_file = self._load_file(file_idx)
-            return arr_file[row_idx, local]
+            return arr_file[row_idx, local].astype(np.float32)
         # handle slice of columns
         if isinstance(col_idx, slice):
-            start = (
-                0
-                if col_idx.start is None
-                else (
-                    col_idx.start
-                    if col_idx.start >= 0
-                    else self.total_cols + col_idx.start
-                )
-            )
-            stop = (
-                self.total_cols
-                if col_idx.stop is None
-                else (
-                    col_idx.stop
-                    if col_idx.stop >= 0
-                    else self.total_cols + col_idx.stop
-                )
-            )
-            step = 1 if col_idx.step is None else col_idx.step
-            # collect blocks from each file
+            start, stop, step = col_idx.indices(self.total_cols)
+            if step < 1:
+                raise IndexError("negative column strides are not supported")
             blocks = []
-            for i, cols_i in enumerate(self.file_cols):
-                fstart = self.cum_cols[i]
-                fend = self.cum_cols[i + 1]
-                if fend <= start or fstart >= stop:
-                    continue
-                lo = max(start, fstart) - fstart
-                hi = min(stop, fend) - fstart
-                arr_file = self._load_file(i)
-                blocks.append(arr_file[row_idx, lo:hi])
+            first = np.searchsorted(self.cum_cols, start, side="right") - 1
+            for i in range(first, len(self.file_cols)):
+                fstart, fend = self.cum_cols[i : i + 2]
+                if fstart >= stop:
+                    break
+                lo = max(start, fstart)
+                lo += (start - lo) % step  # Keep the global phase across files.
+                hi = min(stop, fend)
+                if lo < hi:
+                    local = slice(lo - fstart, hi - fstart, step)
+                    # Detach the slice so a wide strided read cannot pin every
+                    # raw frame it touches after eviction from the LRU cache.
+                    blocks.append(
+                        self._load_file(i)[row_idx, local].astype(np.float32, order="C")
+                    )
             if not blocks:
-                empty = np.empty((self.height, 0), dtype=np.float32)
-                return empty[row_idx, :]
-            arr = np.concatenate(blocks, axis=-1)
-            # apply column step
-            if step != 1:
-                arr = arr[..., ::step]
-            return arr
+                return np.empty((self.height, 0), dtype=np.float32)[row_idx, :]
+            return blocks[0] if len(blocks) == 1 else np.concatenate(blocks, axis=-1)
         # unsupported indexing
         raise IndexError("Unsupported index type for FileDataCache")
 
@@ -1244,16 +1279,17 @@ class ChannelView:
 
 
 class ColumnSliceView:
-    """A zero-copy coordinate view over an exact contiguous column interval."""
+    """A zero-copy coordinate view over an optionally strided column interval."""
 
-    def __init__(self, source, start: int, stop: int):
-        if not 0 <= start < stop <= source.width:
+    def __init__(self, source, start: int, stop: int, stride: int = 1):
+        if not 0 <= start < stop <= source.width or stride < 1:
             raise ValueError("column slice lies outside its source")
         self.source = source
         self.start = int(start)
         self.stop = int(stop)
         self.height = source.height
-        self.width = self.stop - self.start
+        self.stride = stride
+        self.width = (self.stop - self.start + stride - 1) // stride
 
     @property
     def shape(self):
@@ -1268,16 +1304,70 @@ class ColumnSliceView:
             if step < 1:
                 raise IndexError("negative column strides are not supported")
             source_columns = slice(
-                self.start + start,
-                self.start + stop,
-                step,
+                self.start + start * self.stride,
+                min(self.stop, self.start + stop * self.stride),
+                step * self.stride,
             )
         else:
             index = col_key if col_key >= 0 else self.width + col_key
             if not 0 <= index < self.width:
                 raise IndexError("column index is out of range")
-            source_columns = self.start + index
+            source_columns = self.start + index * self.stride
         return self.source[row_key, source_columns]
+
+
+def estimate_analysis_stride(green1, green2):
+    """Measure inter-green lag in short windows before choosing a full scan scale."""
+    height, width = green1.shape
+    probe_width = 2048
+    if width < probe_width:
+        return 1
+    bands = min(height, 64)
+    rows = height // bands * bands
+    starts = np.unique(
+        np.linspace(
+            0,
+            width - probe_width,
+            min(24, width // 512),
+            dtype=int,
+        )
+    )
+    lags = []
+    for start in starts:
+        features = []
+        for view in (green1, green2):
+            block = view[:rows, start : start + probe_width]
+            compact = block.reshape(bands, rows // bands, probe_width).mean(axis=1)
+            features.append(compact - gaussian_filter1d(compact, 3, axis=0))
+        stride = 1
+        while features[0].shape[1] >= 32:
+            a, b = (gaussian_filter1d(f, 1.2, order=1, axis=1) for f in features)
+            ref = a[:, 6:-6]
+            ref_energy = np.sum(ref * ref, axis=1)
+            profile = []
+            for offset in range(13):
+                shifted = b[:, offset : offset + ref.shape[1]]
+                norm = np.sqrt(ref_energy * np.sum(shifted * shifted, axis=1))
+                correlation = np.sum(ref * shifted, axis=1) / np.maximum(norm, 1e-12)
+                profile.append(np.median(correlation))
+            peak = int(np.argmax(profile))
+            if (
+                0 < peak < 12
+                and profile[peak] >= 0.7
+                and profile[peak] - np.median(profile) >= 0.05
+            ):
+                lags.append((peak - 6) * stride)
+                break
+            features = [(f[:, 0:-1:2] + f[:, 1::2]) * 0.5 for f in features]
+            stride *= 2
+    if len(lags) < 3:
+        return 1
+    # Leave headroom for local speed variation inside the +/-6 lag search.
+    lag = np.percentile(np.abs(lags), 75)
+    stride = 1
+    while lag > 3 * stride and width // (2 * stride) >= 512:
+        stride *= 2
+    return stride
 
 
 def windowed_cross_correlation(
@@ -1888,6 +1978,108 @@ def windowed_cross_correlation(
     return good_xs, refined_ys, weights
 
 
+class SpeedAnalysis(NamedTuple):
+    green1: ColumnSliceView
+    green2: ColumnSliceView
+    jitter_models: ColumnJitterModel | None
+    stride: int
+    positions: np.ndarray  # Original Bayer columns within the processing ROI.
+    displacements: np.ndarray  # Signed original columns per output pixel.
+    weights: np.ndarray
+
+
+def measure_speed_at_adaptive_stride(
+    green1,
+    green2,
+    stride,
+    full_mask,
+    jitter_models,
+    *,
+    downsample_steps,
+    max_green_down,
+    valid_x_range=None,
+    show_progress=True,
+):
+    """Return analysis views for skew and measurements in original Bayer columns."""
+    best = None
+    best_support = 0.0
+    while True:
+        g1 = ColumnSliceView(green1, 0, green1.width, stride)
+        g2 = ColumnSliceView(green2, 0, green2.width, stride)
+        mask = full_mask
+        models = jitter_models
+        if stride > 1:
+            mask = build_structure_mask(
+                g1,
+                downsample_steps=downsample_steps,
+                max_green_down=max_green_down,
+                show_progress=show_progress,
+            )
+            if jitter_models is not None:
+                # Use the sensor corrections for the actual exposures selected.
+                models = ColumnJitterModel(
+                    jitter_models.band_corrections[:, :, ::stride],
+                    green1.height,
+                    jitter_models.black_levels,
+                    jitter_models.white_levels,
+                    jitter_models.confidence[::stride],
+                )
+        bounds = None
+        span = g1.width
+        if valid_x_range is not None:
+            bounds = tuple(x / stride for x in valid_x_range)
+            span = bounds[1] - bounds[0]
+        # Retain several overlapping windows on short, coarsely sampled ROIs.
+        step = min(256, max(16, int(span) // 24))
+        xs, lags, weights = windowed_cross_correlation(
+            g1,
+            g2,
+            window_step=step,
+            window_size=16 * step,
+            jitter_models=models,
+            structure_mask=mask,
+            structure_mask_scale=2**downsample_steps,
+            valid_x_range=bounds,
+            show_progress=show_progress,
+        )
+        # Match the signed weighted median used by robust_bspline_fit.
+        positive = (lags > 0) & (weights > 0)
+        negative = (lags < 0) & (weights > 0)
+        dominant = (
+            positive if weights[positive].sum() > weights[negative].sum() else negative
+        )
+        if np.count_nonzero(dominant) >= 4:
+            # A few adjacent windows can all lock onto the same local alias.
+            # Try a coarser scale before extrapolating it over a long capture.
+            coverage = min(1.0, (np.ptp(xs[dominant]) + 16 * step) / span)
+            agreement = weights[dominant].sum() / weights.sum()
+            support = coverage * agreement
+            result = SpeedAnalysis(
+                g1, g2, models, stride, xs * stride, lags * stride, weights
+            )
+            if coverage >= 0.25 and agreement >= 0.65:
+                best = result
+                break
+            if support > best_support:
+                best = result
+                best_support = support
+        if span < 1024:
+            if best is not None:
+                break
+            raise ValueError(
+                "insufficient direction-consistent speed measurements "
+                f"through analysis stride {stride}"
+            )
+        stride *= 2
+        if show_progress:
+            print(f"limited motion evidence; retrying at stride {stride}")
+    if show_progress:
+        print(
+            f"speed analysis stride {best.stride}, {len(best.positions)} measurements"
+        )
+    return best
+
+
 def _smooth_speed_extrapolator(spline, support_min: float, support_max: float):
     """Extend a one-direction speed spline without flat endpoint clamps.
 
@@ -1953,6 +2145,7 @@ def robust_bspline_fit(
     c=2.5,
     visualize: bool = False,
     verbose: bool = True,
+    analysis_stride: int = 1,
 ):
     """Fit a stiff, direction-preserving log-speed spline.
 
@@ -2010,7 +2203,7 @@ def robust_bspline_fit(
     span = support_max - support_min
     knot_count = max(
         4,
-        int(math.ceil(span / SPEED_CORRELATION_KNOT_SPACING)) + 1,
+        int(math.ceil(span / (SPEED_CORRELATION_KNOT_SPACING * analysis_stride))) + 1,
     )
     knots = np.linspace(support_min, support_max, knot_count, dtype=np.float64)
     log_magnitude = np.log(np.abs(fit_y))
@@ -2022,7 +2215,12 @@ def robust_bspline_fit(
     )
     curvature_count = max(
         17,
-        int(math.ceil(span / SPEED_CORRELATION_CURVATURE_SAMPLE_SPACING)) + 1,
+        int(
+            math.ceil(
+                span / (SPEED_CORRELATION_CURVATURE_SAMPLE_SPACING * analysis_stride)
+            )
+        )
+        + 1,
     )
     curvature_x = np.linspace(
         support_min,
@@ -2054,7 +2252,7 @@ def robust_bspline_fit(
         )
         curvature_residual = (
             speed_model(curvature_x, 2)
-            * SPEED_CORRELATION_CURVATURE_LENGTH**2
+            * (SPEED_CORRELATION_CURVATURE_LENGTH * analysis_stride) ** 2
             / SPEED_CORRELATION_CURVATURE_LOG_SIGMA
         )
         return np.concatenate(
@@ -2120,13 +2318,13 @@ def robust_bspline_fit(
             label="Direction-consistent support",
         )
     ax1.plot(x, np.zeros_like(x), "k--")
-    ax1.set_title("Stiff Correlation Speed Fit")
-    ax1.set_ylabel("y")
+    ax1.set_title(f"Green-channel displacement (analysis stride {analysis_stride})")
+    ax1.set_ylabel("Bayer columns per output pixel")
     ax1.legend()
 
     ax2.plot(x, initial_weights, "k.", label="Initial weights")
     ax2.plot(fit_x, current_weights, "r.", label="Final weights")
-    ax2.set_xlabel("x")
+    ax2.set_xlabel("Bayer column within processing region")
     ax2.set_ylabel("weight")
     ax2.legend()
 
@@ -2206,6 +2404,7 @@ def _speed_constraint_diagnostics(
                 "id": circle.identifier,
                 "x": circle.center_x,
                 "target_speed_magnitude": target,
+                "log_speed_sigma": circle.log_speed_sigma,
                 "correlation_speed_magnitude": base_speed,
                 "refined_speed_magnitude": refined_speed,
                 "correlation_relative_residual": base_speed / target - 1.0,
@@ -2250,7 +2449,7 @@ def _speed_constraint_diagnostics(
                     "x2": segment.x2,
                     "annotation_width_pixels": segment.width,
                     "annotation_sigma_pixels": (
-                        SPEED_ANNOTATION_DIMENSION_SIGMA_PIXELS
+                        SPEED_ANNOTATION_DIMENSION_SIGMA_PIXELS * segment.column_stride
                     ),
                     "correlation_output_length": float(base_length),
                     "refined_output_length": float(refined_length),
@@ -2289,6 +2488,7 @@ def refine_speed_spline_with_constraints(
     diagnostic_dir: Path | None = None,
     diagnostic_prefix: str = "speed_constraint_fit",
     global_x_offset: float = 0.0,
+    analysis_stride: int = 1,
     verbose: bool = True,
 ):
     """Fit a smooth speed magnitude while preserving correlation direction.
@@ -2363,7 +2563,7 @@ def refine_speed_spline_with_constraints(
     span = fit_x_max - fit_x_min
     coarse_knot_count = max(
         4,
-        int(math.ceil(span / SPEED_CONSTRAINT_KNOT_SPACING)) + 1,
+        int(math.ceil(span / (SPEED_CONSTRAINT_KNOT_SPACING * analysis_stride))) + 1,
     )
     # Keep the representation independent of annotation locations. Adding a
     # knot at every annotation gives the fit a local degree of freedom that can
@@ -2433,7 +2633,12 @@ def refine_speed_spline_with_constraints(
 
     curvature_sample_count = max(
         17,
-        int(math.ceil(span / SPEED_CONSTRAINT_CURVATURE_SAMPLE_SPACING)) + 1,
+        int(
+            math.ceil(
+                span / (SPEED_CONSTRAINT_CURVATURE_SAMPLE_SPACING * analysis_stride)
+            )
+        )
+        + 1,
     )
     curvature_x = np.linspace(
         fit_x_min,
@@ -2487,7 +2692,7 @@ def refine_speed_spline_with_constraints(
         # basis contains more representation points.
         result.extend(
             speed_log_spline(coefficients)(curvature_x, 2)
-            * SPEED_CONSTRAINT_CURVATURE_LENGTH**2
+            * (SPEED_CONSTRAINT_CURVATURE_LENGTH * analysis_stride) ** 2
             / SPEED_CONSTRAINT_CURVATURE_LOG_SIGMA
         )
         for circle, target in circle_data:
@@ -2900,6 +3105,8 @@ def moving_region_block_scores(
         stop = min(start + block_columns, green_view.width)
         read_start = max(0, start - overlap)
         read_stop = min(green_view.width, stop + overlap)
+        if stop - start < 2:
+            continue
         raw_green = bin2to1(green_view[:, slice(read_start, read_stop)])
 
         grad_y, grad_x = np.gradient(raw_green)
@@ -2921,11 +3128,37 @@ def moving_region_block_scores(
     return results
 
 
+def find_moving_region(green, stride, max_green, padding_columns, *, show_progress):
+    """Localize motion at the analysis scale, returning original column bounds."""
+    while True:
+        view = ColumnSliceView(green, 0, green.width, stride)
+        blocks = moving_region_block_scores(
+            view, max_green, show_progress=show_progress
+        )
+        scores = np.asarray([score for _, _, score in blocks])
+        if scores.size and scores.max() > STRUCTURE_MASK_THRESHOLD:
+            threshold = max(STRUCTURE_MASK_THRESHOLD, scores.min() * 1.3)
+            # A subject may fill the capture, leaving no low-scoring background.
+            if scores.max() <= threshold:
+                threshold = STRUCTURE_MASK_THRESHOLD
+            active = np.flatnonzero(scores > threshold)
+            start, stop = aligned_processing_column_bounds(
+                green.width,
+                blocks[active[0]][0] * stride - padding_columns,
+                blocks[active[-1]][1] * stride + padding_columns,
+            )
+            return start, stop, stride
+        if view.width < 1024:
+            raise ValueError("motion detector did not find a moving image region")
+        stride *= 2
+
+
 def estimate_white_balance(
     bin_paths,
     max_sample_columns: int = WHITE_BALANCE_SAMPLE_COLUMNS,
     *,
     show_progress: bool = True,
+    read_frame=load_raw_frame,
 ) -> np.ndarray:
     if not bin_paths:
         return np.ones(3, dtype=np.float32)
@@ -2956,7 +3189,7 @@ def estimate_white_balance(
         total=len(sample_plan),
         show=show_progress,
     ):
-        dat1_reshaped = load_raw_frame(
+        dat1_reshaped = read_frame(
             bin_path,
             rows=4096,
             columns=display_columns * 2,
@@ -2997,20 +3230,22 @@ def get_percentile(hist, bin_edges, total, percent):
     return bin_edges[idx] + frac * bin_width
 
 
-def autoexposure(selected_bins, white_balance, *, show_progress: bool = True):
+def autoexposure(
+    selected_bins, white_balance, *, show_progress: bool = True, read_frame=load_raw_frame
+):
     num_bins = 65536
     bin_edges = np.arange(0, num_bins + 1, dtype=np.float64)
     histogram = np.zeros(num_bins, dtype=np.int64)
     total_values = 0
 
-    for i, bin in progress(
-        enumerate(selected_bins),
+    for bin_path in progress(
+        selected_bins,
         total=len(selected_bins),
         desc="autoexposure",
         show=show_progress,
     ):
-        dat1_reshaped = load_raw_frame(
-            bin,
+        dat1_reshaped = read_frame(
+            bin_path,
             rows=4096,
             output_dtype=np.float32,
         )
@@ -3025,10 +3260,11 @@ def autoexposure(selected_bins, white_balance, *, show_progress: bool = True):
 
         stacked = np.stack((raw_red, raw_green, raw_blue), axis=2)
         rgb = apply_color_transform(stacked, white_balance)
-        rgb = np.clip(rgb, 0, 65536)
-
-        h, _ = np.histogram(rgb.ravel(), bins=bin_edges)
-        histogram += h
+        # Unit-width bins use floor, with 65536 included in the last bin.
+        np.clip(rgb, 0, num_bins - 1, out=rgb)
+        np.fmin(rgb, num_bins, out=rgb)  # Put NaNs in a discarded overflow bin.
+        counts = np.bincount(rgb.ravel().astype(np.intp), minlength=num_bins)
+        histogram += counts[:num_bins]
         total_values += rgb.size
     p2 = get_percentile(histogram, bin_edges, total_values, 2)
     p98 = get_percentile(histogram, bin_edges, total_values, 98)
@@ -3065,6 +3301,8 @@ def build_structure_mask(
         stop = min(start + block_columns, green_view.width)
         read_start = max(0, start - overlap)
         read_stop = min(green_view.width, stop + overlap)
+        if (stop - start) // downsample == 0:
+            continue
         raw_green = green_view[:, slice(read_start, read_stop)]
         for _ in range(downsample_steps):
             raw_green = bin2to1(raw_green)
@@ -3391,7 +3629,7 @@ def _jitter_band_statistics(
             f"image height {height} must be divisible by {num_bands} jitter bands"
         )
     banded = data.reshape(num_bands, height // num_bands, width)
-    medians = np.median(banded, axis=1).astype(np.float32, copy=False)
+    medians = bn.median(banded, axis=1).astype(np.float32, copy=False)
     span = max(white - black, 1.0)
     high_margin = max(
         JITTER_WHITE_MARGIN_MIN,
@@ -4527,6 +4765,7 @@ def build_padded_cut_output_ranges(
 def justify_cut_output_ranges(
     sample_positions,
     chunk_ranges: list[tuple[int, int]],
+    cut_strides: tuple[int, ...] = (),
 ) -> tuple[list[tuple[int, int]], int]:
     """Adjust interior cuts and find a common width for the half-size stack."""
     cuts = np.array([chunk_ranges[0][0], *(stop for _, stop in chunk_ranges)])
@@ -4549,6 +4788,9 @@ def justify_cut_output_ranges(
     # movement in output columns. This also handles either sampling direction.
     raw_per_column = 0.5 * np.abs(positions[movable + 1] - positions[movable - 1])
     cut_units = JUSTIFY_CUT_SIGMA / raw_per_column
+    if cut_strides:
+        strides = cut_strides if positions[-1] > positions[0] else cut_strides[::-1]
+        cut_units *= np.asarray(strides[1:-1])
     width_deltas = np.diff(np.eye(len(cuts))[:, 1:-1], axis=0) * cut_units
     inner_widths = widths[1:-1]
     inner_deltas = width_deltas[1:-1]
@@ -4636,6 +4878,54 @@ def pad_random_edge_columns(
     return padded
 
 
+class _SamplingBlocks:
+    """Reuse corrected raw columns across adjacent apertures in either direction."""
+
+    TILE_WIDTH = 256
+
+    def __init__(self, width, sources, models, *, protect_scene, pitch_offsets=None):
+        self.sources = sources  # (Bayer channel index, row phase, view)
+        self.models = models
+        self.protect_scene = protect_scene
+        self.pitch_offsets = pitch_offsets
+        self.width = width
+        self.start = self.stop = 0
+        self.tiles = {}
+        self.planes = []
+
+    def read(self, first, stop):
+        if self.start <= first and stop <= self.stop:
+            return self.planes, self.start
+        self.start = first // self.TILE_WIDTH * self.TILE_WIDTH
+        self.stop = min(math.ceil(stop / self.TILE_WIDTH) * self.TILE_WIDTH, self.width)
+        starts = range(self.start, self.stop, self.TILE_WIDTH)
+        self.tiles = {x: self.tiles[x] for x in starts if x in self.tiles}
+        for x in starts:
+            if x in self.tiles:
+                continue
+            columns = slice(x, min(x + self.TILE_WIDTH, self.stop))
+            tile = []
+            for channel, phase, view in self.sources:
+                pixels = apply_column_models(
+                    view[:, columns],
+                    self.models,
+                    x,
+                    channel,
+                    protect_scene=self.protect_scene,
+                )
+                if self.pitch_offsets is not None:
+                    pixels = reconstruct_pitch_rows(
+                        pixels, self.pitch_offsets[columns], phase
+                    )
+                tile.append(pixels)
+            self.tiles[x] = tile
+        self.planes = self.tiles[self.start]
+        if len(self.tiles) > 1:
+            channels = zip(*(self.tiles[x] for x in starts))
+            self.planes = [np.concatenate(parts, axis=1) for parts in channels]
+        return self.planes, self.start
+
+
 def sample_motion_corrected_chunks(
     red_view,
     green1,
@@ -4706,8 +4996,13 @@ def sample_motion_corrected_chunks(
     row_idx = np.arange(len(sensor_rows))[:, None]
     views = (red_view, green1, green2, blue_view)
     row_phases = (0, 1, 0, 1)
-    block_start = block_stop = 0
-    planes = []
+    blocks = _SamplingBlocks(
+        green1.width,
+        tuple(zip(range(4), row_phases, views)),
+        jitter_models,
+        protect_scene=jitter_protect_scene,
+        pitch_offsets=pitch_offsets,
+    )
 
     for chunk_i, batch_indices in enumerate(batches):
         pad_left = batch_indices[0] > 0
@@ -4745,22 +5040,7 @@ def sample_motion_corrected_chunks(
             if end_col <= start_col:
                 continue
 
-            if start_col < block_start or end_col > block_stop:
-                # Adjacent apertures reuse the same input columns. Correct raw
-                # radiometry once, then reconstruct each color at its own phase
-                # and acquisition time before mixing horizontal aperture taps.
-                block_start = start_col // 128 * 128
-                block_stop = min((end_col + 127) // 128 * 128, green1.width)
-                columns = slice(block_start, block_stop)
-                planes = []
-                for channel, (view, phase) in enumerate(zip(views, row_phases)):
-                    plane = apply_column_models(
-                        view[:, columns], jitter_models, block_start, channel,
-                        protect_scene=jitter_protect_scene,
-                    )
-                    if pitch_offsets is not None:
-                        plane = reconstruct_pitch_rows(plane, pitch_offsets[columns], phase)
-                    planes.append(plane)
+            planes, block_start = blocks.read(start_col, end_col)
             indices_local = indices_clipped - block_start
 
             dist = window_indices.astype(np.float32) - centers[:, None].astype(
@@ -4903,6 +5183,12 @@ def sample_skew_corrected_green_chunks(
         return
 
     image_height, image_width = green1.shape
+    blocks = _SamplingBlocks(
+        image_width,
+        ((JITTER_GREEN1, 1, green1), (JITTER_GREEN2, 0, green2)),
+        jitter_models,
+        protect_scene=False,
+    )
     chunk_i = 0
     for start in range(0, len(indices), max_pix):
         batch_indices = indices[start : start + max_pix]
@@ -4927,39 +5213,6 @@ def sample_skew_corrected_green_chunks(
         ):
             raise ValueError("sample positions and widths must be finite and positive")
 
-        window_halves = np.ceil(use_widths).astype(np.int64)
-        bases = np.floor(use_positions).astype(np.int64)
-        left_columns = np.clip(
-            bases - window_halves,
-            0,
-            image_width - 1,
-        )
-        right_columns = np.clip(
-            bases + window_halves,
-            0,
-            image_width - 1,
-        )
-        read_start = int(np.min(left_columns))
-        read_stop = int(np.max(right_columns)) + 1
-
-        green1_block = green1[:, slice(read_start, read_stop)]
-        green2_block = green2[:, slice(read_start, read_stop)]
-        if jitter_models is not None:
-            green1_block = apply_column_models(
-                green1_block,
-                jitter_models,
-                read_start,
-                JITTER_GREEN1,
-                protect_scene=False,
-            )
-            green2_block = apply_column_models(
-                green2_block,
-                jitter_models,
-                read_start,
-                JITTER_GREEN2,
-                protect_scene=False,
-            )
-
         sampled_green = np.zeros(
             (2 * image_height, len(use_indices)),
             dtype=np.float32,
@@ -4982,6 +5235,9 @@ def sample_skew_corrected_green_chunks(
             window_indices = base + offsets
             valid = (window_indices >= 0) & (window_indices < image_width)
             indices_clipped = np.clip(window_indices, 0, image_width - 1)
+            (green1_block, green2_block), read_start = blocks.read(
+                int(indices_clipped[0]), int(indices_clipped[-1]) + 1
+            )
             indices_local = indices_clipped - read_start
 
             green1_values = green1_block[:, indices_local]
@@ -5326,12 +5582,29 @@ def render_output_chunk(
     return bin2to1_rgb_u8(rgb_u8)
 
 
+def _scan_frame_levels(raw, downsample_steps, measure_jitter):
+    green = raw[1::2, 1::2]
+    black = white = None
+    if measure_jitter:
+        channels = raw_channels(raw)
+        black = [channel.min() for channel in channels]
+        white = [channel.max() for channel in channels]
+        max_green = white[JITTER_GREEN1]
+    else:
+        max_green = green.max()
+    down = green.astype(np.float32)
+    for _ in range(downsample_steps):
+        down = bin2to1(down)
+    return max_green, down.max(), black, white
+
+
 def process_preview(
     g: Path,
     padding_columns: int = PROCESSING_PADDING_COLUMNS,
     *,
     show_progress: bool = True,
     output_dir: Path = DEFAULT_OUTPUT_DIR,
+    raw_cache_bytes: int | None = None,
     use_speed_constraints: bool = True,
     equal_length_chunks: bool = False,
     pad_output_to_equal_widths: bool = False,
@@ -5422,81 +5695,54 @@ def process_preview(
     max_green_down = 0
     jitter_black_levels = np.full(4, np.inf, dtype=np.float32)
     jitter_white_levels = np.full(4, -np.inf, dtype=np.float32)
-    for i, bin in progress(
-        enumerate(scan_bins),
-        total=len(scan_bins),
-        desc="scanning raw frames",
-        show=show_progress,
-    ):
-        dat1_reshaped = load_raw_frame(
-            bin,
-            rows=4096,
-            output_dtype=np.float32,
+    if raw_cache_bytes is None:
+        raw_cache_bytes = default_raw_cache_bytes()
+    if raw_cache_bytes < 0:
+        raise ValueError("raw_cache_bytes must be non-negative")
+    scan_width = capture_width if selected is None else int(frame_widths[selected].sum())
+    bytes_per_bayer_column = 2 * 4096 * np.dtype(np.uint16).itemsize
+    store = RawFrameStore(raw_cache_bytes, scan_width * bytes_per_bayer_column)
+    for path in progress(scan_bins, desc="scanning raw frames", show=show_progress):
+        raw = load_raw_frame(path, rows=4096)
+        peak, down_peak, black, white = _scan_frame_levels(
+            raw, downsample_steps, ENABLE_COLUMN_JITTER_CORRECTION
         )
-        raw_green = dat1_reshaped[1::2, 1::2]
-        max_green = max(max_green, np.max(raw_green))
-        if ENABLE_COLUMN_JITTER_CORRECTION:
-            raw_channels = (
-                dat1_reshaped[0::2, 1::2],
-                dat1_reshaped[1::2, 1::2],
-                dat1_reshaped[0::2, 0::2],
-                dat1_reshaped[1::2, 0::2],
-            )
-            for channel, raw_channel in enumerate(raw_channels):
-                jitter_black_levels[channel] = min(
-                    jitter_black_levels[channel],
-                    float(np.min(raw_channel)),
-                )
-                jitter_white_levels[channel] = max(
-                    jitter_white_levels[channel],
-                    float(np.max(raw_channel)),
-                )
-        raw_green_down = raw_green
-        for _ in range(downsample_steps):
-            raw_green_down = bin2to1(raw_green_down)
-        max_green_down = max(max_green_down, np.max(raw_green_down))
-        if ENABLE_COLUMN_JITTER_CORRECTION:
-            del raw_channels, raw_channel
-        del raw_green_down, raw_green, dat1_reshaped
+        store.remember(path, raw)
+        max_green = max(max_green, peak)
+        max_green_down = max(max_green_down, down_peak)
+        if black is not None:
+            np.minimum(jitter_black_levels, black, out=jitter_black_levels)
+            np.maximum(jitter_white_levels, white, out=jitter_white_levels)
+        del raw
+    if show_progress:
+        print(
+            f"raw cache holds {len(store.frames)}/{len(scan_bins)} frames "
+            f"in {store.used / 2**30:.2f} GiB"
+        )
+
+    motion_cache = FileDataCache(
+        scan_bins, dtype=np.uint16, rows=4096, read_frame=store.read
+    )
+    motion_green = ChannelView(motion_cache, row_offset=1, col_offset=1)
+    other_green = ChannelView(motion_cache, row_offset=0, col_offset=0)
+    analysis_stride = estimate_analysis_stride(motion_green, other_green)
+    if show_progress:
+        print(f"initial speed analysis stride {analysis_stride}")
 
     if selected is None:
-        motion_cache = FileDataCache(bins, dtype=np.uint16, rows=4096)
-        motion_green = ChannelView(motion_cache, row_offset=1, col_offset=1)
-        scored_blocks = moving_region_block_scores(
+        processing_x_start, processing_x_stop, analysis_stride = find_moving_region(
             motion_green,
+            analysis_stride,
             max_green,
+            padding_columns,
             show_progress=show_progress,
         )
-        del motion_green, motion_cache
-
-        min_score = min(score for _start, _stop, score in scored_blocks)
         frame_ends = frame_starts[:-1] + frame_widths
-        relative_threshold = min_score * 1.3 if len(scored_blocks) > 1 else 0.0
-        score_threshold = max(STRUCTURE_MASK_THRESHOLD, relative_threshold)
-        interesting_ranges = [
-            (start - padding_columns, stop + padding_columns)
-            for start, stop, score in scored_blocks
-            if score > score_threshold
-        ]
-        # If meaningful structure fills every fixed block, there may be no
-        # low-scoring background from which to form a 1.3x relative contrast.
-        if not interesting_ranges:
-            interesting_ranges = [
-                (start - padding_columns, stop + padding_columns)
-                for start, stop, score in scored_blocks
-                if score > STRUCTURE_MASK_THRESHOLD
-            ]
-        if not interesting_ranges:
-            raise ValueError("motion detector did not find a moving image region")
-        processing_x_start, processing_x_stop = aligned_processing_column_bounds(
-            capture_width,
-            min(start for start, _stop in interesting_ranges),
-            max(stop for _start, stop in interesting_ranges),
-        )
         selected = np.flatnonzero(
             (frame_ends > processing_x_start)
             & (frame_starts[:-1] < processing_x_stop)
         ).tolist()
+    del motion_green, other_green, motion_cache
     if show_progress:
         selection_source = (
             "manual cut ROI" if constraints is not None and constraints.has_cut_regions
@@ -5509,9 +5755,13 @@ def process_preview(
 
     selected_bins = [bins[s] for s in selected]
 
+    if justify_padding != "original":
+        store.retain(selected_bins)
+
     white_balance = estimate_white_balance(
         selected_bins,
         show_progress=show_progress,
+        read_frame=store.read,
     )
     if show_progress:
         print("white balance", white_balance)
@@ -5520,11 +5770,13 @@ def process_preview(
         selected_bins,
         white_balance,
         show_progress=show_progress,
+        read_frame=store.read,
     )
 
     # lazily load binary data across selected files without full-memory concatenation
-    cache = FileDataCache(selected_bins, dtype=np.uint16, rows=4096)
-    data = cache
+    data = FileDataCache(
+        selected_bins, dtype=np.uint16, rows=4096, read_frame=store.read
+    )
 
     base_red = ChannelView(data, row_offset=0, col_offset=1)
     base_blue = ChannelView(data, row_offset=1, col_offset=0)
@@ -5587,44 +5839,24 @@ def process_preview(
             local_constraints.cut_positions[0],
             local_constraints.cut_positions[-1],
         )
-    sample_xs, sample_ys, _weights = windowed_cross_correlation(
+    analysis = measure_speed_at_adaptive_stride(
         green1,
         green2,
-        jitter_models=jitter_models,
-        structure_mask=mask_full,
-        structure_mask_scale=STRUCTURE_MASK_DOWNSAMPLE,
+        analysis_stride,
+        mask_full,
+        jitter_models,
+        downsample_steps=downsample_steps,
+        max_green_down=max_green_down,
         valid_x_range=valid_correlation_range,
         show_progress=show_progress,
     )
     del mask_full
-    fit_sample_xs = sample_xs
-    fit_sample_ys = sample_ys
-    fit_weights = _weights
-    if local_constraints is not None and local_constraints.has_cut_regions:
-        inside_manual_cuts = (
-            (sample_xs >= local_constraints.cut_positions[0])
-            & (sample_xs <= local_constraints.cut_positions[-1])
-        )
-        if np.count_nonzero(inside_manual_cuts) >= 4:
-            fit_sample_xs = sample_xs[inside_manual_cuts]
-            fit_sample_ys = sample_ys[inside_manual_cuts]
-            fit_weights = _weights[inside_manual_cuts]
-            if show_progress:
-                print(
-                    "speed correlation: using "
-                    f"{len(fit_sample_xs)}/{len(sample_xs)} samples inside "
-                    "the annotated start/end cuts"
-                )
-        elif show_progress:
-            print(
-                "speed correlation: fewer than four samples lie inside the "
-                "annotated cuts; using all samples to determine direction"
-            )
     correlation_spline = robust_bspline_fit(
-        x=fit_sample_xs,
-        y=fit_sample_ys,
-        weights=fit_weights,
+        x=analysis.positions,
+        y=analysis.displacements,
+        weights=analysis.weights,
         smoothness=80000,
+        analysis_stride=analysis.stride,
         visualize=False,
         g=g,
         verbose=show_progress,
@@ -5639,21 +5871,14 @@ def process_preview(
             diagnostic_dir=output_dir,
             diagnostic_prefix=f"{capture_timestamp}_speed_constraint_fit",
             global_x_offset=selected_global_x0,
+            analysis_stride=analysis.stride,
             verbose=show_progress,
         )
-    green_displacements = np.interp(
-        np.arange(green1.width, dtype=np.float64),
-        sample_xs,
-        sample_ys,
-        left=sample_ys[0],
-        right=sample_ys[-1],
-    )
-
     if show_progress:
         print(g, len(bins), data.shape)
 
     sample_positions, widths, step_scales = generate_sample_positions(
-        spline, sample_xs, green1.width
+        spline, analysis.positions, green1.width
     )
     step_scales = np.asarray(step_scales, dtype=np.float32)
     # chunk size for sampling
@@ -5662,14 +5887,14 @@ def process_preview(
 
     skew = estimate_skew_hough(
         sample_skew_corrected_green_chunks(
-            green1,
-            green2,
-            sample_positions,
-            widths,
+            analysis.green1,
+            analysis.green2,
+            np.asarray(sample_positions) / analysis.stride,
+            np.maximum(1.0, widths / analysis.stride),
             stride_x=hough_stride,
             stride_y=hough_stride,
             max_pix=skew_chunk_size,
-            jitter_models=jitter_models,
+            jitter_models=analysis.jitter_models,
             show_progress=show_progress,
         ),
         g=g,
@@ -5689,6 +5914,11 @@ def process_preview(
     # geometry fit; keeping them separate preserves the acyclic raw
     # radiometry -> speed -> skew dependency.
     if jitter_models is not None:
+        green_displacements = np.interp(
+            np.arange(green1.width, dtype=np.float64),
+            analysis.positions,
+            analysis.displacements,
+        )
         jitter_models = refine_column_exposure_jitter_correction(
             jitter_models,
             red_view,
@@ -5698,6 +5928,7 @@ def process_preview(
             green_displacements,
             show_progress=show_progress,
         )
+    del analysis
     if ENABLE_JITTER_DEBUG_PLOT and jitter_models is not None:
         row_idx = min(JITTER_DEBUG_ROW, green1.height - 1)
         cols = np.arange(green1.width, dtype=np.int32)
@@ -5758,7 +5989,9 @@ def process_preview(
 
     background_channels = None
     if justify_padding == "original":
-        background_data = FileDataCache(bins, dtype=np.uint16, rows=data.height)
+        background_data = FileDataCache(
+            bins, dtype=np.uint16, rows=data.height, read_frame=store.read
+        )
         background_channels = tuple(
             ChannelView(background_data, row_offset=row, col_offset=col)
             for row, col in ((0, 1), (1, 1), (0, 0), (1, 0))
@@ -5825,7 +6058,7 @@ def process_preview(
             )
         if justify:
             chunk_ranges, justified_stack_width = justify_cut_output_ranges(
-                sample_positions, chunk_ranges
+                sample_positions, chunk_ranges, local_constraints.cut_strides
             )
         output_chunk_count = len(chunk_ranges)
         generator_binned_widths = np.asarray(
@@ -6128,8 +6361,16 @@ def _parse_args(argv=None):
             f"{DEFAULT_SKEW_HOUGH_EXTENTS[1]})"
         ),
     )
+    parser.add_argument(
+        "--raw-cache-gib", type=float, metavar="GIB",
+        help="RAM budget for raw frames across all workers (default: half of available RAM; 0 disables)",
+    )
     parser.add_argument("--max-workers", type=int, default=6)
     args = parser.parse_args(argv)
+    if args.raw_cache_gib is not None and (
+        not math.isfinite(args.raw_cache_gib) or args.raw_cache_gib < 0
+    ):
+        parser.error("--raw-cache-gib must be finite and non-negative")
     if args.vibration_rows < MIN_GROUND_ROWS:
         parser.error(f"--vibration-rows must be at least {MIN_GROUND_ROWS}")
     if args.skew_hough_extents is not None:
@@ -6192,6 +6433,13 @@ def main(argv=None):
         process_kwargs["flip_output_180"] = args.flip_output_180
     if args.skew_hough_extents is not None:
         process_kwargs["skew_hough_extents"] = args.skew_hough_extents
+    if args.raw_cache_gib is not None or len(dirs) > 1:
+        budget = (
+            default_raw_cache_bytes() if args.raw_cache_gib is None
+            else int(args.raw_cache_gib * 2**30)
+        )
+        workers = max(1, min(len(dirs), args.max_workers))
+        process_kwargs["raw_cache_bytes"] = budget // workers
     if len(dirs) == 1:
         process_preview(dirs[0], **process_kwargs)
         return

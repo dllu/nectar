@@ -1,5 +1,6 @@
 import json
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -133,18 +134,18 @@ class SpeedConstraintsTest(unittest.TestCase):
             self.write_frame(root / "im000000.bin", self.make_raw_frame())
             capture = CaptureSequence.discover(root, frame_rows=self.FRAME_ROWS)
             document = AnnotationDocument(
-                circles=[CircleConstraint("circle_001", 0.25, 0.5, 1.5, 1.25)],
+                circles=[CircleConstraint("circle_001", 0.25, 0.5, 1.5, 1.25, 8)],
                 width_groups=[
                     WidthGroup(
                         "width_group_001",
                         "Train windows",
-                        [WidthSegment("segment_001", 0.1, 1.1)],
+                        [WidthSegment("segment_001", 0.1, 1.1, 4)],
                     )
                 ],
                 cut_positions=[
                     CutPosition("position_002", 1.5),
                     CutPosition("position_001", 0.0),
-                    CutPosition("position_003", 1.0),
+                    CutPosition("position_003", 1.0, 2),
                 ],
             )
             path = root / "speed_constraints.json"
@@ -153,7 +154,9 @@ class SpeedConstraintsTest(unittest.TestCase):
             loaded = AnnotationDocument.load(path)
             payload = json.loads(path.read_text(encoding="utf-8"))
 
-            self.assertEqual(len(loaded.circles), 1)
+            self.assertEqual(loaded.circles, document.circles)
+            self.assertEqual(loaded.width_groups, document.width_groups)
+            self.assertEqual(loaded.cut_positions[1].column_stride, 2)
             self.assertEqual(loaded.width_groups[0].name, "Train windows")
             self.assertEqual(
                 [cut.x for cut in loaded.cut_positions],
@@ -204,6 +207,28 @@ class SpeedConstraintsTest(unittest.TestCase):
                     "Building low-resolution navigator…",
                 ],
             )
+
+    def test_cached_and_on_demand_windows_keep_global_bayer_phase(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            rng = np.random.default_rng(8)
+            for index, width in enumerate((5, 3, 7, 2, 6)):
+                raw = rng.integers(0, 65536, (4, 2 * width), dtype=np.uint16)
+                self.write_frame(root / f"im{index}.bin", raw)
+            capture = CaptureSequence.discover(root, frame_rows=4)
+            full = np.concatenate(
+                [decode_raw_frame(f, 4) for f in capture.frames], axis=1
+            )
+            with patch("speed_constraints.DISPLAY_CACHE_MAX_BYTES", 36):
+                loaded = load_capture_data(capture)
+            self.assertEqual(loaded.stride, 4)
+            self.assertLessEqual(loaded.rgb.nbytes, 36)
+            for stride in (1, 2, 4, 8):
+                for start, stop in ((0, 13), (8, 23), (4, 15), (9, 21)):
+                    actual = loaded.window(capture, start, stop, stride)
+                    np.testing.assert_array_equal(
+                        actual, loaded.tone_lut[full[:, start:stop:stride]]
+                    )
 
     def test_builds_one_uniform_navigator_for_the_global_image(self):
         capture = CaptureSequence(

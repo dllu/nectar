@@ -9,6 +9,27 @@ import preview
 
 
 class MemoryEfficientHelpersTest(unittest.TestCase):
+    def test_autoexposure_matches_histogram_at_clipping_and_bin_edges(self):
+        rgb = np.array(
+            [-1, 0, 0.99, 1, 124.5, 65534.75, 65535, 65536, 70000, np.nan],
+            dtype=np.float32,
+        )
+        edges = np.arange(65537)
+        reference, _ = np.histogram(rgb.clip(0, 65536), bins=edges)
+        with (
+            patch.object(preview, "apply_color_transform", return_value=rgb.copy()),
+            patch.object(preview, "get_percentile", return_value=0) as percentile,
+        ):
+            preview.autoexposure(
+                [Path("frame.bin")],
+                np.ones(3),
+                show_progress=False,
+                read_frame=lambda *args, **kwargs: np.zeros((4, 4), np.float32),
+            )
+        histogram, _, total, _ = percentile.call_args.args
+        np.testing.assert_array_equal(histogram, reference)
+        self.assertEqual(total, rgb.size)
+
     def test_process_preview_passes_show_progress_to_structure_mask(self):
         class ReachedStructureMask(Exception):
             pass
@@ -50,6 +71,64 @@ class MemoryEfficientHelpersTest(unittest.TestCase):
 
             self.assertFalse(build_structure_mask.call_args.kwargs["show_progress"])
             self.assertNotIn("show", build_structure_mask.call_args.kwargs)
+
+    def test_strided_bayer_views_keep_phase_across_unequal_raw_files(self):
+        raw = np.arange(4 * 22, dtype=np.uint16).reshape(4, 22)
+        with TemporaryDirectory() as directory:
+            paths = []
+            for index, piece in enumerate(np.split(raw, [6, 16], axis=1)):
+                path = Path(directory) / f"{index}.bin"
+                piece.T.tofile(path)
+                paths.append(path)
+            cache = preview.FileDataCache(paths, np.uint16, 4, max_cache_bytes=1)
+            for phase in (0, 1):
+                green = preview.ChannelView(cache, phase, phase)
+                coarse = preview.ColumnSliceView(green, 1, green.width, 4)
+                expected = raw[phase::2, phase::2][:, 1::4]
+                np.testing.assert_array_equal(coarse[:, :], expected)
+                np.testing.assert_array_equal(coarse[:, -1], expected[:, -1])
+
+    def test_slow_motion_uses_original_aperture_across_tiles_in_both_directions(self):
+        class Plane:
+            def __init__(self, pixels):
+                self.pixels = pixels
+                self.height, self.width = pixels.shape
+                self.reads = []
+
+            def __getitem__(self, key):
+                self.reads.append(key[1])
+                return self.pixels[key]
+
+        height, width = 24, 2048
+        rng = np.random.default_rng(11)
+        pixels = rng.uniform(0, 1000, (height, width)).astype(np.float32)
+        # Reading only the analysis lattice would produce a black image.
+        pixels[:, ::8] = 0
+        for step in (16, -16):
+            positions = np.arange(400.25, 1600, abs(step))[:: int(np.sign(step))]
+            planes = [Plane(pixels) for _ in range(4)]
+            aperture = np.full(len(positions), abs(step))
+            skew = 0.4
+            chunks = preview.sample_motion_corrected_chunks(
+                *planes,
+                positions,
+                aperture,
+                step_scales=np.full(len(positions), step),
+                skew=skew,
+                max_pix=13,
+                show_progress=False,
+            )
+            blue = np.concatenate([chunk[1, :, 2] for _, chunk in chunks])
+            centers = positions - skew * step * (2 * height - 1) / 2
+            columns = np.floor(centers).astype(int)[:, None] + np.arange(-16, 17)
+            dist = columns - centers[:, None]
+            weights = np.where(abs(dist) < 16, 1 + np.cos(np.pi * dist / 16), 0)
+            expected = np.sum(pixels[0, columns] * weights, axis=1) / weights.sum(
+                axis=1
+            )
+            np.testing.assert_allclose(blue, expected, atol=0.003)
+            starts = [columns.start for columns in planes[0].reads]
+            self.assertEqual(len(starts), len(set(starts)))
 
     def test_skew_truncation_matches_materialized_row_offsets(self):
         sample_positions = list(np.linspace(20.0, 180.0, 41, dtype=np.float32))

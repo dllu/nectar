@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Interactively annotate geometric speed constraints on raw line-scan data.
 
-The displayed image is deliberately geometric-operation-free: every 2x2 Bayer
-cell becomes one RGB pixel, with the two green samples averaged.  Annotation x
-coordinates therefore match the half-resolution green planes used by
-``preview.py`` and continue monotonically across raw chunk boundaries.
+Each displayed pixel comes from one 2x2 Bayer cell, with its greens averaged.
+The horizontal display stride can be changed while annotation coordinates
+continue to refer to the original Bayer columns across raw chunk boundaries.
 """
 
 from __future__ import annotations
@@ -23,8 +22,8 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from image_processing import auto_tone_map_to_uint8
-from raw_io import load_raw_frame
+from image_processing import display_tone_lut
+from raw_io import annotation_column_stride, load_raw_frame
 from PySide6.QtCore import QPointF, QRectF, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
@@ -41,11 +40,13 @@ from PySide6.QtGui import (
     QPen,
     QPixmap,
     QShortcut,
+    QTransform,
 )
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QCheckBox,
+    QComboBox,
     QFrame,
     QGraphicsEllipseItem,
     QGraphicsItem,
@@ -86,6 +87,7 @@ MIN_ELLIPSE_SIZE = 3.0
 MIN_SEGMENT_WIDTH = 1.0
 NAVIGATOR_PREFERRED_HEIGHT = 96
 NAVIGATOR_MAX_BYTES = 32 * 1024 * 1024
+DISPLAY_CACHE_MAX_BYTES = 256 * 1024 * 1024
 DISPLAY_STATISTICS_MAX_PIXELS = 4 * 1024 * 1024
 
 CIRCLE_COLOR = QColor("#00ff00")
@@ -240,6 +242,10 @@ class CaptureSequence:
 def decode_raw_frame(
     frame: FrameInfo,
     frame_rows: int,
+    *,
+    first: int = 0,
+    stop: int | None = None,
+    stride: int = 1,
 ) -> np.ndarray:
     """Return one Bayer-binned frame as an RGB uint8 display image."""
     raw = load_raw_frame(
@@ -248,19 +254,23 @@ def decode_raw_frame(
         columns=frame.raw_columns,
     )
     height = frame_rows // BAYER_BIN
-    width = frame.raw_columns // BAYER_BIN
+    if stop is None:
+        stop = frame.display_columns
+    width = len(range(first, stop, stride))
+    even = slice(2 * first, 2 * stop, 2 * stride)
+    odd = slice(2 * first + 1, 2 * stop, 2 * stride)
     rgb = np.empty((height, width, 3), dtype=np.uint8)
 
     # This is the same Bayer layout used by preview.raw_channels().  Taking the
     # high byte matches the live camera preview and leaves the values entirely
     # un-white-balanced and un-tone-mapped.
-    np.right_shift(raw[0::2, 1::2], 8, out=rgb[:, :, 0], casting="unsafe")
-    green_1 = np.right_shift(raw[1::2, 1::2], 8).astype(np.uint16)
-    green_2 = np.right_shift(raw[0::2, 0::2], 8).astype(np.uint16)
+    np.right_shift(raw[0::2, odd], 8, out=rgb[:, :, 0], casting="unsafe")
+    green_1 = np.right_shift(raw[1::2, odd], 8).astype(np.uint16)
+    green_2 = np.right_shift(raw[0::2, even], 8).astype(np.uint16)
     green_1 += green_2
     np.right_shift(green_1, 1, out=green_1)
     rgb[:, :, 1] = green_1
-    np.right_shift(raw[1::2, 0::2], 8, out=rgb[:, :, 2], casting="unsafe")
+    np.right_shift(raw[1::2, even], 8, out=rgb[:, :, 2], casting="unsafe")
     del raw
     return rgb
 
@@ -284,14 +294,73 @@ class NavigatorData:
 
 @dataclass
 class LoadedCapture:
-    """The complete Bayer-binned display image and its small navigator."""
+    """A memory-bounded display cache and its capture-wide navigator."""
 
     rgb: np.ndarray
     navigator: NavigatorData
+    stride: int
+    tone_lut: np.ndarray
+    _detail: tuple[int, int, np.ndarray] | None = field(
+        default=None, init=False, repr=False
+    )
+
+    def window(self, capture: CaptureSequence, first: int, stop: int, stride: int):
+        """Read globally aligned Bayer columns, decoding finer detail on demand."""
+        if stride >= self.stride and first % self.stride == 0:
+            columns = slice(
+                first // self.stride,
+                math.ceil(stop / self.stride),
+                stride // self.stride,
+            )
+            return np.ascontiguousarray(self.rgb[:, columns])
+        width = len(range(first, stop, stride))
+        rgb = np.empty((capture.image_height, width, 3), np.uint8)
+        # Panning typically exposes only 256 new display columns. Reuse the
+        # overlap so a single keypress does not reread the entire raw window.
+        missing = [(first, stop)]
+        if self._detail is not None:
+            old_first, old_stride, old_rgb = self._detail
+            left = max(first, old_first)
+            right = min(stop, old_first + old_rgb.shape[1] * old_stride)
+            if (
+                old_stride == stride
+                and (first - old_first) % stride == 0
+                and left < right
+            ):
+                offset = (left - first) // stride
+                old_offset = (left - old_first) // stride
+                count = len(range(left, right, stride))
+                rgb[:, offset : offset + count] = old_rgb[
+                    :, old_offset : old_offset + count
+                ]
+                missing = [(first, left), (right, stop)]
+        for left, right in missing:
+            if left >= right:
+                continue
+            index = capture.frame_index_at_x(left)
+            for frame in capture.frames[index:]:
+                if frame.x_start >= right:
+                    break
+                start = max(left, frame.x_start)
+                start += (first - start) % stride
+                end = min(right, frame.x_end)
+                if start < end:
+                    block = decode_raw_frame(
+                        frame,
+                        capture.frame_rows,
+                        first=start - frame.x_start,
+                        stop=end - frame.x_start,
+                        stride=stride,
+                    )
+                    offset = (start - first) // stride
+                    rgb[:, offset : offset + block.shape[1]] = self.tone_lut[block]
+        self._detail = first, stride, rgb
+        return rgb
 
     @property
     def memory_bytes(self) -> int:
-        return self.rgb.nbytes + self.navigator.memory_bytes
+        detail_bytes = 0 if self._detail is None else self._detail[2].nbytes
+        return self.rgb.nbytes + self.navigator.memory_bytes + detail_bytes
 
 
 def navigator_thumbnail_geometry(
@@ -324,9 +393,10 @@ def build_navigator_data(
     *,
     preferred_height: int = NAVIGATOR_PREFERRED_HEIGHT,
     max_bytes: int = NAVIGATOR_MAX_BYTES,
+    stride: int = 1,
 ) -> NavigatorData:
     """Downsample the already-loaded capture without regard to file boundaries."""
-    if rgb.shape != (capture.image_height, capture.total_width, 3):
+    if rgb.shape != (capture.image_height, math.ceil(capture.total_width / stride), 3):
         raise ValueError("loaded RGB image does not match the capture geometry")
     thumbnail_height, thumbnail_width = navigator_thumbnail_geometry(
         capture,
@@ -352,9 +422,16 @@ def load_capture_data(
     status: Callable[[str], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
 ) -> LoadedCapture | None:
-    """Read every raw file once and retain the complete binned display image."""
+    """Build the overview once, bounding the resident full-height RGB cache."""
+    stride = 1
+    while (
+        stride < capture.total_width
+        and math.ceil(capture.total_width / stride) * capture.image_height * 3
+        > DISPLAY_CACHE_MAX_BYTES
+    ):
+        stride *= 2
     rgb = np.empty(
-        (capture.image_height, capture.total_width, 3),
+        (capture.image_height, math.ceil(capture.total_width / stride), 3),
         dtype=np.uint8,
     )
     total_frames = len(capture.frames)
@@ -362,9 +439,15 @@ def load_capture_data(
     for index, frame in enumerate(capture.frames):
         if cancelled is not None and cancelled():
             return None
-        frame_rgb = decode_raw_frame(frame, capture.frame_rows)
-        rgb[:, frame.x_start : frame.x_end] = frame_rgb
-        del frame_rgb
+        start = math.ceil(frame.x_start / stride)
+        stop = math.ceil(frame.x_end / stride)
+        if start < stop:
+            rgb[:, start:stop] = decode_raw_frame(
+                frame,
+                capture.frame_rows,
+                first=start * stride - frame.x_start,
+                stride=stride,
+            )
         completed = index + 1
         if progress is not None and (
             completed == total_frames or completed % progress_stride == 0
@@ -375,21 +458,24 @@ def load_capture_data(
         return None
     if status is not None:
         status("Applying display tone map…")
-    pixel_count = capture.image_height * capture.total_width
+    pixel_count = rgb.shape[0] * rgb.shape[1]
     statistics_stride = max(
         1,
         math.ceil(math.sqrt(pixel_count / DISPLAY_STATISTICS_MAX_PIXELS)),
     )
     statistics = rgb[::statistics_stride, ::statistics_stride]
-    toned_rgb = auto_tone_map_to_uint8(rgb, statistics=statistics)
-    del statistics, rgb
+    lut = display_tone_lut(statistics)
+    del statistics
+    for start in range(0, rgb.shape[1], 1024):
+        block = rgb[:, start : start + 1024]
+        block[:] = lut[block]
 
     if cancelled is not None and cancelled():
         return None
     if status is not None:
         status("Building low-resolution navigator…")
-    navigator = build_navigator_data(capture, toned_rgb)
-    return LoadedCapture(toned_rgb, navigator)
+    navigator = build_navigator_data(capture, rgb, stride=stride)
+    return LoadedCapture(rgb, navigator, stride, lut)
 
 
 class CaptureLoader(QThread):
@@ -428,6 +514,7 @@ class CircleConstraint:
     y: float
     width: float
     height: float
+    column_stride: int = 1
 
     @property
     def center(self) -> QPointF:
@@ -439,6 +526,7 @@ class WidthSegment:
     id: str
     x1: float
     x2: float
+    column_stride: int = 1
 
     @property
     def center_x(self) -> float:
@@ -456,6 +544,7 @@ class WidthGroup:
 class CutPosition:
     id: str
     x: float
+    column_stride: int = 1
 
 
 @dataclass
@@ -502,6 +591,7 @@ class AnnotationDocument:
                     y=_finite_number(bounds.get("y"), f"circles[{index}].y"),
                     width=width,
                     height=height,
+                    column_stride=annotation_column_stride(entry),
                 )
             )
             circle_ids.add(identifier)
@@ -546,7 +636,14 @@ class AnnotationDocument:
                         f"equal_width_groups[{group_index}].segments[{segment_index}] "
                         "must have non-zero width"
                     )
-                segments.append(WidthSegment(segment_id, min(x1, x2), max(x1, x2)))
+                segments.append(
+                    WidthSegment(
+                        segment_id,
+                        min(x1, x2),
+                        max(x1, x2),
+                        annotation_column_stride(segment_entry),
+                    )
+                )
                 segment_ids.add(segment_id)
             width_groups.append(WidthGroup(identifier, name, segments))
             group_ids.add(identifier)
@@ -565,6 +662,7 @@ class AnnotationDocument:
                 CutPosition(
                     identifier,
                     _finite_number(entry.get("x"), f"cut_positions[{index}].x"),
+                    annotation_column_stride(entry),
                 )
             )
             cut_ids.add(identifier)
@@ -590,7 +688,14 @@ class AnnotationDocument:
                 role = "end"
             else:
                 role = "cut"
-            cut_entries.append({"id": cut.id, "x": _rounded(cut.x), "role": role})
+            cut_entries.append(
+                {
+                    "id": cut.id,
+                    "x": _rounded(cut.x),
+                    "role": role,
+                    "column_stride": cut.column_stride,
+                }
+            )
 
         return {
             "schema_version": SCHEMA_VERSION,
@@ -605,6 +710,7 @@ class AnnotationDocument:
             "circles": [
                 {
                     "id": circle.id,
+                    "column_stride": circle.column_stride,
                     "bounds": {
                         "x": _rounded(circle.x),
                         "y": _rounded(circle.y),
@@ -621,6 +727,7 @@ class AnnotationDocument:
                     "segments": [
                         {
                             "id": segment.id,
+                            "column_stride": segment.column_stride,
                             "x1": _rounded(segment.x1),
                             "x2": _rounded(segment.x2),
                         }
@@ -866,7 +973,8 @@ class WidthEdgeHandle(QGraphicsRectItem):
 
     def update_geometry(self) -> None:
         x = 0.0 if self.edge == "left" else self.segment.width
-        self.setRect(x - 4.0, 0.0, 8.0, self.segment.image_height)
+        radius = 4.0 * self.segment.display_stride
+        self.setRect(x - radius, 0.0, 2 * radius, self.segment.image_height)
 
     def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         self.segment.begin_resize(self.edge)
@@ -891,6 +999,7 @@ class WidthGraphicsItem(QGraphicsItem):
         changed: Callable[[str, float, float], None],
     ):
         super().__init__()
+        self.display_stride = 1
         self.segment_id = segment.id
         self.annotation_key = ("segment", segment.id)
         self.image_height = image_height
@@ -982,6 +1091,7 @@ class CutGraphicsItem(QGraphicsLineItem):
         changed: Callable[[str, float], None],
     ):
         super().__init__(0.0, 0.0, 0.0, image_height)
+        self.display_stride = 1
         self.cut_id = cut.id
         self.annotation_key = ("cut", cut.id)
         self.image_height = image_height
@@ -997,9 +1107,17 @@ class CutGraphicsItem(QGraphicsLineItem):
         self.setCursor(QCursor(Qt.CursorShape.SizeHorCursor))
         self.setZValue(30)
 
+    def boundingRect(self) -> QRectF:
+        radius = 5.0 * self.display_stride
+        return QRectF(-radius, -0.5, 2 * radius, self.image_height + 1)
+
+    def set_display_stride(self, stride: int) -> None:
+        self.prepareGeometryChange()
+        self.display_stride = stride
+
     def shape(self) -> QPainterPath:
         stroker = QPainterPathStroker()
-        stroker.setWidth(10.0)
+        stroker.setWidth(10.0 * self.display_stride)
         path = QPainterPath(QPointF(0.0, 0.0))
         path.lineTo(0.0, self.image_height)
         return stroker.createStroke(path)
@@ -1010,7 +1128,8 @@ class CutGraphicsItem(QGraphicsLineItem):
         if self.isSelected():
             handle = QColor(CUT_COLOR)
             handle.setAlpha(135)
-            painter.fillRect(QRectF(-4.0, 6.0, 8.0, 18.0), handle)
+            radius = 4.0 * self.display_stride
+            painter.fillRect(QRectF(-radius, 6.0, 2 * radius, 18.0), handle)
 
     def itemChange(self, change, value):  # type: ignore[no-untyped-def]
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange:
@@ -1035,6 +1154,7 @@ class AnnotationView(QGraphicsView):
         self.image_height = float(image_height)
         self.mode = "select"
         self._rotated_180 = False
+        self.column_stride = 1
         self._fit_mode = True
         self._draw_start: QPointF | None = None
         self._preview_item: QGraphicsItem | None = None
@@ -1151,7 +1271,7 @@ class AnnotationView(QGraphicsView):
     def zoom(self, factor: float) -> None:
         self.set_fit_mode(False)
         transform = self.transform()
-        current = math.hypot(transform.m11(), transform.m12())
+        current = abs(transform.m22())
         target = min(max(current * factor, 0.05), 16.0)
         self.scale(target / current, target / current)
 
@@ -1173,10 +1293,10 @@ class AnnotationView(QGraphicsView):
             return
         center = self.mapToScene(self.viewport().rect().center())
         transform = self.transform()
-        zoom = math.hypot(transform.m11(), transform.m12())
+        zoom = abs(transform.m22())
         self._rotated_180 = enabled
         self.resetTransform()
-        self.scale(zoom, zoom)
+        self.scale(zoom / self.column_stride, zoom)
         if enabled:
             self.rotate(180.0)
         self.centerOn(center)
@@ -1186,7 +1306,12 @@ class AnnotationView(QGraphicsView):
             self.resetTransform()
             if self._rotated_180:
                 self.rotate(180.0)
-            self.fitInView(self.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+            rect = self.sceneRect()
+            zoom = min(
+                max(1, self.viewport().width() - 4) * self.column_stride / rect.width(),
+                max(1, self.viewport().height() - 4) / rect.height(),
+            )
+            self.scale(zoom / self.column_stride, zoom)
             self.centerOn(self.sceneRect().center())
 
     def set_fit_mode(self, enabled: bool) -> None:
@@ -1210,6 +1335,7 @@ class AnnotationView(QGraphicsView):
     def actual_size(self) -> None:
         self.set_fit_mode(False)
         self.resetTransform()
+        self.scale(1 / self.column_stride, 1)
         if self._rotated_180:
             self.rotate(180.0)
 
@@ -1446,12 +1572,17 @@ class SpeedConstraintWindow(QMainWindow):
         *,
         window_columns: int = DEFAULT_WINDOW_COLUMNS,
         window_step_columns: int = DEFAULT_WINDOW_STEP_COLUMNS,
+        column_stride: int = 1,
     ):
         super().__init__()
         self.capture = capture
         self.document = document
         self.json_path = json_path
-        self.window_columns = min(max(1, window_columns), capture.total_width)
+        self.max_window_columns = min(
+            capture.total_width,
+            max(1, DISPLAY_CACHE_MAX_BYTES // (3 * capture.image_height)),
+        )
+        self.window_columns = min(max(1, window_columns), self.max_window_columns)
         self.window_step_columns = max(1, window_step_columns)
         self.window_start_x = 0
         self._window_x_left = 0.0
@@ -1463,6 +1594,7 @@ class SpeedConstraintWindow(QMainWindow):
         )
         self.scene = QGraphicsScene(self)
         self.view = AnnotationView(self.scene, capture.image_height)
+        self.view.column_stride = column_stride
         self.loaded_capture: LoadedCapture | None = None
         self.image_item: QGraphicsPixmapItem | None = None
         self.circle_items: dict[str, EllipseGraphicsItem] = {}
@@ -1510,7 +1642,7 @@ class SpeedConstraintWindow(QMainWindow):
 
         self.previous_action = QAction("◀ Previous", self)
         self.previous_action.setToolTip(
-            f"Move left {self.window_step_columns} columns (Left arrow)"
+            f"Move left {self.window_step_columns} displayed columns (Left arrow)"
         )
         self.previous_action.triggered.connect(self.previous_window)
         toolbar.addAction(self.previous_action)
@@ -1522,7 +1654,7 @@ class SpeedConstraintWindow(QMainWindow):
 
         self.next_action = QAction("Next ▶", self)
         self.next_action.setToolTip(
-            f"Move right {self.window_step_columns} columns (Right arrow)"
+            f"Move right {self.window_step_columns} displayed columns (Right arrow)"
         )
         self.next_action.triggered.connect(self.next_window)
         toolbar.addAction(self.next_action)
@@ -1530,15 +1662,27 @@ class SpeedConstraintWindow(QMainWindow):
 
         toolbar.addWidget(QLabel(" Columns "))
         self.window_columns_spin = QSpinBox()
-        self.window_columns_spin.setRange(1, self.capture.total_width)
+        self.window_columns_spin.setRange(1, self.max_window_columns)
         self.window_columns_spin.setSingleStep(self.window_step_columns)
         self.window_columns_spin.setValue(self.window_columns)
         self.window_columns_spin.setKeyboardTracking(False)
         self.window_columns_spin.setToolTip(
-            "Width of the detailed view in half-resolution capture columns"
+            f"Width in displayed columns (up to {self.max_window_columns:,} per window)"
         )
         self.window_columns_spin.valueChanged.connect(self._set_window_columns)
         toolbar.addWidget(self.window_columns_spin)
+        self.stride_combo = QComboBox()
+        for exponent in range(max(1, self.capture.total_width.bit_length())):
+            stride = 1 << exponent
+            self.stride_combo.addItem(
+                "All columns" if stride == 1 else f"1/{stride} columns", stride
+            )
+        self.stride_combo.setCurrentIndex(
+            self.stride_combo.findData(self.view.column_stride)
+        )
+        self.stride_combo.setToolTip("Horizontal sampling of the Bayer image")
+        self.stride_combo.currentIndexChanged.connect(self._set_column_stride)
+        toolbar.addWidget(self.stride_combo)
         toolbar.addSeparator()
 
         self.fit_action = QAction("Fit", self)
@@ -1613,7 +1757,7 @@ class SpeedConstraintWindow(QMainWindow):
         navigator_header = QHBoxLayout()
         navigator_header.setContentsMargins(8, 4, 8, 2)
         self.navigator_status = QLabel(
-            f"Loading {len(self.capture.frames)} raw files into memory…"
+            f"Building overview from {len(self.capture.frames)} raw files…"
         )
         self.navigator_status.setObjectName("muted")
         navigator_header.addWidget(self.navigator_status, 1)
@@ -1670,13 +1814,11 @@ class SpeedConstraintWindow(QMainWindow):
     def _capture_loading_progress(self, completed: int, total: int) -> None:
         self.navigator_progress.setRange(0, total)
         self.navigator_progress.setValue(completed)
-        self.navigator_status.setText(
-            f"Loading raw file {completed} / {total} into memory…"
-        )
+        self.navigator_status.setText(f"Reading raw file {completed} / {total}…")
 
     def _capture_loaded(self, data: LoadedCapture) -> None:
         self.loaded_capture = data
-        self.navigator.set_data(data.navigator)
+        self._update_navigator_stride()
         x_left, x_right = self._window_bounds()
         self.navigator.set_window_range(float(x_left), float(x_right))
         self.navigator_progress.hide()
@@ -1696,7 +1838,7 @@ class SpeedConstraintWindow(QMainWindow):
 
     def _navigator_position_selected(self, global_x: float) -> None:
         self.window_start_x = self._aligned_window_start(
-            global_x - self.window_columns / 2
+            global_x - self.window_span / 2
         )
         self._load_window(center_x=global_x)
 
@@ -1869,18 +2011,53 @@ class SpeedConstraintWindow(QMainWindow):
             suffix = ""
         self.statusBar().showMessage(f"Tool: {mode}{suffix}")
 
+    @property
+    def window_span(self) -> int:
+        return self.window_columns * self.view.column_stride
+
+    @property
+    def navigation_step(self) -> int:
+        return self.window_step_columns * self.view.column_stride
+
+    def _update_navigator_stride(self) -> None:
+        if self.loaded_capture is None:
+            return
+        data = self.loaded_capture.navigator
+        stride = self.view.column_stride
+        if stride > 1:
+            rgb = cv2.resize(
+                data.rgb,
+                (math.ceil(data.total_width / stride), data.thumbnail_height),
+                interpolation=cv2.INTER_AREA,
+            )
+            data = NavigatorData(rgb, data.source_width, data.thumbnail_height)
+        self.navigator.set_data(data)
+
+    def _set_column_stride(self, index: int) -> None:
+        stride = self.stride_combo.itemData(index)
+        left, right = self._window_bounds()
+        center = (left + right) / 2
+        if not self.view.fit_mode:
+            center = self.view.mapToScene(self.view.viewport().rect().center()).x()
+        self.view.scale(self.view.column_stride / stride, 1)
+        self.view.column_stride = stride
+        self._update_navigator_stride()
+        self._update_handle_widths()
+        self.window_start_x = self._aligned_window_start(center - self.window_span / 2)
+        self._load_window(center_x=center)
+
     def _window_bounds(self) -> tuple[int, int]:
         return self.capture.column_window_bounds(
             self.window_start_x,
-            self.window_columns,
+            self.window_span,
         )
 
     def _aligned_window_start(self, start: float) -> int:
-        aligned = round(float(start) / self.window_step_columns)
-        aligned *= self.window_step_columns
+        aligned = round(float(start) / self.navigation_step)
+        aligned *= self.navigation_step
         return self.capture.column_window_bounds(
             aligned,
-            self.window_columns,
+            self.window_span,
         )[0]
 
     def _load_window(
@@ -1896,9 +2073,9 @@ class SpeedConstraintWindow(QMainWindow):
             self.scene.removeItem(self.image_item)
             self.image_item = None
         if self.loaded_capture is not None:
-            rgb = np.ascontiguousarray(
-                self.loaded_capture.rgb[:, x_left:x_right]
-            )
+            stride = self.view.column_stride
+            first = x_left - x_left % stride
+            rgb = self.loaded_capture.window(self.capture, first, x_right, stride)
             image = QImage(
                 rgb.data,
                 rgb.shape[1],
@@ -1907,7 +2084,8 @@ class SpeedConstraintWindow(QMainWindow):
                 QImage.Format.Format_RGB888,
             ).copy()
             self.image_item = QGraphicsPixmapItem(QPixmap.fromImage(image))
-            self.image_item.setPos(float(x_left), 0.0)
+            self.image_item.setTransform(QTransform.fromScale(stride, 1))
+            self.image_item.setPos(float(first), 0.0)
             self.image_item.setZValue(-100)
             self.scene.addItem(self.image_item)
 
@@ -1959,7 +2137,7 @@ class SpeedConstraintWindow(QMainWindow):
         if self.window_start_x > 0:
             self.window_start_x = max(
                 0,
-                self.window_start_x - self.window_step_columns,
+                self.window_start_x - self.navigation_step,
             )
             self._load_window()
 
@@ -1967,25 +2145,23 @@ class SpeedConstraintWindow(QMainWindow):
         _x_left, x_right = self._window_bounds()
         if x_right < self.capture.total_width:
             self.window_start_x = min(
-                self.capture.total_width - self.window_columns,
-                self.window_start_x + self.window_step_columns,
+                self.capture.total_width - self.window_span,
+                self.window_start_x + self.navigation_step,
             )
             self._load_window()
 
     def _set_window_columns(self, value: int) -> None:
         old_left, old_right = self._window_bounds()
-        self.window_columns = min(max(1, value), self.capture.total_width)
+        self.window_columns = min(max(1, value), self.max_window_columns)
         self.window_start_x = self._aligned_window_start(
-            (old_left + old_right - self.window_columns) / 2
+            (old_left + old_right - self.window_span) / 2
         )
         self._load_window(center_x=(old_left + old_right) / 2)
 
     def _ensure_x_visible(self, x: float, y: float | None = None) -> None:
         x_left, x_right = self._window_bounds()
         if not x_left <= x <= x_right:
-            self.window_start_x = self._aligned_window_start(
-                x - self.window_columns / 2
-            )
+            self.window_start_x = self._aligned_window_start(x - self.window_span / 2)
             self._load_window(center_x=x)
         if not self.view.fit_mode:
             self.view.centerOn(x, self.capture.image_height / 2 if y is None else y)
@@ -2034,8 +2210,17 @@ class SpeedConstraintWindow(QMainWindow):
             )
             self.scene.addItem(item)
             self.cut_items[cut.id] = item
+        self._update_handle_widths()
         x_left, x_right = self._window_bounds()
         self._update_annotation_visibility(float(x_left), float(x_right))
+
+    def _update_handle_widths(self) -> None:
+        for item in self.segment_items.values():
+            item.display_stride = self.view.column_stride
+            for handle in item.handles.values():
+                handle.update_geometry()
+        for item in self.cut_items.values():
+            item.set_display_stride(self.view.column_stride)
 
     def _populate_lists(self, selected_key: tuple[str, str] | None = None) -> None:
         self._syncing_selection = True
@@ -2111,7 +2296,12 @@ class SpeedConstraintWindow(QMainWindow):
             )
             self.document.circles.append(
                 CircleConstraint(
-                    identifier, rect.x(), rect.y(), rect.width(), rect.height()
+                    identifier,
+                    rect.x(),
+                    rect.y(),
+                    rect.width(),
+                    rect.height(),
+                    self.view.column_stride,
                 )
             )
             selected = ("circle", identifier)
@@ -2132,13 +2322,17 @@ class SpeedConstraintWindow(QMainWindow):
                 for segment in existing_group.segments
             }
             identifier = _unique_id("segment", existing)
-            group.segments.append(WidthSegment(identifier, x1, x2))
+            group.segments.append(
+                WidthSegment(identifier, x1, x2, self.view.column_stride)
+            )
             selected = ("segment", identifier)
         else:
             identifier = _unique_id(
                 "position", {cut.id for cut in self.document.cut_positions}
             )
-            self.document.cut_positions.append(CutPosition(identifier, start.x()))
+            self.document.cut_positions.append(
+                CutPosition(identifier, start.x(), self.view.column_stride)
+            )
             self.document.cut_positions.sort(key=lambda cut: (cut.x, cut.id))
             selected = ("cut", identifier)
 
@@ -2154,6 +2348,8 @@ class SpeedConstraintWindow(QMainWindow):
         )
         if circle is None:
             return
+        if not math.isclose(circle.width, rect.width()):
+            circle.column_stride = self.view.column_stride
         circle.x, circle.y = rect.x(), rect.y()
         circle.width, circle.height = rect.width(), rect.height()
         self._populate_lists(("circle", identifier))
@@ -2166,6 +2362,8 @@ class SpeedConstraintWindow(QMainWindow):
                 None,
             )
             if segment is not None:
+                if not math.isclose(segment.x2 - segment.x1, abs(x2 - x1)):
+                    segment.column_stride = self.view.column_stride
                 segment.x1, segment.x2 = min(x1, x2), max(x1, x2)
                 self._populate_lists(("segment", identifier))
                 self._mark_changed()
@@ -2177,6 +2375,8 @@ class SpeedConstraintWindow(QMainWindow):
         )
         if cut is None:
             return
+        if cut.x != x:
+            cut.column_stride = self.view.column_stride
         cut.x = x
         self.document.cut_positions.sort(key=lambda position: (position.x, position.id))
         self._populate_lists(("cut", identifier))
@@ -2535,16 +2735,22 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=DEFAULT_WINDOW_COLUMNS,
         help=(
-            "width of the detailed half-resolution view in columns "
+            "number of displayed columns across the detail window "
             f"(default: {DEFAULT_WINDOW_COLUMNS})"
         ),
+    )
+    parser.add_argument(
+        "--column-stride",
+        type=int,
+        default=1,
+        help="show one of every N Bayer columns (a power of two, default 1)",
     )
     parser.add_argument(
         "--window-step-columns",
         type=int,
         default=DEFAULT_WINDOW_STEP_COLUMNS,
         help=(
-            "columns moved by the left/right keys "
+            "displayed columns moved by the left/right keys "
             f"(default: {DEFAULT_WINDOW_STEP_COLUMNS})"
         ),
     )
@@ -2558,6 +2764,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     json_name = Path(args.json_name)
     if json_name.name != args.json_name or json_name.suffix.lower() != ".json":
         parser.error("--json-name must be a .json filename without a directory")
+    if args.column_stride < 1 or args.column_stride & (args.column_stride - 1):
+        parser.error("--column-stride must be a positive power of two")
     if args.window_columns < 1:
         parser.error("--window-columns must be positive")
     if args.window_step_columns < 1:
@@ -2585,6 +2793,9 @@ def main(argv: list[str] | None = None) -> int:
         json_path,
         window_columns=args.window_columns,
         window_step_columns=args.window_step_columns,
+        column_stride=min(
+            args.column_stride, 1 << (capture.total_width.bit_length() - 1)
+        ),
     )
     window.show()
     return app.exec()

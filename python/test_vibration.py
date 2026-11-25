@@ -91,6 +91,23 @@ class CameraVibrationTest(unittest.TestCase):
         actual = reconstruct_pitch_rows(plane, np.array([-0.5, 1.5]), row_phase=1)
         np.testing.assert_array_equal(actual, [[10, 25], [10, 15], [12.5, 10], [17.5, 10]])
 
+    def test_smooth_pitch_runs_match_independent_columns_bit_for_bit(self):
+        rng = np.random.default_rng(31)
+        plane = rng.uniform(0, 65535, (32, 128)).astype(np.float32)
+        offsets = np.linspace(-2.4, 2.4, plane.shape[1], dtype=np.float32)
+        rows = np.arange(plane.shape[0])[:, None]
+        cols = np.arange(plane.shape[1])
+        for phase in (0, 1):
+            result = reconstruct_pitch_rows(plane, offsets, phase)
+            for parity in (0, 1):
+                shift = (offsets + (parity - phase)) * 0.5
+                lower = np.floor(shift)
+                frac = shift - lower
+                y = rows + lower.astype(int)
+                a = plane[np.clip(y, 0, len(rows) - 1), cols]
+                b = plane[np.clip(y + 1, 0, len(rows) - 1), cols]
+                np.testing.assert_array_equal(result[parity::2], a + frac * (b - a))
+
 
 if __name__ == "__main__":
     unittest.main()

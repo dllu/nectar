@@ -15,6 +15,24 @@ Some simple programs for capturing images from Alkeria Necta line scan camera.
 2. [imgui](https://github.com/ocornut/imgui) 1.91.9 and above
 3. SDL2
 
+## Previewing slow subjects
+
+Run `python/preview.py` as usual. The preview probes the displacement between
+the two green planes at powers-of-two column strides and uses the selected
+scale for motion detection, speed correlation, and skew estimation. If there
+are too few supported measurements, it doubles the stride and tries again.
+The fitted step and reconstruction aperture are expressed in original Bayer
+columns. A slow subject therefore contributes multiple original exposures to
+each full-resolution output pixel.
+
+The first pass reads the raw files sequentially and keeps them in RAM for the
+later passes. The default cache budget is half the available RAM on Linux,
+shared across simultaneous captures. If the raw files exceed the budget, the
+preview uses lossless LZ4 compression and reads any frames that still do not
+fit from disk. Use `--raw-cache-gib 12` to set a 12 GiB budget or
+`--raw-cache-gib 0` to disable the capture-wide cache. Jitter correction and
+rendering use additional working memory.
+
 ## Speed-constraint annotations
 
 The raw speed-constraint editor displays the Bayer-binned capture and autosaves
@@ -24,13 +42,15 @@ circle, equal-width, and sequence-cut annotations beside the raw data:
 uv run python python/speed_constraints.py /path/to/capture
 ```
 
-At startup it reads every raw file once and retains the complete uint8 display
-image in memory. The detailed window is 4096 half-resolution columns wide by
-default, independent of the raw file sizes. A uniformly scaled navigator is
-built from that image at the bottom; click it to center the detailed window.
+Use the column selector in the toolbar to show all columns or one in every
+2, 4, 8, and so on. You can also start with `--column-stride 8`. The default
+detail window spans 4096 displayed columns, so at 1/8 it covers 32,768
+original Bayer columns. Click the navigator to center the window. The editor
+keeps a bounded RGB overview in memory and reads finer detail on demand.
 The navigator wraps into multiple rows as needed, and its divider can be
-dragged vertically. Use Left/Right to slide by 256 columns, Ctrl+mouse-wheel to
-zoom, F to enable persistent fitting, F8 to hide the navigator, and F9 to hide
+dragged vertically. Use Left/Right to slide by 256 displayed columns,
+Ctrl+mouse-wheel to zoom, F to enable persistent fitting, F8 to hide the
+navigator, and F9 to hide
 the annotation panel. Fit mode is enabled initially and refits whenever the
 window is resized; manual zoom or 100% mode disables it. The **Rotate 180°**
 checkbox rotates both detailed and
@@ -42,8 +62,10 @@ in the capture directory; an existing file is loaded when the tool starts.
 `preview.py` loads that file automatically. Circle and equal-width annotations
 refine the correlation-derived speed spline without changing its direction,
 using a fixed, uniformly spaced spline basis. Each equal-width group has a
-jointly fitted common output width; all manual dimensions use a fixed 2.5-pixel
-annotation uncertainty, so longer annotations carry tighter relative weight.
+jointly fitted common output width. The dimension uncertainty is 2.5 displayed
+pixels. For example, at 1/8 it is 20 Bayer columns horizontally and 2.5 Bayer
+rows vertically. The editor records the stride for each annotation and saves
+its coordinates at the original Bayer scale. Older annotations use stride 1.
 Sequence positions replace motion-region detection and define one output
 DNG/JPEG per adjacent pair. The first and last positions also bound speed
 fitting: only complete correlation windows inside those bounds are eligible.
@@ -59,8 +81,8 @@ cut and pad the resulting slices to the width of the widest one.
 
 Pass `--justify` to give the stacked JPEG a common row width. The fit keeps
 the annotated start and end fixed and balances interior cut movement against
-horizontal scaling, using a 20-pixel prior in the Bayer-binned annotation
-image and a 4% scale prior. The stack horizontally resizes its middle rows
+horizontal scaling. Each cut has a prior of 20 displayed columns at its own
+annotation stride, and the scale prior is 4%. The stack resizes its middle rows
 and pads its first and last rows with randomly sampled columns from their
 outside edges. Individual DNG and JPEG slices use the adjusted cuts at their
 native dewarped scale.

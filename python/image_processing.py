@@ -67,28 +67,40 @@ def auto_tone_map_to_uint8(
     rgb = np.asarray(rgb)
     if rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2] != 3:
         raise ValueError("automatic tone mapping expects an HxWx3 uint8 image")
-    if statistics is None:
-        statistics = rgb
-    else:
-        statistics = np.asarray(statistics)
-        if (
-            statistics.dtype != np.uint8
-            or statistics.ndim != 3
-            or statistics.shape[2] != 3
-            or statistics.size == 0
-        ):
-            raise ValueError(
-                "tone-map statistics must be a non-empty HxWx3 uint8 image"
-            )
+    lut = display_tone_lut(
+        rgb if statistics is None else statistics,
+        low_percentile=low_percentile,
+        high_percentile=high_percentile,
+        gamma=gamma,
+    )
+    return lut[rgb]
+
+
+def display_tone_lut(
+    statistics: np.ndarray,
+    *,
+    low_percentile=0.5,
+    high_percentile=99.5,
+    gamma=2.2,
+) -> np.ndarray:
+    """Choose one display curve for all windows of a capture."""
+    statistics = np.asarray(statistics)
+    if (
+        statistics.dtype != np.uint8
+        or statistics.ndim != 3
+        or statistics.shape[2] != 3
+        or statistics.size == 0
+    ):
+        raise ValueError("tone-map statistics must be a non-empty HxWx3 uint8 image")
     black_point, white_point = np.percentile(
         statistics,
         (low_percentile, high_percentile),
     )
     if white_point <= black_point:
-        return rgb.copy()
+        return np.arange(256, dtype=np.uint8)
     lut = np.arange(256, dtype=np.float32)
     lut -= black_point
     lut /= white_point - black_point
     np.clip(lut, 0.0, 1.0, out=lut)
     np.power(lut, 1.0 / gamma, out=lut)
-    return np.rint(lut * 255.0).astype(np.uint8)[rgb]
+    return np.rint(lut * 255.0).astype(np.uint8)

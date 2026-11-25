@@ -106,14 +106,27 @@ def reconstruct_pitch_rows(plane, offsets, row_phase):
     # Split even/odd output rows. Within either parity the fractional weight
     # is constant down a column. Clamp at the nearest measured color sample.
     result = np.empty((2 * height, width), dtype=np.float32)
-    rows = np.arange(height, dtype=np.int32)[:, None]
-    cols = np.arange(width)
+    rows = np.arange(height, dtype=np.int32)
     for parity in (0, 1):
         shift = (offsets + (parity - row_phase)) * 0.5
         lower = np.floor(shift).astype(np.int32)
         fraction = (shift - lower).astype(np.float32)
-        source = rows + lower
-        a = plane[source.clip(0, height - 1), cols]
-        b = plane[(source + 1).clip(0, height - 1), cols]
-        result[parity::2] = a + fraction * (b - a)
+        changes = np.flatnonzero(np.diff(lower)) + 1
+        if changes.size > 8:
+            source = rows[:, None] + lower
+            cols = np.arange(width)
+            a = plane[source.clip(0, height - 1), cols]
+            b = plane[(source + 1).clip(0, height - 1), cols]
+            result[parity::2] = a + fraction * (b - a)
+            continue
+        # Pitch varies smoothly. Adjacent columns usually need the same pair
+        # of source rows, so gather each row span with a single index.
+        start = 0
+        for stop in (*changes, width):
+            if start < stop:
+                source = rows + lower[start]
+                a = plane[source.clip(0, height - 1), start:stop]
+                b = plane[(source + 1).clip(0, height - 1), start:stop]
+                result[parity::2, start:stop] = a + fraction[start:stop] * (b - a)
+            start = stop
     return result

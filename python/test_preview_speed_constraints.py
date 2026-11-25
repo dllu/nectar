@@ -42,6 +42,67 @@ class PreviewSpeedConstraintsTest(unittest.TestCase):
         self.assertAlmostEqual(long_segment.log_width_sigma, sigma / 1000.0)
         self.assertLess(long_segment.log_width_sigma, short_segment.log_width_sigma)
 
+    def test_slow_motion_stride_and_signed_raw_coordinate_recovery(self):
+        class Plane:
+            def __init__(self, pixels):
+                self.pixels = pixels
+                self.shape = pixels.shape
+                self.height, self.width = self.shape
+
+            def __getitem__(self, key):
+                return self.pixels[key]
+
+        rng = np.random.default_rng(2)
+        texture = rng.normal(size=(8, 8192)).astype(np.float32)
+        texture = preview.gaussian_filter1d(texture, 3, axis=1)
+        scene = (12000 + 8000 * texture).repeat(4, axis=0)
+        first = Plane(scene)
+        self.assertEqual(
+            preview.estimate_analysis_stride(first, Plane(np.roll(scene, 2, axis=1))), 1
+        )
+        for lag, initial_stride in ((16, 1), (-16, 8)):
+            with self.subTest(lag=lag):
+                second = Plane(np.roll(scene, lag, axis=1))
+                self.assertEqual(preview.estimate_analysis_stride(first, second), 8)
+                _, _, _, stride, xs, lags, weights = (
+                    preview.measure_speed_at_adaptive_stride(
+                        first,
+                        second,
+                        initial_stride,
+                        np.ones((16, 4096), bool),
+                        None,
+                        downsample_steps=1,
+                        max_green_down=12000,
+                        show_progress=False,
+                        valid_x_range=(512, 7680),
+                    )
+                )
+                self.assertGreater(stride, 1)
+                self.assertGreaterEqual(len(xs), 4)
+                self.assertTrue(np.all((xs >= 512) & (xs <= 7680)))
+                self.assertTrue(np.all(weights > 0))
+                np.testing.assert_allclose(lags, lag, atol=0.2)
+
+    def test_compressed_annotations_only_enlarge_horizontal_uncertainty(self):
+        circle = preview.CircleSpeedConstraint("wheel", 160, 0, 80, 20, 8)
+        segment = preview.EqualWidthSegment("window", 180, 260, 4)
+        constraints = preview.ManualSpeedConstraints(
+            Path("."),
+            (circle,),
+            (preview.EqualWidthGroup("windows", "", (segment,)),),
+            (160, 300),
+            (2, 8),
+        ).translated(160, 256)
+        sigma = preview.SPEED_ANNOTATION_DIMENSION_SIGMA_PIXELS
+        self.assertEqual(constraints.circles[0].speed_magnitude, 2)
+        self.assertAlmostEqual(
+            constraints.circles[0].log_speed_sigma, np.hypot(8 * sigma / 80, sigma / 20)
+        )
+        self.assertAlmostEqual(
+            constraints.width_groups[0].segments[0].log_width_sigma, 4 * sigma / 80
+        )
+        self.assertEqual(constraints.cut_strides, (2, 8))
+
     def test_refinement_preserves_direction_and_reduces_manual_residuals(self):
         def correlation_spline(values):
             values = np.asarray(values, dtype=np.float64)
@@ -405,6 +466,17 @@ class PreviewSpeedConstraintsTest(unittest.TestCase):
         self.assertLess(adjusted[1][0], ranges[1][0])
         self.assertGreater(adjusted[1][1], ranges[1][1])
         self.assertEqual(stack_width, 49)
+
+    def test_cut_uncertainty_follows_the_annotation_in_reverse_sampling_order(self):
+        ranges = [(8, 33), (33, 113), (113, 223), (223, 323), (323, 341)]
+        positions = np.arange(350.0)
+        strides = (1, 1, 8, 1, 4, 1)
+        adjusted = preview.justify_cut_output_ranges(positions, ranges, strides)
+        self.assertNotEqual(adjusted, preview.justify_cut_output_ranges(positions, ranges))
+        self.assertEqual(
+            adjusted,
+            preview.justify_cut_output_ranges(positions[::-1], ranges, strides[::-1]),
+        )
 
     def test_justification_preserves_renderable_slices_and_fits_wide_edges(self):
         ranges = [(0, 4000), (4000, 4002), (4002, 4004), (4004, 8004)]

@@ -71,6 +71,8 @@ class ProgressTest(unittest.TestCase):
                         [
                             "--output-dir",
                             str(output_dir),
+                            "--raw-cache-gib",
+                            "2",
                             *(str(capture) for capture in captures),
                         ]
                     )
@@ -81,11 +83,13 @@ class ProgressTest(unittest.TestCase):
                             captures[0],
                             show_progress=False,
                             output_dir=output_dir,
+                            raw_cache_bytes=2**30,
                         ),
                         call(
                             captures[1],
                             show_progress=False,
                             output_dir=output_dir,
+                            raw_cache_bytes=2**30,
                         ),
                     ],
                     any_order=True,
