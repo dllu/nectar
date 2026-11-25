@@ -57,6 +57,21 @@ equal chunks smaller than `OUTPUT_CHUNK_TARGET`, ignoring intermediate cut
 positions. Pass `--pad-output-to-equal-widths` instead to retain every annotated
 cut and pad the resulting slices to the width of the widest one.
 
+Pass `--justify` to give the stacked JPEG a common row width. The fit keeps
+the annotated start and end fixed and balances interior cut movement against
+horizontal scaling, using a 20-pixel prior in the Bayer-binned annotation
+image and a 4% scale prior. The stack horizontally resizes its middle rows
+and pads its first and last rows with randomly sampled columns from their
+outside edges. Individual DNG and JPEG slices use the adjusted cuts at their
+native dewarped scale.
+
+With `--justify --justify-padding original`, the end rows use contiguous
+background from outside the annotated cuts. The renderer extends the speed
+spline at a constant speed from each end cut and repeats the farthest usable
+column if the capture ends before the row is filled. Use the default
+`--justify-padding random` when the captured margins contain other moving
+objects you want to omit.
+
 Output orientation follows the camera mounting date: captures before 2026 are
 not rotated, while captures from 2026 onward are rotated 180 degrees. Override
 the automatic choice with `--flip-output-180` or `--no-flip-output-180`.
@@ -68,3 +83,18 @@ Darktable `.dng.xmp` sidecars are carried forward by `NECTA` chunk number and
 renamed for the new DNG hash; if several sidecars exist for one chunk, the most
 recently modified one is used. Choose a separate `--output-dir` when an older
 render needs to be preserved.
+
+## Camera vibration compensation
+
+`preview.py` corrects pitch vibration by default. It tracks stationary ground
+in the bottom 128 sensor rows of the upright image using normalized vertical
+cross-correlation on one raw green plane. The fit removes a slow baseline
+(Gaussian sigma of 256 capture-time columns) and tapers the correction to zero
+where the ground lacks a distinct match. Each Bayer plane is sampled at its
+fractional source height before the horizontal dewarp combines scan columns.
+
+Use `--vibration-rows N` to adjust the ground strip height in full-resolution
+pixels (minimum 32). Choose a strip containing stationary detail. For a capture
+where the subject fills the bottom edge, or for a comparison render, pass
+`--no-vibration-compensation`. The separate `--jitter` option controls
+exposure stripes.

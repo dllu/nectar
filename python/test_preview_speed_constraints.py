@@ -392,6 +392,82 @@ class PreviewSpeedConstraintsTest(unittest.TestCase):
             ).pad_output_to_equal_widths
         )
 
+    def test_justification_adjusts_interior_cuts_in_either_sampling_direction(self):
+        ranges = [(8, 33), (33, 113), (113, 223), (223, 323), (323, 341)]
+        positions = np.arange(350.0)
+
+        adjusted, stack_width = preview.justify_cut_output_ranges(positions, ranges)
+        reversed_sampling = preview.justify_cut_output_ranges(positions[::-1], ranges)
+
+        self.assertEqual((adjusted, stack_width), reversed_sampling)
+        self.assertEqual(adjusted[0][0], ranges[0][0])
+        self.assertEqual(adjusted[-1][1], ranges[-1][1])
+        self.assertLess(adjusted[1][0], ranges[1][0])
+        self.assertGreater(adjusted[1][1], ranges[1][1])
+        self.assertEqual(stack_width, 49)
+
+    def test_justification_preserves_renderable_slices_and_fits_wide_edges(self):
+        ranges = [(0, 4000), (4000, 4002), (4002, 4004), (4004, 8004)]
+        adjusted, stack_width = preview.justify_cut_output_ranges(
+            np.arange(8004.0), ranges
+        )
+
+        widths = [stop - start for start, stop in adjusted]
+        self.assertGreaterEqual(min(widths), 2)
+        self.assertGreaterEqual(stack_width, max(widths[0], widths[-1]) // 2)
+        self.assertEqual(sum(widths), 8004)
+
+    def test_original_padding_uses_adjacent_samples_in_either_direction(self):
+        class ArrayView:
+            height = 2
+            width = 20
+            data = np.broadcast_to(np.arange(width, dtype=np.float32), (height, width))
+
+            def __getitem__(self, key):
+                return self.data[key]
+
+        channels = (ArrayView(),) * 4
+        for prepend, step, expected in (
+            (True, 2.0, [2, 4, 6, 8]),
+            (False, 2.0, [12, 14, 16]),
+            (True, -2.0, [16, 14, 12]),
+            (False, -2.0, [8, 6, 4, 2]),
+        ):
+            with self.subTest(prepend=prepend, step=step):
+                raw = preview.sample_extrapolated_stack_edge(
+                    channels,
+                    edge_position=10.0,
+                    step=step,
+                    sample_count=8,
+                    prepend=prepend,
+                    skew=0.0,
+                    show_progress=False,
+                )
+                np.testing.assert_allclose(raw[0, :, 2], expected)
+
+    def test_original_padding_preserves_the_join_when_the_capture_runs_out(self):
+        subject = np.full((2, 2, 3), 90, dtype=np.uint8)
+        background = np.broadcast_to(
+            np.array([10, 30, 50], dtype=np.uint8)[None, :, None], (4, 3, 3)
+        )
+        for prepend, expected in (
+            (True, [10, 10, 40, 90, 90]),
+            (False, [90, 90, 20, 50, 50]),
+        ):
+            with self.subTest(prepend=prepend):
+                with patch.object(preview, "render_preview_bgr", return_value=background):
+                    padded = preview.pad_with_capture_background(
+                        subject,
+                        background,
+                        5,
+                        np.ones(3),
+                        0.0,
+                        1.0,
+                        prepend=prepend,
+                        flip_output_180=False,
+                    )
+                np.testing.assert_array_equal(padded[0, :, 0], expected)
+
     def test_padded_cut_ranges_center_neighbor_content(self):
         ranges, width = preview.build_padded_cut_output_ranges(
             [(0, 8), (8, 12), (12, 22), (22, 28)]

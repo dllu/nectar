@@ -28,7 +28,7 @@ import matplotlib.pyplot as plt
 from numpy.lib.stride_tricks import sliding_window_view
 import numpy as np
 from PIL import ExifTags, Image, TiffImagePlugin
-from scipy.optimize import least_squares, minimize_scalar
+from scipy.optimize import LinearConstraint, least_squares, minimize, minimize_scalar
 from scipy.interpolate import CubicSpline
 from scipy.ndimage import gaussian_filter1d
 from tqdm import tqdm
@@ -42,6 +42,12 @@ from image_processing import (
     apply_color_transform,
 )
 from raw_io import load_raw_frame
+from vibration import (
+    DEFAULT_GROUND_ROWS,
+    MIN_GROUND_ROWS,
+    estimate_pitch_offsets,
+    reconstruct_pitch_rows,
+)
 
 CAMERA_MAKE = "Alkeria"
 CAMERA_MODEL_NAME = "Alkeria Necta N4K2-7C"
@@ -117,6 +123,8 @@ SPEED_CONSTRAINT_CURVATURE_LOG_SIGMA = 0.05
 SPEED_ANNOTATION_DIMENSION_SIGMA_PIXELS = 2.5
 OUTPUT_CHUNK_TARGET = 32768
 EDGE_PADDING_SAMPLE_COLUMNS = 128
+JUSTIFY_SCALE_SIGMA = 0.04
+JUSTIFY_CUT_SIGMA = 20.0  # Pixels in the Bayer-binned annotation image.
 MAX_CONCURRENT_RENDERS = 2
 JITTER_RED = 0
 JITTER_GREEN1 = 1
@@ -4516,6 +4524,87 @@ def build_padded_cut_output_ranges(
     return padded, widest
 
 
+def justify_cut_output_ranges(
+    sample_positions,
+    chunk_ranges: list[tuple[int, int]],
+) -> tuple[list[tuple[int, int]], int]:
+    """Adjust interior cuts and find a common width for the half-size stack."""
+    cuts = np.array([chunk_ranges[0][0], *(stop for _, stop in chunk_ranges)])
+    widths = np.diff(cuts)
+    if np.any(widths < 2):
+        raise ValueError("an annotated cut region is too narrow to render")
+    if len(widths) <= 2:
+        return chunk_ranges, int(max(widths) // 2)
+
+    def common_width(widths: np.ndarray) -> float:
+        # For fixed cuts, setting the derivative of sum((W / width - 1)**2)
+        # to zero gives W. The outer rows must fit at their original scale.
+        inverse = 1.0 / widths[1:-1]
+        width = inverse.sum() / (inverse @ inverse)
+        return float(max(width, widths[0], widths[-1]))
+
+    positions = np.asarray(sample_positions, dtype=np.float64)
+    movable = cuts[1:-1]
+    # Use the local dewarped sample spacing to express one sigma of cut
+    # movement in output columns. This also handles either sampling direction.
+    raw_per_column = 0.5 * np.abs(positions[movable + 1] - positions[movable - 1])
+    cut_units = JUSTIFY_CUT_SIGMA / raw_per_column
+    width_deltas = np.diff(np.eye(len(cuts))[:, 1:-1], axis=0) * cut_units
+    inner_widths = widths[1:-1]
+    inner_deltas = width_deltas[1:-1]
+    initial_width = common_width(widths)
+    width_unit = initial_width * JUSTIFY_SCALE_SIGMA
+
+    # Keep every slice renderable, and let both outer rows fit at unit scale.
+    minimum_slice_widths = LinearConstraint(
+        np.column_stack((width_deltas, np.zeros(len(widths)))), 2 - widths, np.inf
+    )
+    edge_widths = LinearConstraint(
+        np.column_stack((-width_deltas[[0, -1]], [width_unit, width_unit])),
+        widths[[0, -1]] - initial_width,
+        np.inf,
+    )
+    initial_errors = (initial_width / inner_widths - 1) / JUSTIFY_SCALE_SIGMA
+    loss_scale = max(1.0, initial_errors @ initial_errors)
+
+    def cost(parameters):
+        cut_errors = parameters[:-1]
+        adjusted_widths = inner_widths + inner_deltas @ cut_errors
+        width = initial_width + width_unit * parameters[-1]
+        scales = width / adjusted_widths
+        scale_errors = (scales - 1) / JUSTIFY_SCALE_SIGMA
+        loss = 0.5 * (scale_errors @ scale_errors + cut_errors @ cut_errors)
+        weighted_errors = scale_errors / (JUSTIFY_SCALE_SIGMA * adjusted_widths)
+        cut_gradient = cut_errors - (weighted_errors * scales) @ inner_deltas
+        width_gradient = width_unit * weighted_errors.sum()
+        return loss / loss_scale, np.r_[cut_gradient, width_gradient] / loss_scale
+
+    fit = minimize(
+        cost,
+        np.zeros(len(cuts) - 1),
+        jac=True,
+        method="SLSQP",
+        constraints=(minimum_slice_widths, edge_widths),
+        options={"ftol": 1e-9, "maxiter": 200},
+    )
+    if not fit.success:
+        raise RuntimeError(f"could not justify annotated cuts: {fit.message}")
+
+    # Round displacements consistently and retain at least two full-resolution
+    # samples per slice, even if a constraint is active at rounding precision.
+    adjusted = cuts.copy()
+    adjusted[1:-1] = np.floor(movable + cut_units * fit.x[:-1] + 0.5)
+    for i in range(1, len(cuts) - 1):
+        adjusted[i] = np.clip(
+            adjusted[i], adjusted[i - 1] + 2, cuts[-1] - 2 * (len(cuts) - 1 - i)
+        )
+    ranges = [
+        (int(start), int(stop)) for start, stop in zip(adjusted, adjusted[1:])
+    ]
+    # Refit the target to the widths actually passed to the half-size stack.
+    return ranges, round(common_width(np.diff(adjusted) // 2))
+
+
 def pad_random_edge_columns(
     data: np.ndarray,
     output_width: int,
@@ -4561,6 +4650,7 @@ def sample_motion_corrected_chunks(
     max_pix: int = 16384,
     jitter_models=None,
     jitter_protect_scene: bool = True,
+    pitch_offsets=None,
     step_scales=None,
     chunk_ranges=None,
     outer_padding_width: int | None = None,
@@ -4602,7 +4692,22 @@ def sample_motion_corrected_chunks(
 
     out_height = green1.height * 2
     center_y = (out_height - 1) / 2.0
-    row_offsets = (2 * np.arange(green1.height) - center_y).astype(np.float32)
+    if pitch_offsets is not None:
+        pitch_offsets = np.asarray(pitch_offsets, dtype=np.float32)
+        if pitch_offsets.shape != (green1.width,) or not np.isfinite(pitch_offsets).all():
+            raise ValueError(
+                "pitch_offsets must contain one finite offset per input column"
+            )
+        if not np.any(pitch_offsets):
+            pitch_offsets = None
+    row_step = 2 if pitch_offsets is None else 1
+    sensor_rows = np.arange(0, out_height, row_step)
+    row_offsets = (sensor_rows - center_y).astype(np.float32)
+    row_idx = np.arange(len(sensor_rows))[:, None]
+    views = (red_view, green1, green2, blue_view)
+    row_phases = (0, 1, 0, 1)
+    block_start = block_stop = 0
+    planes = []
 
     for chunk_i, batch_indices in enumerate(batches):
         pad_left = batch_indices[0] > 0
@@ -4640,50 +4745,23 @@ def sample_motion_corrected_chunks(
             if end_col <= start_col:
                 continue
 
-            r_win = red_view[:, slice(start_col, end_col)]
-            g1_win = green1[:, slice(start_col, end_col)]
-            g2_win = green2[:, slice(start_col, end_col)]
-            b_win = blue_view[:, slice(start_col, end_col)]
-
-            indices_local = indices_clipped - start_col
-            indices_local = np.clip(indices_local, 0, r_win.shape[1] - 1)
-            sample_rows = np.arange(green1.height, dtype=np.int32)
-            row_idx = sample_rows[:, None]
-
-            r_vals = r_win[row_idx, indices_local]
-            g1_vals = g1_win[row_idx, indices_local]
-            g2_vals = g2_win[row_idx, indices_local]
-            b_vals = b_win[row_idx, indices_local]
-
-            if jitter_models is not None:
-                r_vals = jitter_models.correct_samples(
-                    r_vals,
-                    JITTER_RED,
-                    indices_clipped,
-                    sample_rows,
-                    protect_scene=jitter_protect_scene,
-                )
-                g1_vals = jitter_models.correct_samples(
-                    g1_vals,
-                    JITTER_GREEN1,
-                    indices_clipped,
-                    sample_rows,
-                    protect_scene=jitter_protect_scene,
-                )
-                g2_vals = jitter_models.correct_samples(
-                    g2_vals,
-                    JITTER_GREEN2,
-                    indices_clipped,
-                    sample_rows,
-                    protect_scene=jitter_protect_scene,
-                )
-                b_vals = jitter_models.correct_samples(
-                    b_vals,
-                    JITTER_BLUE,
-                    indices_clipped,
-                    sample_rows,
-                    protect_scene=jitter_protect_scene,
-                )
+            if start_col < block_start or end_col > block_stop:
+                # Adjacent apertures reuse the same input columns. Correct raw
+                # radiometry once, then reconstruct each color at its own phase
+                # and acquisition time before mixing horizontal aperture taps.
+                block_start = start_col // 128 * 128
+                block_stop = min((end_col + 127) // 128 * 128, green1.width)
+                columns = slice(block_start, block_stop)
+                planes = []
+                for channel, (view, phase) in enumerate(zip(views, row_phases)):
+                    plane = apply_column_models(
+                        view[:, columns], jitter_models, block_start, channel,
+                        protect_scene=jitter_protect_scene,
+                    )
+                    if pitch_offsets is not None:
+                        plane = reconstruct_pitch_rows(plane, pitch_offsets[columns], phase)
+                    planes.append(plane)
+            indices_local = indices_clipped - block_start
 
             dist = window_indices.astype(np.float32) - centers[:, None].astype(
                 np.float32
@@ -4694,15 +4772,14 @@ def sample_motion_corrected_chunks(
             sum_weight = np.sum(weights, axis=1)
             sum_weight[sum_weight == 0] = 1.0
 
-            r_weighted = np.sum(r_vals * weights, axis=1) / sum_weight
-            g1_weighted = np.sum(g1_vals * weights, axis=1) / sum_weight
-            g2_weighted = np.sum(g2_vals * weights, axis=1) / sum_weight
-            b_weighted = np.sum(b_vals * weights, axis=1) / sum_weight
-
-            r_interp = interpolate_upsample(r_weighted, 0)
-            g1_interp = interpolate_upsample(g1_weighted, 1)
-            g2_interp = interpolate_upsample(g2_weighted, 0)
-            b_interp = interpolate_upsample(b_weighted, 1)
+            lines = []
+            for plane, phase in zip(planes, row_phases):
+                samples = plane[row_idx, indices_local]
+                line = np.sum(samples * weights, axis=1) / sum_weight
+                if pitch_offsets is None:
+                    line = interpolate_upsample(line, phase)
+                lines.append(line)
+            r_interp, g1_interp, g2_interp, b_interp = lines
 
             if j == 0:
                 raw_sampled[:, 0, 0] = r_interp
@@ -4739,6 +4816,58 @@ def sample_motion_corrected_chunks(
         # The consumer drops its reference before requesting the next chunk;
         # drop the generator's reference too before allocating its successor.
         del raw_sampled
+
+
+def sample_extrapolated_stack_edge(
+    channels,
+    *,
+    edge_position: float,
+    step: float,
+    sample_count: int,
+    prepend: bool,
+    skew: float,
+    pitch_offsets=None,
+    show_progress: bool = True,
+) -> np.ndarray | None:
+    """Sample contiguous background outside an outer row at constant speed."""
+    _, green1, _, _ = channels
+    step = math.copysign(max(abs(step), 0.1), step)
+    # Include one preceding sample for the Bayer interpolation, just as for
+    # ordinary slices. It may be clipped by the capture boundary.
+    offsets = (
+        np.arange(-sample_count - 1, 0)
+        if prepend
+        else np.arange(0, sample_count + 1)
+    )
+    positions = (edge_position + step * offsets).tolist()
+    widths = np.full(len(positions), max(1.0, abs(step)))
+    steps = np.full(len(positions), step, dtype=np.float32)
+    last_row = 2 * green1.height - (2 if pitch_offsets is None else 1)
+    row_offsets = np.array([0, last_row], dtype=np.float32) - (green1.height - 0.5)
+    positions, widths, kept = truncate_sample_positions_for_skew(
+        positions,
+        widths,
+        skew=skew,
+        step_scales=steps,
+        row_offsets=row_offsets,
+        width=green1.width,
+        return_slice=True,
+    )
+    first = int(kept.start == 0)
+    if len(positions) <= first:
+        return None
+    return next(
+        sample_motion_corrected_chunks(
+            *channels,
+            positions,
+            widths,
+            skew=skew,
+            step_scales=steps[kept],
+            pitch_offsets=pitch_offsets,
+            chunk_ranges=[(first, len(positions))],
+            show_progress=show_progress,
+        )
+    )[1]
 
 
 def sample_skew_corrected_green_chunks(
@@ -5100,6 +5229,64 @@ def validate_skew_hough_extents(extents) -> tuple[float, float]:
     return skew_min, skew_max
 
 
+def render_preview_bgr(
+    raw_sampled: np.ndarray,
+    white_balance: np.ndarray,
+    p2: float,
+    p98: float,
+    *,
+    flip_output_180: bool,
+) -> np.ndarray:
+    rgb = apply_color_transform(raw_sampled, white_balance)
+    np.clip(rgb, 0, 65536, out=rgb)
+    sharpen(rgb, in_place=True)
+    rgb -= p2
+    rgb += 0.1
+    rgb /= p98
+    np.clip(rgb, 0, 1, out=rgb)
+    rgb = rgb[::-1, :, :]
+    np.sqrt(rgb, out=rgb)
+    rgb *= 255
+
+    bgr = rgb[:, :, ::-1].astype(np.uint8)
+    del rgb
+    if flip_output_180:
+        bgr = np.ascontiguousarray(bgr[::-1, ::-1, :])
+    return bgr
+
+
+def pad_with_capture_background(
+    binned: np.ndarray,
+    raw_padding: np.ndarray | None,
+    output_width: int,
+    white_balance: np.ndarray,
+    p2: float,
+    p98: float,
+    *,
+    prepend: bool,
+    flip_output_180: bool,
+) -> np.ndarray:
+    """Tone-map the captured padding and extend its far edge if necessary."""
+    if raw_padding is None:
+        background = binned[:, :1] if prepend else binned[:, -1:]
+    else:
+        background = render_preview_bgr(
+            raw_padding, white_balance, p2, p98, flip_output_180=flip_output_180
+        )
+        # Keep the 2x binning grid anchored at the join with the subject.
+        odd = background.shape[1] % 2
+        if odd:
+            outside = (odd, 0) if prepend else (0, odd)
+            background = np.pad(background, ((0, 0), outside, (0, 0)), mode="edge")
+        background = bin2to1_rgb_u8(background)
+    missing = output_width - binned.shape[1] - background.shape[1]
+    if missing:
+        outside = (missing, 0) if prepend else (0, missing)
+        background = np.pad(background, ((0, 0), outside, (0, 0)), mode="edge")
+    pieces = (background, binned) if prepend else (binned, background)
+    return np.concatenate(pieces, axis=1)
+
+
 def render_output_chunk(
     raw_sampled: np.ndarray,
     *,
@@ -5127,21 +5314,9 @@ def render_output_chunk(
         del dng_sampled
 
     out_name = f"{name_prefix}_{dng_sha1}"
-    rgb = apply_color_transform(raw_sampled, white_balance)
-    np.clip(rgb, 0, 65536, out=rgb)
-    sharpen(rgb, in_place=True)
-    rgb -= p2
-    rgb += 0.1
-    rgb /= p98
-    np.clip(rgb, 0, 1, out=rgb)
-    rgb = rgb[::-1, :, :]
-    np.sqrt(rgb, out=rgb)
-    rgb *= 255
-
-    rgb_u8 = rgb[:, :, ::-1].astype(np.uint8)
-    del rgb
-    if flip_output_180:
-        rgb_u8 = np.ascontiguousarray(rgb_u8[::-1, ::-1, :])
+    rgb_u8 = render_preview_bgr(
+        raw_sampled, white_balance, p2, p98, flip_output_180=flip_output_180
+    )
     try:
         write_jpeg(output_dir / f"{out_name}.jpg", rgb_u8, jpeg_exif)
     except Exception as e:
@@ -5160,6 +5335,10 @@ def process_preview(
     use_speed_constraints: bool = True,
     equal_length_chunks: bool = False,
     pad_output_to_equal_widths: bool = False,
+    justify: bool = False,
+    justify_padding: str = "random",
+    vibration_compensation: bool = True,
+    vibration_rows: int = DEFAULT_GROUND_ROWS,
     flip_output_180: bool | None = FLIP_OUTPUT_180,
     skew_hough_extents: tuple[float, float] = DEFAULT_SKEW_HOUGH_EXTENTS,
 ) -> int:
@@ -5168,6 +5347,8 @@ def process_preview(
         raise ValueError(f"no .bin frames found in {g}")
     if padding_columns < 0:
         raise ValueError("padding_columns must be non-negative")
+    if vibration_rows < MIN_GROUND_ROWS:
+        raise ValueError(f"vibration_rows must be at least {MIN_GROUND_ROWS}")
     skew_min, skew_max = validate_skew_hough_extents(skew_hough_extents)
     capture_timestamp = g.name
     flip_output_180 = resolve_flip_output_180(g, flip_output_180)
@@ -5187,6 +5368,14 @@ def process_preview(
         raise ValueError(
             "equal-length chunks and cut-based padding are mutually exclusive"
         )
+    if justify and (equal_length_chunks or pad_output_to_equal_widths):
+        raise ValueError("justification is mutually exclusive with other cut layouts")
+    if justify and (constraints is None or not constraints.has_cut_regions):
+        raise ValueError("justification requires annotated cut positions")
+    if justify_padding not in ("random", "original"):
+        raise ValueError("justify padding must be 'random' or 'original'")
+    if justify_padding == "original" and not justify:
+        raise ValueError("original justify padding requires --justify")
     if equal_length_chunks and (
         constraints is None or not constraints.has_cut_regions
     ):
@@ -5567,9 +5756,35 @@ def process_preview(
         fig.savefig(g / "jitter_row_debug.png")
         plt.close(fig)
 
+    background_channels = None
+    if justify_padding == "original":
+        background_data = FileDataCache(bins, dtype=np.uint16, rows=data.height)
+        background_channels = tuple(
+            ChannelView(background_data, row_offset=row, col_offset=col)
+            for row, col in ((0, 1), (1, 1), (0, 0), (1, 0))
+        )
+    pitch_offsets = background_pitch_offsets = None
+    if vibration_compensation:
+        # Original-background padding uses global capture coordinates. Fit
+        # one continuous trajectory across the join and slice it for the ROI.
+        pitch_green = green2 if background_channels is None else background_channels[2]
+        fitted_offsets = estimate_pitch_offsets(
+            pitch_green,
+            ground_at_high_rows=flip_output_180,
+            ground_rows=vibration_rows,
+        )
+        if background_channels is not None and np.any(fitted_offsets):
+            background_pitch_offsets = fitted_offsets
+            fitted_offsets = fitted_offsets[processing_x_start:processing_x_stop]
+        if np.any(fitted_offsets):
+            pitch_offsets = fitted_offsets
+        if show_progress:
+            rms = np.sqrt(np.mean(fitted_offsets**2))
+            print(f"ground pitch correction RMS {rms:.2f} sensor pixels")
     out_height = green1.height * 2
     center_y = (out_height - 1) / 2.0
-    row_offsets = (2 * np.arange(green1.height) - center_y).astype(np.float32)
+    last_row = out_height - (2 if pitch_offsets is None else 1)
+    row_offsets = np.array([0, last_row], dtype=np.float32) - center_y
     sample_positions, widths, kept_slice = truncate_sample_positions_for_skew(
         sample_positions,
         widths,
@@ -5587,6 +5802,7 @@ def process_preview(
     chunk_ranges = None
     stack_chunk_widths = None
     padded_output_width = None
+    justified_stack_width = None
     if local_constraints is not None and local_constraints.has_cut_regions:
         if equal_length_chunks:
             outer_range = build_cut_aligned_output_ranges(
@@ -5607,10 +5823,14 @@ def process_preview(
             chunk_ranges, padded_output_width = build_padded_cut_output_ranges(
                 chunk_ranges
             )
+        if justify:
+            chunk_ranges, justified_stack_width = justify_cut_output_ranges(
+                sample_positions, chunk_ranges
+            )
         output_chunk_count = len(chunk_ranges)
         generator_binned_widths = np.asarray(
             [
-                (padded_output_width or stop - start) // 2
+                justified_stack_width or (padded_output_width or stop - start) // 2
                 for start, stop in chunk_ranges
             ],
             dtype=np.int64,
@@ -5637,6 +5857,14 @@ def process_preview(
                     padded_output_width,
                     "(sampling order)",
                 )
+            elif justified_stack_width is not None:
+                print(
+                    "justified cut-aligned output widths",
+                    unpadded_widths,
+                    "->",
+                    [stop - start for start, stop in chunk_ranges],
+                    f"(sampling order), stack width {justified_stack_width}",
+                )
             else:
                 range_description = (
                     "equal-length output widths"
@@ -5661,6 +5889,11 @@ def process_preview(
     # temporaries, so six simultaneous renderers remain unnecessarily risky.
     output_dir.mkdir(parents=True, exist_ok=True)
     with _render_slots:
+        if justify_padding == "original":
+            cuts = local_constraints.cut_positions
+            first_cut, last_cut = cuts[0], cuts[-1]
+            if sample_positions[0] > sample_positions[-1]:
+                first_cut, last_cut = last_cut, first_cut
         with tempfile.TemporaryDirectory(
             dir=output_dir,
             prefix=f".{capture_timestamp}_render_",
@@ -5683,6 +5916,7 @@ def process_preview(
                     skew=skew,
                     max_pix=chunk_size,
                     jitter_models=jitter_models,
+                    pitch_offsets=pitch_offsets,
                     step_scales=step_scales,
                     chunk_ranges=chunk_ranges,
                     outer_padding_width=padded_output_width,
@@ -5706,6 +5940,63 @@ def process_preview(
                         flip_output_180=flip_output_180,
                     )
                     del raw_sampled
+                    if (
+                        justified_stack_width is not None
+                        and binned.shape[1] != justified_stack_width
+                    ):
+                        if output_chunk_i in (0, output_chunk_count - 1):
+                            prepend = output_chunk_i == 0
+                            if background_channels is None:
+                                binned = pad_random_edge_columns(
+                                    binned,
+                                    justified_stack_width,
+                                    prepend=prepend,
+                                    rng=np.random.default_rng(),
+                                )
+                            else:
+                                start, stop = chunk_ranges[chunk_i]
+                                prepend_in_sampling_order = chunk_i == 0
+                                # Binning can drop a full-size column at the
+                                # displayed right edge, where padding joins.
+                                skip = 0 if prepend else (stop - start) % 2
+                                if prepend_in_sampling_order:
+                                    edge, cut = start + skip, first_cut
+                                else:
+                                    edge, cut = stop - 1 - skip, last_cut
+                                edge_position = sample_positions[edge] + selected_global_x0
+                                padding_width = justified_stack_width - binned.shape[1]
+                                raw_padding = sample_extrapolated_stack_edge(
+                                    background_channels,
+                                    edge_position=edge_position,
+                                    step=float(spline(cut)),
+                                    sample_count=2 * padding_width,
+                                    prepend=prepend_in_sampling_order,
+                                    skew=skew,
+                                    pitch_offsets=background_pitch_offsets,
+                                    show_progress=show_progress,
+                                )
+                                binned = pad_with_capture_background(
+                                    binned,
+                                    raw_padding,
+                                    justified_stack_width,
+                                    white_balance,
+                                    p2,
+                                    p98,
+                                    prepend=prepend,
+                                    flip_output_180=flip_output_180,
+                                )
+                                del raw_padding
+                        else:
+                            interpolation = (
+                                cv2.INTER_AREA
+                                if binned.shape[1] > justified_stack_width
+                                else cv2.INTER_CUBIC
+                            )
+                            binned = cv2.resize(
+                                binned,
+                                (justified_stack_width, binned.shape[0]),
+                                interpolation=interpolation,
+                            )
                     stacked_preview.add_chunk(output_chunk_i, binned)
                     del binned
 
@@ -5750,6 +6041,22 @@ def _parse_args(argv=None):
         help="enable the clipping-aware vertical-stripe correction",
     )
     parser.add_argument(
+        "--vibration-compensation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="compensate camera pitch using stationary ground at the bottom of the output",
+    )
+    parser.add_argument(
+        "--vibration-rows",
+        type=int,
+        default=DEFAULT_GROUND_ROWS,
+        metavar="N",
+        help=(
+            f"ground strip height in full-resolution sensor pixels "
+            f"(minimum {MIN_GROUND_ROWS}, default {DEFAULT_GROUND_ROWS})"
+        ),
+    )
+    parser.add_argument(
         "--flip-output-180",
         action=argparse.BooleanOptionalAction,
         default=FLIP_OUTPUT_180,
@@ -5784,6 +6091,21 @@ def _parse_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--justify",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="adjust annotated cuts and justify the rows of the stacked JPEG",
+    )
+    parser.add_argument(
+        "--justify-padding",
+        choices=("random", "original"),
+        default="random",
+        help=(
+            "fill justified end rows with random edge columns (default) or "
+            "contiguous background from the original capture"
+        ),
+    )
+    parser.add_argument(
         "--jitter-debug",
         action="store_true",
         default=ENABLE_JITTER_DEBUG_PLOT,
@@ -5808,6 +6130,8 @@ def _parse_args(argv=None):
     )
     parser.add_argument("--max-workers", type=int, default=6)
     args = parser.parse_args(argv)
+    if args.vibration_rows < MIN_GROUND_ROWS:
+        parser.error(f"--vibration-rows must be at least {MIN_GROUND_ROWS}")
     if args.skew_hough_extents is not None:
         try:
             args.skew_hough_extents = validate_skew_hough_extents(
@@ -5849,35 +6173,30 @@ def main(argv=None):
         else:
             print("skipping directory", candidate)
 
-    if len(dirs) == 1:
-        process_kwargs = {"output_dir": output_dir}
-        if not args.speed_constraints:
-            process_kwargs["use_speed_constraints"] = False
-        if args.equal_length_chunks:
-            process_kwargs["equal_length_chunks"] = True
-        if args.pad_output_to_equal_widths:
-            process_kwargs["pad_output_to_equal_widths"] = True
-        if args.flip_output_180 is not None:
-            process_kwargs["flip_output_180"] = args.flip_output_180
-        if args.skew_hough_extents is not None:
-            process_kwargs["skew_hough_extents"] = args.skew_hough_extents
-        process_preview(dirs[0], **process_kwargs)
-        return
-
-    process_kwargs = {
-        "show_progress": False,
-        "output_dir": output_dir,
-    }
+    process_kwargs = {"output_dir": output_dir}
+    if not args.vibration_compensation:
+        process_kwargs["vibration_compensation"] = False
+    if args.vibration_rows != DEFAULT_GROUND_ROWS:
+        process_kwargs["vibration_rows"] = args.vibration_rows
     if not args.speed_constraints:
         process_kwargs["use_speed_constraints"] = False
     if args.equal_length_chunks:
         process_kwargs["equal_length_chunks"] = True
     if args.pad_output_to_equal_widths:
         process_kwargs["pad_output_to_equal_widths"] = True
+    if args.justify:
+        process_kwargs["justify"] = True
+    if args.justify_padding != "random":
+        process_kwargs["justify_padding"] = args.justify_padding
     if args.flip_output_180 is not None:
         process_kwargs["flip_output_180"] = args.flip_output_180
     if args.skew_hough_extents is not None:
         process_kwargs["skew_hough_extents"] = args.skew_hough_extents
+    if len(dirs) == 1:
+        process_preview(dirs[0], **process_kwargs)
+        return
+
+    process_kwargs["show_progress"] = False
     with ThreadPoolExecutor(max_workers=max(1, args.max_workers)) as executor:
         future_map = {
             executor.submit(
