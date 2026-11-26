@@ -46,7 +46,9 @@ Use the column selector in the toolbar to show all columns or one in every
 2, 4, 8, and so on. You can also start with `--column-stride 8`. The default
 detail window spans 4096 displayed columns, so at 1/8 it covers 32,768
 original Bayer columns. Click the navigator to center the window. The editor
-keeps a bounded RGB overview in memory and reads finer detail on demand.
+reads each raw frame once at startup and keeps the complete Bayer-binned RGB
+image in RAM (three bytes per pixel). Seeking and changing the display stride
+use that image directly.
 The navigator wraps into multiple rows as needed, and its divider can be
 dragged vertically. Use Left/Right to slide by 256 displayed columns,
 Ctrl+mouse-wheel to zoom, F to enable persistent fitting, F8 to hide the
@@ -79,18 +81,21 @@ equal chunks smaller than `OUTPUT_CHUNK_TARGET`, ignoring intermediate cut
 positions. Pass `--pad-output-to-equal-widths` instead to retain every annotated
 cut and pad the resulting slices to the width of the widest one.
 
-Pass `--justify` to give the stacked JPEG a common row width. The fit keeps
+Pass `--justify` to give all full-resolution DNG and JPEG slices a common
+width. The stacked JPEG uses the same slices at half resolution. The fit keeps
 the annotated start and end fixed and balances interior cut movement against
 horizontal scaling. Each cut has a prior of 20 displayed columns at its own
-annotation stride, and the scale prior is 4%. The stack resizes its middle rows
-and pads its first and last rows with randomly sampled columns from their
-outside edges. Individual DNG and JPEG slices use the adjusted cuts at their
-native dewarped scale.
+annotation stride, and the scale prior is 4%. Each interior slice gets a
+constant offset to its log-speed spline during raw sampling. The first and
+last slices keep their native scale and fill any missing width with randomly
+sampled columns from their outside edges.
 
-With `--justify --justify-padding original`, the end rows use contiguous
+With `--justify --justify-padding original`, the end slices use contiguous
 background from outside the annotated cuts. The renderer extends the speed
-spline at a constant speed from each end cut and repeats the farthest usable
-column if the capture ends before the row is filled. Use the default
+spline at a constant speed from each end cut. If the capture ends early, the
+renderer fills the remaining width by randomly sampling whole columns from
+the outermost 128 available columns, including the slice edge when fewer than
+128 background columns are available. Use the default
 `--justify-padding random` when the captured margins contain other moving
 objects you want to omit.
 

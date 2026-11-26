@@ -5,6 +5,8 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import numpy as np
+from PIL import Image
+import tifffile
 
 import preview
 
@@ -457,15 +459,15 @@ class PreviewSpeedConstraintsTest(unittest.TestCase):
         ranges = [(8, 33), (33, 113), (113, 223), (223, 323), (323, 341)]
         positions = np.arange(350.0)
 
-        adjusted, stack_width = preview.justify_cut_output_ranges(positions, ranges)
+        adjusted, width = preview.justify_cut_output_ranges(positions, ranges)
         reversed_sampling = preview.justify_cut_output_ranges(positions[::-1], ranges)
 
-        self.assertEqual((adjusted, stack_width), reversed_sampling)
+        self.assertEqual((adjusted, width), reversed_sampling)
         self.assertEqual(adjusted[0][0], ranges[0][0])
         self.assertEqual(adjusted[-1][1], ranges[-1][1])
         self.assertLess(adjusted[1][0], ranges[1][0])
         self.assertGreater(adjusted[1][1], ranges[1][1])
-        self.assertEqual(stack_width, 49)
+        self.assertEqual(width, 98)
 
     def test_cut_uncertainty_follows_the_annotation_in_reverse_sampling_order(self):
         ranges = [(8, 33), (33, 113), (113, 223), (223, 323), (323, 341)]
@@ -480,16 +482,33 @@ class PreviewSpeedConstraintsTest(unittest.TestCase):
 
     def test_justification_preserves_renderable_slices_and_fits_wide_edges(self):
         ranges = [(0, 4000), (4000, 4002), (4002, 4004), (4004, 8004)]
-        adjusted, stack_width = preview.justify_cut_output_ranges(
+        adjusted, width = preview.justify_cut_output_ranges(
             np.arange(8004.0), ranges
         )
 
         widths = [stop - start for start, stop in adjusted]
         self.assertGreaterEqual(min(widths), 2)
-        self.assertGreaterEqual(stack_width, max(widths[0], widths[-1]) // 2)
+        self.assertGreaterEqual(width, max(widths[0], widths[-1]))
         self.assertEqual(sum(widths), 8004)
 
-    def test_original_padding_uses_adjacent_samples_in_either_direction(self):
+    def test_justified_grid_scales_the_native_spline_within_each_interior(self):
+        ranges = [(1, 4), (4, 8), (8, 17), (17, 21)]
+        for direction in (1, -1):
+            steps = direction * (2 + np.arange(21) / 8)
+            native = 100 + np.r_[0, np.cumsum(steps[:-1])]
+            positions, apertures, skew, adjusted = preview.justify_sample_grid(
+                native, steps, ranges, 6
+            )
+            self.assertEqual(adjusted, [(1, 4), (4, 10), (10, 16), (16, 20)])
+            for (left, right), (start, stop) in zip(ranges, adjusted):
+                scale = (right - left) / (stop - start)
+                columns = left + scale * np.arange(stop - start)
+                expected = np.interp(columns, np.arange(21), native)
+                np.testing.assert_allclose(positions[start:stop], expected)
+                np.testing.assert_allclose(skew[start:stop], direction * (2 + columns / 8))
+                np.testing.assert_allclose(apertures[start:stop], scale * (2 + columns / 8))
+
+    def test_original_padding_keeps_adjacent_samples_and_randomizes_only_the_shortfall(self):
         class ArrayView:
             height = 2
             width = 20
@@ -499,46 +518,76 @@ class PreviewSpeedConstraintsTest(unittest.TestCase):
                 return self.data[key]
 
         channels = (ArrayView(),) * 4
-        for prepend, step, expected in (
-            (True, 2.0, [2, 4, 6, 8]),
-            (False, 2.0, [12, 14, 16]),
-            (True, -2.0, [16, 14, 12]),
-            (False, -2.0, [8, 6, 4, 2]),
+        columns = np.arange(100, 300, dtype=np.float32)
+        subject = np.broadcast_to(columns[None, :, None], (4, len(columns), 3))
+        for prepend, step, edge, requested, background in (
+            (True, 2.0, 10, 256, [2, 4, 6, 8]),
+            (False, 2.0, 10, 256, [12, 14, 16]),
+            (True, -2.0, 10, 256, [16, 14, 12]),
+            (False, -2.0, 10, 256, [8, 6, 4, 2]),
+            (True, 2.0, 2, 256, []),
+            (False, 2.0, 16, 256, []),
+            (True, 2.0, 10, 2, [6, 8]),
         ):
-            with self.subTest(prepend=prepend, step=step):
-                raw = preview.sample_extrapolated_stack_edge(
-                    channels,
-                    edge_position=10.0,
+            with (
+                self.subTest(prepend=prepend, step=step, edge=edge, requested=requested),
+                patch.object(preview.np.random, "default_rng", return_value=np.random.default_rng(7)),
+            ):
+                raw = preview.pad_with_capture_background(
+                    subject, len(columns) + requested, channels,
+                    edge_position=edge,
                     step=step,
-                    sample_count=8,
                     prepend=prepend,
                     skew=0.0,
                     show_progress=False,
                 )
-                np.testing.assert_allclose(raw[0, :, 2], expected)
+                captured = np.r_[background, columns] if prepend else np.r_[columns, background]
+                missing = requested - len(background)
+                start = missing if prepend else 0
+                np.testing.assert_array_equal(raw[0, start:start + len(captured), 2], captured)
+                if missing:
+                    pool = captured[:128] if prepend else captured[-128:]
+                    filler = raw[0, :missing, 2] if prepend else raw[0, -missing:, 2]
+                    self.assertTrue(np.isin(filler, pool).all())
+                    self.assertGreater(len(np.unique(filler)), 1)
 
-    def test_original_padding_preserves_the_join_when_the_capture_runs_out(self):
-        subject = np.full((2, 2, 3), 90, dtype=np.uint8)
-        background = np.broadcast_to(
-            np.array([10, 30, 50], dtype=np.uint8)[None, :, None], (4, 3, 3)
-        )
-        for prepend, expected in (
-            (True, [10, 10, 40, 90, 90]),
-            (False, [90, 90, 20, 50, 50]),
-        ):
-            with self.subTest(prepend=prepend):
-                with patch.object(preview, "render_preview_bgr", return_value=background):
-                    padded = preview.pad_with_capture_background(
-                        subject,
-                        background,
-                        5,
-                        np.ones(3),
-                        0.0,
-                        1.0,
-                        prepend=prepend,
-                        flip_output_180=False,
+    def test_justified_dng_and_jpeg_widths_match_the_binned_stack(self):
+        with TemporaryDirectory() as directory:
+            capture = Path(directory) / "2026-07-30-00-00-00"
+            output = Path(directory) / "output"
+            capture.mkdir()
+            raw = np.arange(128, dtype="<u2")[:, None] + np.arange(4096, dtype="<u2")
+            raw.tofile(capture / "im000000.bin")
+            (capture / preview.SPEED_CONSTRAINTS_JSON).write_text(json.dumps({
+                "schema_version": 1,
+                "coordinate_system": {"name": "bayer_channel_pixels", "bayer_bin": 2},
+                "cut_positions": [{"id": str(x), "x": x} for x in (2, 21, 36, 54, 60)],
+            }))
+
+            for direction, padding in ((1, "random"), (-1, "original")):
+                with (
+                    self.subTest(direction=direction, padding=padding),
+                    patch.object(preview, "ENABLE_COLUMN_JITTER_CORRECTION", False),
+                    patch.object(preview, "windowed_cross_correlation", return_value=(
+                        np.linspace(3, 59, 5), np.full(5, direction), np.ones(5),
+                    )),
+                    patch.object(preview, "estimate_skew_hough", return_value=0.0),
+                ):
+                    count = preview.process_preview(
+                        capture, output_dir=output, justify=True, justify_padding=padding,
+                        flip_output_180=(direction < 0), vibration_compensation=False,
+                        show_progress=False,
                     )
-                np.testing.assert_array_equal(padded[0, :, 0], expected)
+                    chunks = sorted(output.glob("*.dng"))
+                    self.assertEqual(len(chunks), 4)
+                    self.assertEqual(count, 4 * 17)
+                    for path in chunks:
+                        with tifffile.TiffFile(path) as dng:
+                            self.assertEqual(dng.pages[0].shape, (4096, 17, 3))
+                        with Image.open(path.with_suffix(".jpg")) as jpeg:
+                            self.assertEqual(jpeg.size, (17, 4096))
+                    with Image.open(output / f"{capture.name}_stack.jpg") as stack:
+                        self.assertEqual(stack.size, (8, 4 * 2048))
 
     def test_padded_cut_ranges_center_neighbor_content(self):
         ranges, width = preview.build_padded_cut_output_ranges(

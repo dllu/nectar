@@ -1,6 +1,5 @@
 import json
 import unittest
-from unittest.mock import patch
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -208,7 +207,7 @@ class SpeedConstraintsTest(unittest.TestCase):
                 ],
             )
 
-    def test_cached_and_on_demand_windows_keep_global_bayer_phase(self):
+    def test_seeks_at_every_stride_work_after_source_files_are_removed(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             rng = np.random.default_rng(8)
@@ -219,16 +218,13 @@ class SpeedConstraintsTest(unittest.TestCase):
             full = np.concatenate(
                 [decode_raw_frame(f, 4) for f in capture.frames], axis=1
             )
-            with patch("speed_constraints.DISPLAY_CACHE_MAX_BYTES", 36):
-                loaded = load_capture_data(capture)
-            self.assertEqual(loaded.stride, 4)
-            self.assertLessEqual(loaded.rgb.nbytes, 36)
-            for stride in (1, 2, 4, 8):
-                for start, stop in ((0, 13), (8, 23), (4, 15), (9, 21)):
-                    actual = loaded.window(capture, start, stop, stride)
-                    np.testing.assert_array_equal(
-                        actual, loaded.tone_lut[full[:, start:stop:stride]]
-                    )
+            expected = auto_tone_map_to_uint8(full)
+            loaded = load_capture_data(capture)
+
+        for stride in (1, 2, 4, 8):
+            for start, stop in ((0, 5), (17, 23), (4, 15), (9, 21)):
+                actual = loaded.window(start, stop, stride)
+                np.testing.assert_array_equal(actual, expected[:, start:stop:stride])
 
     def test_builds_one_uniform_navigator_for_the_global_image(self):
         capture = CaptureSequence(

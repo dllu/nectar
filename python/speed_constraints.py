@@ -87,7 +87,6 @@ MIN_ELLIPSE_SIZE = 3.0
 MIN_SEGMENT_WIDTH = 1.0
 NAVIGATOR_PREFERRED_HEIGHT = 96
 NAVIGATOR_MAX_BYTES = 32 * 1024 * 1024
-DISPLAY_CACHE_MAX_BYTES = 256 * 1024 * 1024
 DISPLAY_STATISTICS_MAX_PIXELS = 4 * 1024 * 1024
 
 CIRCLE_COLOR = QColor("#00ff00")
@@ -294,73 +293,17 @@ class NavigatorData:
 
 @dataclass
 class LoadedCapture:
-    """A memory-bounded display cache and its capture-wide navigator."""
+    """The complete Bayer-binned display image and its navigator."""
 
     rgb: np.ndarray
     navigator: NavigatorData
-    stride: int
-    tone_lut: np.ndarray
-    _detail: tuple[int, int, np.ndarray] | None = field(
-        default=None, init=False, repr=False
-    )
 
-    def window(self, capture: CaptureSequence, first: int, stop: int, stride: int):
-        """Read globally aligned Bayer columns, decoding finer detail on demand."""
-        if stride >= self.stride and first % self.stride == 0:
-            columns = slice(
-                first // self.stride,
-                math.ceil(stop / self.stride),
-                stride // self.stride,
-            )
-            return np.ascontiguousarray(self.rgb[:, columns])
-        width = len(range(first, stop, stride))
-        rgb = np.empty((capture.image_height, width, 3), np.uint8)
-        # Panning typically exposes only 256 new display columns. Reuse the
-        # overlap so a single keypress does not reread the entire raw window.
-        missing = [(first, stop)]
-        if self._detail is not None:
-            old_first, old_stride, old_rgb = self._detail
-            left = max(first, old_first)
-            right = min(stop, old_first + old_rgb.shape[1] * old_stride)
-            if (
-                old_stride == stride
-                and (first - old_first) % stride == 0
-                and left < right
-            ):
-                offset = (left - first) // stride
-                old_offset = (left - old_first) // stride
-                count = len(range(left, right, stride))
-                rgb[:, offset : offset + count] = old_rgb[
-                    :, old_offset : old_offset + count
-                ]
-                missing = [(first, left), (right, stop)]
-        for left, right in missing:
-            if left >= right:
-                continue
-            index = capture.frame_index_at_x(left)
-            for frame in capture.frames[index:]:
-                if frame.x_start >= right:
-                    break
-                start = max(left, frame.x_start)
-                start += (first - start) % stride
-                end = min(right, frame.x_end)
-                if start < end:
-                    block = decode_raw_frame(
-                        frame,
-                        capture.frame_rows,
-                        first=start - frame.x_start,
-                        stop=end - frame.x_start,
-                        stride=stride,
-                    )
-                    offset = (start - first) // stride
-                    rgb[:, offset : offset + block.shape[1]] = self.tone_lut[block]
-        self._detail = first, stride, rgb
-        return rgb
+    def window(self, first: int, stop: int, stride: int) -> np.ndarray:
+        return np.ascontiguousarray(self.rgb[:, first:stop:stride])
 
     @property
     def memory_bytes(self) -> int:
-        detail_bytes = 0 if self._detail is None else self._detail[2].nbytes
-        return self.rgb.nbytes + self.navigator.memory_bytes + detail_bytes
+        return self.rgb.nbytes + self.navigator.memory_bytes
 
 
 def navigator_thumbnail_geometry(
@@ -422,16 +365,9 @@ def load_capture_data(
     status: Callable[[str], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
 ) -> LoadedCapture | None:
-    """Build the overview once, bounding the resident full-height RGB cache."""
-    stride = 1
-    while (
-        stride < capture.total_width
-        and math.ceil(capture.total_width / stride) * capture.image_height * 3
-        > DISPLAY_CACHE_MAX_BYTES
-    ):
-        stride *= 2
+    """Read each frame once and keep every display column in memory."""
     rgb = np.empty(
-        (capture.image_height, math.ceil(capture.total_width / stride), 3),
+        (capture.image_height, capture.total_width, 3),
         dtype=np.uint8,
     )
     total_frames = len(capture.frames)
@@ -439,15 +375,7 @@ def load_capture_data(
     for index, frame in enumerate(capture.frames):
         if cancelled is not None and cancelled():
             return None
-        start = math.ceil(frame.x_start / stride)
-        stop = math.ceil(frame.x_end / stride)
-        if start < stop:
-            rgb[:, start:stop] = decode_raw_frame(
-                frame,
-                capture.frame_rows,
-                first=start * stride - frame.x_start,
-                stride=stride,
-            )
+        rgb[:, frame.x_start : frame.x_end] = decode_raw_frame(frame, capture.frame_rows)
         completed = index + 1
         if progress is not None and (
             completed == total_frames or completed % progress_stride == 0
@@ -467,6 +395,8 @@ def load_capture_data(
     lut = display_tone_lut(statistics)
     del statistics
     for start in range(0, rgb.shape[1], 1024):
+        if cancelled is not None and cancelled():
+            return None
         block = rgb[:, start : start + 1024]
         block[:] = lut[block]
 
@@ -474,8 +404,8 @@ def load_capture_data(
         return None
     if status is not None:
         status("Building low-resolution navigator…")
-    navigator = build_navigator_data(capture, rgb, stride=stride)
-    return LoadedCapture(rgb, navigator, stride, lut)
+    navigator = build_navigator_data(capture, rgb)
+    return LoadedCapture(rgb, navigator)
 
 
 class CaptureLoader(QThread):
@@ -1578,11 +1508,7 @@ class SpeedConstraintWindow(QMainWindow):
         self.capture = capture
         self.document = document
         self.json_path = json_path
-        self.max_window_columns = min(
-            capture.total_width,
-            max(1, DISPLAY_CACHE_MAX_BYTES // (3 * capture.image_height)),
-        )
-        self.window_columns = min(max(1, window_columns), self.max_window_columns)
+        self.window_columns = min(max(1, window_columns), capture.total_width)
         self.window_step_columns = max(1, window_step_columns)
         self.window_start_x = 0
         self._window_x_left = 0.0
@@ -1662,12 +1588,12 @@ class SpeedConstraintWindow(QMainWindow):
 
         toolbar.addWidget(QLabel(" Columns "))
         self.window_columns_spin = QSpinBox()
-        self.window_columns_spin.setRange(1, self.max_window_columns)
+        self.window_columns_spin.setRange(1, self.capture.total_width)
         self.window_columns_spin.setSingleStep(self.window_step_columns)
         self.window_columns_spin.setValue(self.window_columns)
         self.window_columns_spin.setKeyboardTracking(False)
         self.window_columns_spin.setToolTip(
-            f"Width in displayed columns (up to {self.max_window_columns:,} per window)"
+            f"Width in displayed columns (up to {self.capture.total_width:,} per window)"
         )
         self.window_columns_spin.valueChanged.connect(self._set_window_columns)
         toolbar.addWidget(self.window_columns_spin)
@@ -2075,7 +2001,7 @@ class SpeedConstraintWindow(QMainWindow):
         if self.loaded_capture is not None:
             stride = self.view.column_stride
             first = x_left - x_left % stride
-            rgb = self.loaded_capture.window(self.capture, first, x_right, stride)
+            rgb = self.loaded_capture.window(first, x_right, stride)
             image = QImage(
                 rgb.data,
                 rgb.shape[1],
@@ -2152,7 +2078,7 @@ class SpeedConstraintWindow(QMainWindow):
 
     def _set_window_columns(self, value: int) -> None:
         old_left, old_right = self._window_bounds()
-        self.window_columns = min(max(1, value), self.max_window_columns)
+        self.window_columns = min(max(1, value), self.capture.total_width)
         self.window_start_x = self._aligned_window_start(
             (old_left + old_right - self.window_span) / 2
         )
