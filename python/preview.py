@@ -6015,6 +6015,8 @@ def process_preview(
     n = len(sample_positions)
     if n == 0:
         return 0
+    # Capture time increases with source column, regardless of camera mounting.
+    newest_first = step_scales[0] < 0
     chunk_ranges = None
     stack_chunk_widths = None
     padded_output_width = None
@@ -6051,7 +6053,7 @@ def process_preview(
         stack_chunk_widths = np.asarray(output_widths) // 2
         if np.any(stack_chunk_widths < 1):
             raise ValueError("an annotated cut region is too narrow to render")
-        if flip_output_180:
+        if newest_first:
             stack_chunk_widths = stack_chunk_widths[::-1]
         chunk_size = OUTPUT_CHUNK_TARGET  # Ignored for explicit cut ranges.
         if show_progress:
@@ -6091,7 +6093,7 @@ def process_preview(
         pad_edge = pad_random_edge_columns
         if background_channels is not None:
             cuts = local_constraints.cut_positions
-            if step_scales[0] < 0:
+            if newest_first:
                 cuts = cuts[::-1]
 
             def pad_original(raw, output_width, *, prepend):
@@ -6156,7 +6158,8 @@ def process_preview(
                         flip_output_180=flip_output_180,
                     )
                     del raw_sampled
-                    stacked_preview.add_chunk(output_chunk_i, binned)
+                    stack_row = output_chunk_count - 1 - chunk_i if newest_first else chunk_i
+                    stacked_preview.add_chunk(stack_row, binned)
                     del binned
 
                 stacked_preview.write(

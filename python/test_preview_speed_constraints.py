@@ -551,12 +551,15 @@ class PreviewSpeedConstraintsTest(unittest.TestCase):
                     self.assertTrue(np.isin(filler, pool).all())
                     self.assertGreater(len(np.unique(filler)), 1)
 
-    def test_justified_dng_and_jpeg_widths_match_the_binned_stack(self):
+    def test_stack_chronology_and_full_resolution_numbering(self):
         with TemporaryDirectory() as directory:
             capture = Path(directory) / "2026-07-30-00-00-00"
             output = Path(directory) / "output"
             capture.mkdir()
-            raw = np.arange(128, dtype="<u2")[:, None] + np.arange(4096, dtype="<u2")
+            # Capture time is visible as a brightness ramp in every output.
+            raw = 256 * np.arange(128, dtype="<u2")[:, None] + np.arange(
+                4096, dtype="<u2"
+            )
             raw.tofile(capture / "im000000.bin")
             (capture / preview.SPEED_CONSTRAINTS_JSON).write_text(json.dumps({
                 "schema_version": 1,
@@ -564,9 +567,14 @@ class PreviewSpeedConstraintsTest(unittest.TestCase):
                 "cut_positions": [{"id": str(x), "x": x} for x in (2, 21, 36, 54, 60)],
             }))
 
-            for direction, padding in ((1, "random"), (-1, "original")):
+            for direction, flip, justify, padding in (
+                (1, False, True, "random"),
+                (1, True, False, "random"),
+                (-1, False, False, "random"),
+                (-1, True, True, "original"),
+            ):
                 with (
-                    self.subTest(direction=direction, padding=padding),
+                    self.subTest(direction=direction, flip=flip, justify=justify),
                     patch.object(preview, "ENABLE_COLUMN_JITTER_CORRECTION", False),
                     patch.object(preview, "windowed_cross_correlation", return_value=(
                         np.linspace(3, 59, 5), np.full(5, direction), np.ones(5),
@@ -574,20 +582,36 @@ class PreviewSpeedConstraintsTest(unittest.TestCase):
                     patch.object(preview, "estimate_skew_hough", return_value=0.0),
                 ):
                     count = preview.process_preview(
-                        capture, output_dir=output, justify=True, justify_padding=padding,
-                        flip_output_180=(direction < 0), vibration_compensation=False,
+                        capture, output_dir=output, justify=justify, justify_padding=padding,
+                        flip_output_180=flip, vibration_compensation=False,
                         show_progress=False,
                     )
                     chunks = sorted(output.glob("*.dng"))
                     self.assertEqual(len(chunks), 4)
-                    self.assertEqual(count, 4 * 17)
+                    file_widths = []
+                    jpeg_levels = []
+                    dng_levels = []
                     for path in chunks:
                         with tifffile.TiffFile(path) as dng:
-                            self.assertEqual(dng.pages[0].shape, (4096, 17, 3))
+                            height, width, channels = dng.pages[0].shape
+                            self.assertEqual((height, channels), (4096, 3))
+                            dng_levels.append(dng.asarray()[:, width // 2].mean())
                         with Image.open(path.with_suffix(".jpg")) as jpeg:
-                            self.assertEqual(jpeg.size, (17, 4096))
+                            self.assertEqual(jpeg.size, (width, height))
+                            file_widths.append(width)
+                            jpeg_levels.append(np.asarray(jpeg)[:, width // 2].mean())
+                    if justify:
+                        self.assertEqual(file_widths, [17] * 4)
+                    else:
+                        self.assertGreater(len(set(file_widths)), 1)
+                    self.assertEqual(count, sum(file_widths))
+                    file_direction = -direction if flip else direction
+                    for levels in (dng_levels, jpeg_levels):
+                        self.assertTrue(np.all(file_direction * np.diff(levels) > 0))
                     with Image.open(output / f"{capture.name}_stack.jpg") as stack:
-                        self.assertEqual(stack.size, (8, 4 * 2048))
+                        self.assertEqual(stack.size, (max(file_widths) // 2, 4 * 2048))
+                        centers = np.asarray(stack)[:, stack.width // 2].reshape(4, 2048, 3)
+                        self.assertTrue(np.all(np.diff(centers.mean(axis=(1, 2))) > 0))
 
     def test_padded_cut_ranges_center_neighbor_content(self):
         ranges, width = preview.build_padded_cut_output_ranges(

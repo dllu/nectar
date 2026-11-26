@@ -89,6 +89,9 @@ annotation stride, and the scale prior is 4%. Each interior slice gets a
 constant offset to its log-speed spline during raw sampling. The first and
 last slices keep their native scale and fill any missing width with randomly
 sampled columns from their outside edges.
+For a print layout, choose cuts that give the middle slices similar native
+lengths and leave both end slices shorter. This keeps horizontal scaling
+small and lets the captured background fill the ends.
 
 With `--justify --justify-padding original`, the end slices use contiguous
 background from outside the annotated cuts. The renderer extends the speed
@@ -102,6 +105,9 @@ objects you want to omit.
 Output orientation follows the camera mounting date: captures before 2026 are
 not rotated, while captures from 2026 onward are rotated 180 degrees. Override
 the automatic choice with `--flip-output-180` or `--no-flip-output-180`.
+The half-resolution `_stack.jpg` places the earliest part of the capture on
+top. Full-resolution JPEGs and DNGs are numbered from left to right so they
+can be concatenated horizontally in filename order.
 
 Each capture is rendered into a temporary staging directory. Only after the
 complete DNG/JPEG set and stack preview succeed does `preview.py` replace that
