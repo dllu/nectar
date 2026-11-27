@@ -171,11 +171,11 @@ class MemoryEfficientHelpersTest(unittest.TestCase):
                 for channel in range(3)
             ],
             axis=2,
-        ).astype(np.uint8)
+        )
 
         result = preview.bin2to1_rgb_u8(image)
 
-        np.testing.assert_array_equal(result, expected)
+        np.testing.assert_array_equal(result, np.rint(expected).astype(np.uint8))
 
     def test_color_transform_matches_explicit_white_balanced_transform(self):
         rng = np.random.default_rng(8)

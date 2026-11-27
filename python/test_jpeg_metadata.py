@@ -4,7 +4,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import numpy as np
-from PIL import ExifTags, Image
+from PIL import ExifTags, Image, JpegImagePlugin
 
 import preview
 
@@ -26,6 +26,7 @@ class JpegMetadataTest(unittest.TestCase):
 
             for path in paths:
                 with self.subTest(path=path), Image.open(path) as jpeg:
+                    self.assertEqual(JpegImagePlugin.get_sampling(jpeg), 0)  # 4:4:4
                     exif = jpeg.getexif()
                     exif_ifd = exif.get_ifd(ExifTags.IFD.Exif)
                     self.assertEqual(exif[ExifTags.Base.Make], preview.CAMERA_MAKE)
@@ -34,6 +35,7 @@ class JpegMetadataTest(unittest.TestCase):
                         preview.CAMERA_MODEL_NAME,
                     )
                     self.assertEqual(exif[ExifTags.Base.Orientation], 1)
+                    self.assertEqual(exif_ifd[ExifTags.Base.ColorSpace], 1)
                     self.assertEqual(
                         exif[ExifTags.Base.Software],
                         "nectar-preview",

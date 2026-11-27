@@ -1,0 +1,16 @@
+{
+  "capture_settings": {"cds_gain": 1, "analog_gain": 0, "shutterspeed": 1240},
+  "dark_rgb": [3634, 2956, 1359],
+  "light_rgb": [31375, 28010, 20371],
+  "shadow_chroma_threshold": 3000,
+  "source": {
+    "subject": "Lower steam against UP 4014 running gear.",
+    "segment_frames": ["im000330.bin", "im000640.bin"],
+    "segment_cut_bayer_columns": [4000, 75616],
+    "segment_dng_dimensions": [7048, 4096],
+    "segment_roi_xyxy": [250, 2150, 2250, 2900],
+    "sample_stride_xy": [2, 2],
+    "green_intervals_half_open": [[2200, 3500], [26000, 30000]],
+    "statistic": "Median native RGB of unclipped steam samples in each brightness interval."
+  }
+}

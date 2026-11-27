@@ -1,0 +1,15 @@
+{
+  "capture_settings": {"cds_gain": 1, "analog_gain": 3, "shutterspeed": 1252},
+  "as_shot_neutral": [1, 0.927789, 0.712038],
+  "dark_rgb": [2301, 1957, 469],
+  "shadow_chroma_threshold": 3000,
+  "shadow_fade_end": 14000,
+  "source": {
+    "subject": "Silver passenger-car trucks. The Big Boy driving wheel was held out.",
+    "dng": "2026-11-21-18-11-33_NECTA0003_9133614f7162db65c62e19198b08d00661e111d6.dng",
+    "roi_xyxy": [808, 2764, 9164, 3123],
+    "sample_stride_xy": [3, 2],
+    "green_interval_half_open": [1600, 2400],
+    "statistic": "Median native RGB of 26377 samples with all channels above zero. White balance is the original DNG AsShotNeutral."
+  }
+}

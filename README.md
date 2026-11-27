@@ -117,6 +117,79 @@ renamed for the new DNG hash; if several sidecars exist for one chunk, the most
 recently modified one is used. Choose a separate `--output-dir` when an older
 render needs to be preserved.
 
+## Color and linear DNGs
+
+The DNG stores three reconstructed 16-bit camera channels. White balance is
+editable through `AsShotNeutral`. The D65 color matrix includes the sensor's
+unequal daylight response, while the forward matrix takes white-balanced
+camera RGB to D50 XYZ. The JPEG uses the DNG's 16-bit samples and camera
+profile, followed by display exposure, sharpening and sRGB encoding. The
+individual JPEGs and stack retain full-resolution chroma (4:4:4, quality 99).
+To derive the nominal profile,
+we combined the published sensor quantum efficiency and solid RGB filter
+transmission curves at 5 nm intervals from 400 to 700 nm. Under D65 this
+predicts a native white of `(1.16927, 1, 0.72297)`. We fitted the matrix to
+the average reflectances of 24 ColorChecker patches, using the CIE 1931 2°
+observer and constraining balanced white to stay neutral. Lens transmission
+and the individual camera can differ from this model. [Alkeria NECTA User Guide, figures 3.2 and 3.3](https://www.argocorp.com/linescancamera/Alkeria/common/download/NECTA/document/DOC-NECTA-User_Guide-v2.4.pdf)
+and [BabelColor spectral data](https://babelcolor.com/colorchecker-2.htm).
+
+Green reconstruction aligns the two phases in capture time and sensor height.
+A signal-weighted mean keeps the surviving measurement when one phase clips
+to zero. A five-column median estimates the local difference in phase response
+separately at each sensor height. Native-row detail that varies within that
+window contributes additional contrast, weighted by the camera pitch at the
+exposures that supplied it.
+
+If spot-balancing a white surface leaves a darker neutral surface tinted, place
+`color_reference.json` beside that capture's raw frames. Measure two unclipped
+neutral areas under the same illumination in **reconstructed camera counts**
+from an initial DNG. The following values are from dim and bright lower steam
+in the November 22 Big Boy capture.
+
+```json
+{
+  "dark_rgb": [3634, 2956, 1359],
+  "light_rgb": [31375, 28010, 20371],
+  "shadow_chroma_threshold": 3000
+}
+```
+
+The difference between the patches sets white balance. Their relative offsets
+correct level-dependent color in both exports. Where a channel has clipped to
+black, the correction is bounded by the signal in the other channels. Color
+in that interval is an estimate. The optional `shadow_chroma_threshold` tapers
+saturation where even the strongest white-balanced channel falls below the
+threshold. For this capture, 3,000 counts is about twice the largest fitted
+channel offset in green-equivalent units. Omitting the field preserves full
+shadow saturation. Captures without a reference use the automatic white balance
+and their original black point.
+
+When the highlights already have a good white balance, a shadow reference can
+retain it. Use the initial DNG's `AsShotNeutral`, a measured dark neutral, and
+`shadow_fade_end` in green-equivalent 16-bit camera counts. The offset has full
+strength at the dark patch and fades smoothly to zero at the endpoint. A pixel
+above that level in any balanced channel retains all three original counts.
+The preview also retains the original exposure metering. The optional chroma
+taper is useful when a channel clips to zero in a dark neutral.
+
+The [measured capture references](python/color_references/) record the source
+DNG, patch coordinates, and gain and shutter settings. The preview uses a
+bundled reference when the capture directory name and recorded settings match.
+A local `color_reference.json` takes precedence. The November 21 reference
+uses the silver trucks of a passenger car, with a chroma taper for the
+black-clipped blue channel. The June 16 reference uses a shaded Nankai bogie.
+Its blue channel retains detail, so it uses only the relative offsets.
+
+To reproduce the four-row layout from the Nectar repository, run
+
+```sh
+capture=/mnt/dataz/pictures/linescan/2026-11-22-17-17-19
+uv run python python/preview.py "$capture" \
+  --speed-constraints-file "$capture/four-row-print/speed_constraints.json" \
+  --justify --justify-padding original --output-dir "$capture/four-row-print-color"
+```
+
 ## Camera vibration compensation
 
 `preview.py` corrects pitch vibration by default. It tracks stationary ground

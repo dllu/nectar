@@ -38,8 +38,12 @@ import tifffile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from image_processing import (
+    CAMERA_D65_NEUTRAL,
     COLOR_CORRECTION,
-    RAW_COLOR_CORRECTION,
+    GREEN_DETAIL_RADIUS,
+    NeutralReference,
+    fuse_aligned_greens,
+    green_signal_mean,
     apply_color_transform,
 )
 from raw_io import RawFrameStore, annotation_column_stride, load_raw_frame
@@ -174,7 +178,7 @@ LINEAR_SRGB_TO_XYZ_D50 = np.array(
     dtype=np.float64,
 )
 
-DNG_COLOR_MATRIX_1 = np.linalg.solve(
+DNG_COLOR_MATRIX_1 = CAMERA_D65_NEUTRAL[:, None] * np.linalg.solve(
     COLOR_CORRECTION.astype(np.float64),
     XYZ_D65_TO_LINEAR_SRGB,
 )
@@ -183,11 +187,14 @@ DNG_FORWARD_MATRIX_1 = LINEAR_SRGB_TO_XYZ_D50 @ COLOR_CORRECTION.astype(np.float
 
 def _rational_values(
     values: np.ndarray, *, signed: bool, denominator: int = 1_000_000
-) -> tuple[tuple[int, int], ...]:
+) -> list[int]:
     values = np.asarray(values, dtype=np.float64).ravel()
     if not signed and np.any(values < 0):
         raise ValueError("unsigned rational values must be non-negative")
-    return tuple((int(round(value * denominator)), denominator) for value in values)
+    pairs = []
+    for value in values:
+        pairs.extend((round(value * denominator), denominator))
+    return pairs
 
 
 def parse_capture_datetime(capture_dir: Path) -> datetime | None:
@@ -212,25 +219,29 @@ def resolve_flip_output_180(
     return captured_at is not None and captured_at.year >= 2026
 
 
-def parse_exposure_time(capture_dir: Path) -> tuple[int, int] | None:
+def read_capture_settings(capture_dir: Path) -> dict[str, str]:
     try:
         settings = (capture_dir / "capture_settings.txt").read_text(
             encoding="utf-8"
         )
     except (OSError, UnicodeError):
-        return None
-
+        return {}
+    result = {}
     for line in settings.splitlines():
         key, separator, value = line.partition("=")
-        if separator and key.strip() == "shutterspeed":
-            try:
-                shutter_ticks = int(value.strip())
-            except ValueError:
-                return None
-            if not 0 <= shutter_ticks <= np.iinfo(np.uint32).max:
-                return None
-            return shutter_ticks, SHUTTER_TICKS_PER_SECOND
-    return None
+        if separator:
+            result.setdefault(key.strip(), value.strip())
+    return result
+
+
+def parse_exposure_time(capture_dir: Path) -> tuple[int, int] | None:
+    try:
+        ticks = int(read_capture_settings(capture_dir)["shutterspeed"])
+    except (KeyError, ValueError):
+        return None
+    if not 0 <= ticks <= np.iinfo(np.uint32).max:
+        return None
+    return ticks, SHUTTER_TICKS_PER_SECOND
 
 
 def build_jpeg_exif(
@@ -244,6 +255,7 @@ def build_jpeg_exif(
     exif[ExifTags.Base.Software] = "nectar-preview"
 
     exif_ifd = exif.get_ifd(ExifTags.IFD.Exif)
+    exif_ifd[ExifTags.Base.ColorSpace] = 1  # sRGB
     if captured_at is not None:
         captured_at_text = captured_at.strftime(DNG_DATETIME_FORMAT)
         exif[ExifTags.Base.DateTime] = captured_at_text
@@ -266,6 +278,8 @@ def write_jpeg(path: Path, bgr: np.ndarray, exif: np.ndarray) -> None:
         bgr,
         [cv2.IMAGE_METADATA_EXIF],
         [exif],
+        [cv2.IMWRITE_JPEG_QUALITY, 99,
+         cv2.IMWRITE_JPEG_SAMPLING_FACTOR, cv2.IMWRITE_JPEG_SAMPLING_FACTOR_444],
     )
     if not written:
         raise OSError(f"failed to write JPEG: {path}")
@@ -403,6 +417,14 @@ class DiskBackedStackPreview:
             self._file = None
 
 
+def camera_rgb_u16(rgb: np.ndarray) -> np.ndarray:
+    if rgb.dtype == np.uint16:
+        return np.ascontiguousarray(rgb)
+    linear = np.empty(rgb.shape, dtype=np.uint16)
+    np.clip(rgb, 0, 65535, out=linear, casting="unsafe")
+    return linear
+
+
 def write_linear_dng(
     path: Path,
     raw_rgb: np.ndarray,
@@ -416,19 +438,11 @@ def write_linear_dng(
             "tifffile is required for DNG export. Install it via `uv pip install tifffile`."
         )
 
-    flipped = raw_rgb[::-1, :, :]
-    if flipped.dtype == np.uint16:
-        linear = np.ascontiguousarray(flipped)
-    else:
-        # Writing directly into uint16 avoids a full-size clipped float32
-        # temporary alongside the source and destination images.
-        linear = np.empty(flipped.shape, dtype=np.uint16)
-        np.clip(flipped, 0, 65535, out=linear, casting="unsafe")
+    linear = camera_rgb_u16(raw_rgb[::-1])
     wb = np.asarray(white_balance, dtype=np.float64)
-    safe_wb = np.clip(wb, 1e-6, None)
-    as_shot_neutral = 1.0 / safe_wb
-    if as_shot_neutral[1] != 0:
-        as_shot_neutral /= as_shot_neutral[1]
+    if wb.shape != (3,) or not np.all(np.isfinite(wb) & (wb > 0)):
+        raise ValueError("white balance must contain three finite positive gains")
+    as_shot_neutral = wb.min() / wb
 
     extratags = [
         (271, "s", len(CAMERA_MAKE) + 1, CAMERA_MAKE),  # Make
@@ -474,18 +488,24 @@ def write_linear_dng(
             )
         )  # DateTimeOriginal
     if exposure_time is not None:
-        extratags.append((33434, "2I", 1, (exposure_time,)))  # ExposureTime
+        extratags.append((33434, "2I", 1, exposure_time))  # ExposureTime
 
     tifffile.imwrite(
         path,
         linear,
-        photometric=tifffile.PHOTOMETRIC.LINEAR_RAW,
+        # RGB describes the three contiguous color samples to tifffile.
+        # Older supported versions add two ExtraSamples to LinearRaw.
+        photometric="rgb",
         planarconfig="contig",
         metadata=None,
         software="nectar-preview",
         datetime=captured_at_text,
         extratags=extratags,
     )
+    with tifffile.TiffFile(path, mode="r+") as dng:
+        dng.pages[0].tags["PhotometricInterpretation"].overwrite(
+            tifffile.PHOTOMETRIC.LINEAR_RAW
+        )
 
 
 def sha1sum(path: Path, chunk_size: int = 1024 * 1024) -> str:
@@ -871,11 +891,13 @@ def bayer_channel_frame_geometry(
 def load_manual_speed_constraints(
     capture_dir: Path,
     bins: list[Path],
+    path: Path | None = None,
 ) -> ManualSpeedConstraints | None:
     """Load and validate the GUI's speed-constraint document, when present."""
-    path = Path(capture_dir) / SPEED_CONSTRAINTS_JSON
-    if not path.exists():
-        return None
+    if path is None:
+        path = Path(capture_dir) / SPEED_CONSTRAINTS_JSON
+        if not path.exists():
+            return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -3073,12 +3095,16 @@ def bin2to1_rgb_u8(data: np.ndarray) -> np.ndarray:
     if height == 0 or width == 0:
         return np.empty((height // 2, width // 2, 3), dtype=np.uint8)
 
-    summed = data[:height:2, :width:2].astype(np.uint16)
-    summed += data[1:height:2, :width:2]
-    summed += data[:height:2, 1:width:2]
-    summed += data[1:height:2, 1:width:2]
-    np.right_shift(summed, 2, out=summed)
-    return summed.astype(np.uint8)
+    output = np.empty((height // 2, width // 2, 3), dtype=np.uint8)
+    for start in range(0, height, 128):
+        stop = min(start + 128, height)
+        block = data[start:stop, :width]
+        summed = block[::2, ::2].astype(np.uint16)
+        summed += block[1::2, ::2]
+        summed += block[::2, 1::2]
+        summed += block[1::2, 1::2]
+        output[start // 2:stop // 2] = np.rint(summed * np.float32(0.25))
+    return output
 
 
 def moving_region_block_scores(
@@ -3153,6 +3179,50 @@ def find_moving_region(green, stride, max_green, padding_columns, *, show_progre
         stride *= 2
 
 
+def capture_neutral_reference(capture_dir: Path) -> NeutralReference | None:
+    path = capture_dir / "color_reference.json"
+    local_reference = path.exists()
+    if not local_reference:
+        path = Path(__file__).with_name("color_references") / f"{capture_dir.name}.json"
+        if not path.exists():
+            return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if "capture_settings" in data:
+            settings = read_capture_settings(capture_dir)
+            expected = data["capture_settings"]
+            if not isinstance(expected, dict):
+                raise ValueError("capture_settings must contain named camera settings")
+            if any(settings.get(key) != str(value) for key, value in expected.items()):
+                if local_reference:
+                    raise ValueError("reference gain or exposure differs from capture_settings.txt")
+                return None
+        if "as_shot_neutral" in data:
+            if "light_rgb" in data:
+                raise ValueError("choose either as_shot_neutral or light_rgb")
+            return NeutralReference.from_shadow(
+                data["dark_rgb"],
+                data["as_shot_neutral"],
+                shadow_fade_end=data["shadow_fade_end"],
+                shadow_chroma_threshold=data.get("shadow_chroma_threshold", 0),
+            )
+        if "shadow_fade_end" in data:
+            raise ValueError("shadow_fade_end requires as_shot_neutral")
+        return NeutralReference.from_patches(
+            data["dark_rgb"], data["light_rgb"],
+            shadow_chroma_threshold=data.get("shadow_chroma_threshold", 0),
+        )
+    except (TypeError, KeyError, ValueError) as error:
+        raise ValueError(f"invalid color reference in {path}: {error}") from error
+
+
+def binned_camera_rgb(raw):
+    raw = np.asarray(raw, dtype=np.float32)
+    red, odd, even, blue = (bin2to1(plane) for plane in raw_channels(raw))
+    green, _ = green_signal_mean(odd, even)
+    return np.stack((red, green, blue), axis=-1)
+
+
 def estimate_white_balance(
     bin_paths,
     max_sample_columns: int = WHITE_BALANCE_SAMPLE_COLUMNS,
@@ -3195,14 +3265,9 @@ def estimate_white_balance(
             columns=display_columns * 2,
             output_dtype=np.float32,
         )
-        raw_red = bin2to1(dat1_reshaped[0::2, 1::2])
-        raw_green = bin2to1(dat1_reshaped[1::2, 1::2])
-        raw_blue = bin2to1(dat1_reshaped[1::2, 0::2])
-
-        channel_sum[0] += raw_red.sum()
-        channel_sum[1] += raw_green.sum()
-        channel_sum[2] += raw_blue.sum()
-        total_pixels += raw_red.size
+        rgb = binned_camera_rgb(dat1_reshaped)
+        channel_sum += rgb.sum(axis=(0, 1), dtype=np.float64)
+        total_pixels += rgb.shape[0] * rgb.shape[1]
 
     means = channel_sum / max(total_pixels, 1)
     mean_of_means = np.mean(means)
@@ -3231,7 +3296,8 @@ def get_percentile(hist, bin_edges, total, percent):
 
 
 def autoexposure(
-    selected_bins, white_balance, *, show_progress: bool = True, read_frame=load_raw_frame
+    selected_bins, white_balance, *, neutral_reference: NeutralReference | None = None,
+    show_progress: bool = True, read_frame=load_raw_frame,
 ):
     num_bins = 65536
     bin_edges = np.arange(0, num_bins + 1, dtype=np.float64)
@@ -3249,16 +3315,11 @@ def autoexposure(
             rows=4096,
             output_dtype=np.float32,
         )
-        raw_red = dat1_reshaped[0::2, 1::2]
-        raw_red = bin2to1(raw_red)
-
-        raw_blue = dat1_reshaped[1::2, 0::2]
-        raw_blue = bin2to1(raw_blue)
-
-        raw_green = dat1_reshaped[1::2, 1::2]
-        raw_green = bin2to1(raw_green)
-
-        stacked = np.stack((raw_red, raw_green, raw_blue), axis=2)
+        stacked = binned_camera_rgb(dat1_reshaped)
+        # A shadow-only correction retains the existing display black and white
+        # points as well as the camera's established highlight white balance.
+        if neutral_reference is not None and neutral_reference.shadow_range is None:
+            neutral_reference.correct(stacked)
         rgb = apply_color_transform(stacked, white_balance)
         # Unit-width bins use floor, with 65536 included in the last bin.
         np.clip(rgb, 0, num_bins - 1, out=rgb)
@@ -4956,6 +5017,7 @@ def sample_motion_corrected_chunks(
     max_pix: int = 16384,
     jitter_models=None,
     jitter_protect_scene: bool = True,
+    fuse_green: bool = False,
     pitch_offsets=None,
     step_scales=None,
     chunk_ranges=None,
@@ -4963,6 +5025,11 @@ def sample_motion_corrected_chunks(
     pad_edge=pad_random_edge_columns,
     show_progress: bool = True,
 ):
+    """Sample aligned camera RGB on the output grid.
+
+    Print rendering enables green fusion. The arithmetic mean also supports
+    comparisons with the green-only sampler used for geometric analysis.
+    """
     if stride_x < 1 or stride_y < 1 or max_pix < 1:
         raise ValueError("sampling strides and chunk size must be positive")
     indices = list(range(0, len(sample_positions), stride_x))
@@ -5020,74 +5087,94 @@ def sample_motion_corrected_chunks(
         pitch_offsets=pitch_offsets,
     )
 
+    # A whole sensor-row shift swaps the native and interpolated greens.
+    pitch_phase = None
+    if fuse_green and pitch_offsets is not None:
+        pitch_phase = 1 - 2 * np.abs((pitch_offsets + 1) % 2 - 1)
+
+    def sample_lines(sample_idx):
+        xi = sample_positions[sample_idx]
+        wi = widths[sample_idx]
+        skew_scaled = skew * step_scales[sample_idx]
+
+        centers = xi + skew_scaled * row_offsets
+        window_half = int(math.ceil(wi))
+        offsets = np.arange(-window_half, window_half + 1, dtype=np.int32)
+        base = np.floor(centers).astype(np.int32)
+        window_indices = base[:, None] + offsets[None, :]
+        valid = (window_indices >= 0) & (window_indices < green1.width)
+        indices_clipped = np.clip(window_indices, 0, green1.width - 1)
+
+        start_col = int(indices_clipped.min())
+        end_col = int(indices_clipped.max()) + 1
+
+        planes, block_start = blocks.read(start_col, end_col)
+        indices_local = indices_clipped - block_start
+
+        dist = window_indices.astype(np.float32) - centers[:, None].astype(
+            np.float32
+        )
+        weights = np.zeros_like(dist, dtype=np.float32)
+        mask = (np.abs(dist) < wi) & valid
+        weights[mask] = 1 + np.cos(np.pi * dist[mask] / wi)
+        sum_weight = np.sum(weights, axis=1)
+        sum_weight[sum_weight == 0] = 1.0
+
+        lines = []
+        for plane, phase in zip(planes, row_phases):
+            samples = plane[row_idx, indices_local]
+            line = np.sum(samples * weights, axis=1) / sum_weight
+            if pitch_offsets is None:
+                line = interpolate_upsample(line, phase)
+            lines.append(line)
+        phase_weight = 1.0
+        if pitch_phase is not None:
+            phase_weight = np.sum(pitch_phase[indices_clipped] * weights, axis=1) / sum_weight
+        return (*lines, phase_weight)
+
     for chunk_i, batch_indices in enumerate(batches):
-        pad_left = batch_indices[0] > 0
-        if pad_left:
-            previous_index = batch_indices[0] - (
-                1 if chunk_ranges is not None else stride_x
-            )
-            use_indices = [previous_index] + batch_indices
-        else:
-            use_indices = list(batch_indices)
-
-        out_width = len(use_indices)
-        raw_sampled = np.zeros((2 * green1.height, out_width, 3), dtype=np.float32)
-
-        for j, sample_idx in progress(
-            enumerate(use_indices),
-            total=len(use_indices),
-            desc="sampling chunk",
-            show=show_progress,
+        raw_sampled = np.empty((out_height, len(batch_indices), 3), dtype=np.float32)
+        # Read neighboring output columns across tile and print-cut boundaries.
+        # Only these small tiles need two aligned, full-resolution green planes.
+        radius = GREEN_DETAIL_RADIUS if fuse_green else 0
+        for tile in progress(
+            range(0, len(batch_indices), 256), desc="sampling chunk", show=show_progress
         ):
-            xi = sample_positions[sample_idx]
-            wi = widths[sample_idx]
-            skew_scaled = skew * step_scales[sample_idx]
+            count = min(256, len(batch_indices) - tile)
+            first = batch_indices[tile]
+            last = batch_indices[tile + count - 1]
+            left = max(0, first - radius * stride_x)
+            right = min(indices[-1], last + radius * stride_x)
+            positions = range(left, right + 1, stride_x)
+            greens = np.empty((2, out_height, len(positions)), dtype=np.float32)
+            phase_weights = None
+            if pitch_phase is not None:
+                phase_weights = np.empty_like(greens[0])
+            previous = None
+            if left >= stride_x:
+                previous = sample_lines(left - stride_x)
+            for col, idx in enumerate(positions):
+                current = sample_lines(idx)
+                if previous is None:
+                    previous = current
+                # The odd-time red/green exposure supplies the next spatial
+                # column. Align the planes before estimating their responses.
+                greens[0, :, col] = previous[1]
+                greens[1, :, col] = current[2]
+                if phase_weights is not None:
+                    phase_weights[:, col] = 0.5 * (previous[4] + current[4])
+                if first <= idx <= last:
+                    dst = tile + (idx - first) // stride_x
+                    raw_sampled[:, dst, 0] = previous[0]
+                    raw_sampled[:, dst, 2] = current[3]
+                previous = current
 
-            centers = xi + skew_scaled * row_offsets
-            window_half = int(math.ceil(wi))
-            offsets = np.arange(-window_half, window_half + 1, dtype=np.int32)
-            base = np.floor(centers).astype(np.int32)
-            window_indices = base[:, None] + offsets[None, :]
-            valid = (window_indices >= 0) & (window_indices < green1.width)
-            indices_clipped = np.clip(window_indices, 0, green1.width - 1)
-
-            start_col = int(indices_clipped.min())
-            end_col = int(indices_clipped.max()) + 1
-            if end_col <= start_col:
-                continue
-
-            planes, block_start = blocks.read(start_col, end_col)
-            indices_local = indices_clipped - block_start
-
-            dist = window_indices.astype(np.float32) - centers[:, None].astype(
-                np.float32
-            )
-            weights = np.zeros_like(dist, dtype=np.float32)
-            mask = (np.abs(dist) < wi) & valid
-            weights[mask] = 1 + np.cos(np.pi * dist[mask] / wi)
-            sum_weight = np.sum(weights, axis=1)
-            sum_weight[sum_weight == 0] = 1.0
-
-            lines = []
-            for plane, phase in zip(planes, row_phases):
-                samples = plane[row_idx, indices_local]
-                line = np.sum(samples * weights, axis=1) / sum_weight
-                if pitch_offsets is None:
-                    line = interpolate_upsample(line, phase)
-                lines.append(line)
-            r_interp, g1_interp, g2_interp, b_interp = lines
-
-            if j == 0:
-                raw_sampled[:, 0, 0] = r_interp
-                raw_sampled[:, 0, 1] += g1_interp * 0.5
-            if j < len(use_indices) - 1:
-                raw_sampled[:, j + 1, 0] = r_interp
-                raw_sampled[:, j + 1, 1] += g1_interp * 0.5
-            raw_sampled[:, j, 1] += g2_interp * 0.5
-            raw_sampled[:, j, 2] = b_interp
-
-        if pad_left:
-            raw_sampled = raw_sampled[:, 1:, :]
+            if fuse_green:
+                green = fuse_aligned_greens(*greens, phase_weights=phase_weights)
+            else:
+                green = 0.5 * (greens[0] + greens[1])
+            skip = (first - left) // stride_x
+            raw_sampled[:, tile:tile + count, 1] = green[:, skip:skip + count]
         if stride_y > 1:
             raw_sampled = raw_sampled[::stride_y, :, :]
         if outer_padding_width is not None:
@@ -5157,6 +5244,7 @@ def pad_with_capture_background(
                 step_scales=steps[kept],
                 pitch_offsets=pitch_offsets,
                 chunk_ranges=[(first, len(positions))],
+                fuse_green=True,
                 show_progress=show_progress,
             )
         )
@@ -5508,22 +5596,24 @@ def render_preview_bgr(
     *,
     flip_output_180: bool,
 ) -> np.ndarray:
-    rgb = apply_color_transform(raw_sampled, white_balance)
-    np.clip(rgb, 0, 65536, out=rgb)
-    sharpen(rgb, in_place=True)
-    rgb -= p2
-    rgb += 0.1
-    rgb /= p98
-    np.clip(rgb, 0, 1, out=rgb)
-    rgb = rgb[::-1, :, :]
-    np.sqrt(rgb, out=rgb)
-    rgb *= 255
-
-    bgr = rgb[:, :, ::-1].astype(np.uint8)
-    del rgb
-    if flip_output_180:
-        bgr = np.ascontiguousarray(bgr[::-1, ::-1, :])
-    return bgr
+    height = raw_sampled.shape[0]
+    bgr = np.empty(raw_sampled.shape, dtype=np.uint8)
+    # Include the radius of sharpen's widest Gaussian (sigma=2, float32).
+    # This bounds working memory for the four-row print's 38k-wide rows.
+    for start in range(0, height, 64):
+        stop = min(height, start + 64)
+        top, bottom = max(0, start - 8), min(height, stop + 8)
+        rgb = apply_color_transform(raw_sampled[top:bottom], white_balance)
+        sharpen(rgb, in_place=True)
+        rgb = rgb[start - top:stop - top]
+        rgb -= p2
+        rgb /= max(p98 - p2, 1.0)
+        np.clip(rgb, 0, 1, out=rgb)
+        encoded = np.where(
+            rgb <= 0.0031308, 12.92 * rgb, 1.055 * rgb ** (1 / 2.4) - 0.055
+        )
+        bgr[start:stop] = np.rint(255 * encoded[..., ::-1])
+    return np.ascontiguousarray(bgr[:, ::-1] if flip_output_180 else bgr[::-1])
 
 
 def render_output_chunk(
@@ -5539,30 +5629,19 @@ def render_output_chunk(
     flip_output_180: bool,
 ) -> np.ndarray:
     """Write one full-resolution chunk and return its compact stack preview."""
-    dng_sampled = raw_sampled
-    if flip_output_180:
-        dng_sampled = np.ascontiguousarray(dng_sampled[::-1, ::-1, :])
-    _dng_path, dng_sha1 = write_hashed_linear_dng(
+    # Share exactly the native camera counts and orientation of the DNG with
+    # the JPEG. This also allows display-only iterations from a finished DNG.
+    camera = camera_rgb_u16(raw_sampled[:, ::-1] if flip_output_180 else raw_sampled[::-1])
+    dng_path, _ = write_hashed_linear_dng(
         output_dir,
         name_prefix,
-        dng_sampled,
+        camera[::-1],
         white_balance,
         capture_dir=capture_dir,
     )
-    if dng_sampled is not raw_sampled:
-        del dng_sampled
-
-    out_name = f"{name_prefix}_{dng_sha1}"
-    rgb_u8 = render_preview_bgr(
-        raw_sampled, white_balance, p2, p98, flip_output_180=flip_output_180
-    )
-    try:
-        write_jpeg(output_dir / f"{out_name}.jpg", rgb_u8, jpeg_exif)
-    except Exception as e:
-        print(f'oh no when writing jpeg {e}')
-        raise
-
-    return bin2to1_rgb_u8(rgb_u8)
+    bgr = render_preview_bgr(camera[::-1], white_balance, p2, p98, flip_output_180=False)
+    write_jpeg(dng_path.with_suffix(".jpg"), bgr, jpeg_exif)
+    return bin2to1_rgb_u8(bgr)
 
 
 def _scan_frame_levels(raw, downsample_steps, measure_jitter):
@@ -5589,6 +5668,7 @@ def process_preview(
     output_dir: Path = DEFAULT_OUTPUT_DIR,
     raw_cache_bytes: int | None = None,
     use_speed_constraints: bool = True,
+    speed_constraints_file: Path | None = None,
     equal_length_chunks: bool = False,
     pad_output_to_equal_widths: bool = False,
     justify: bool = False,
@@ -5618,7 +5698,8 @@ def process_preview(
     frame_starts, frame_widths = bayer_channel_frame_geometry(bins)
     capture_width = int(frame_starts[-1])
     constraints = (
-        load_manual_speed_constraints(g, bins) if use_speed_constraints else None
+        load_manual_speed_constraints(g, bins, speed_constraints_file)
+        if use_speed_constraints else None
     )
     if equal_length_chunks and pad_output_to_equal_widths:
         raise ValueError(
@@ -5741,17 +5822,20 @@ def process_preview(
     if justify_padding != "original":
         store.retain(selected_bins)
 
-    white_balance = estimate_white_balance(
-        selected_bins,
-        show_progress=show_progress,
-        read_frame=store.read,
-    )
+    neutral_reference = capture_neutral_reference(g)
+    if neutral_reference is None:
+        white_balance = estimate_white_balance(
+            selected_bins, show_progress=show_progress, read_frame=store.read
+        )
+    else:
+        white_balance = 1.0 / neutral_reference.neutral
     if show_progress:
         print("white balance", white_balance)
 
     p2, p98 = autoexposure(
         selected_bins,
         white_balance,
+        neutral_reference=neutral_reference,
         show_progress=show_progress,
         read_frame=store.read,
     )
@@ -6137,6 +6221,7 @@ def process_preview(
                     step_scales=step_scales,
                     chunk_ranges=chunk_ranges,
                     outer_padding_width=padded_output_width,
+                    fuse_green=True,
                     pad_edge=pad_edge,
                     show_progress=show_progress,
                 ):
@@ -6146,6 +6231,8 @@ def process_preview(
                         else chunk_i
                     )
                     name_prefix = f"{capture_timestamp}_NECTA{output_chunk_i:04d}"
+                    if neutral_reference is not None:
+                        neutral_reference.correct(raw_sampled)
                     binned = render_output_chunk(
                         raw_sampled,
                         output_dir=staging_dir,
@@ -6236,6 +6323,10 @@ def _parse_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--speed-constraints-file", type=Path,
+        help="read the cuts and speed annotations for a particular print layout",
+    )
+    parser.add_argument(
         "--equal-length-chunks",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -6300,6 +6391,8 @@ def _parse_args(argv=None):
         not math.isfinite(args.raw_cache_gib) or args.raw_cache_gib < 0
     ):
         parser.error("--raw-cache-gib must be finite and non-negative")
+    if args.speed_constraints_file is not None and not args.speed_constraints:
+        parser.error("--speed-constraints-file conflicts with --no-speed-constraints")
     if args.vibration_rows < MIN_GROUND_ROWS:
         parser.error(f"--vibration-rows must be at least {MIN_GROUND_ROWS}")
     if args.skew_hough_extents is not None:
@@ -6348,6 +6441,8 @@ def main(argv=None):
         process_kwargs["vibration_compensation"] = False
     if args.vibration_rows != DEFAULT_GROUND_ROWS:
         process_kwargs["vibration_rows"] = args.vibration_rows
+    if args.speed_constraints_file is not None:
+        process_kwargs["speed_constraints_file"] = args.speed_constraints_file
     if not args.speed_constraints:
         process_kwargs["use_speed_constraints"] = False
     if args.equal_length_chunks:

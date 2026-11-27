@@ -1,0 +1,14 @@
+{
+  "capture_settings": {"cds_gain": 1, "analog_gain": 10, "shutterspeed": 452},
+  "as_shot_neutral": [1, 0.879913, 0.650546],
+  "dark_rgb": [2437, 2376, 1357],
+  "shadow_fade_end": 10000,
+  "source": {
+    "subject": "Shadowed Nankai bogie in row 2. The corresponding wheel under the cab in row 3 was held out.",
+    "dng": "2026-06-16-01-59-33_NECTA0002_01735a807e82c5d93ef6f29b31519908e23aeccb.dng",
+    "roi_xyxy": [10400, 2936, 11336, 3430],
+    "sample_stride_xy": [3, 2],
+    "green_interval_half_open": [2200, 2600],
+    "statistic": "Median native RGB of 50337 samples with all channels above zero. White balance is the original DNG AsShotNeutral."
+  }
+}
